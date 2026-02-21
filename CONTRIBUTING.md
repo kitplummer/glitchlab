@@ -93,12 +93,10 @@ To give agents more capabilities (e.g., `docker` or `sql-lint` support):
 * Build Weird. Ship Clean.: Agents can be chaotic, but the output must be surgical and high-quality.
 
 
-* 
-**Local-First**: We avoid cloud dependencies other than the model APIs.
+* **Local-First**: We avoid cloud dependencies other than the model APIs.
 
 
-* 
-**Deterministic Orchestration**: The sequence of events should be explicit, not governed by "emergent behavior".
+* **Deterministic Orchestration**: The sequence of events should be explicit, not governed by "emergent behavior".
 
 
 * **Under 2k Lines**: Keep the core engine lean. If a feature adds significant bloat, consider making it an optional plugin.
