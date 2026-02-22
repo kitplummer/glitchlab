@@ -100,7 +100,7 @@ impl Default for EngConfig {
             },
             limits: LimitsConfig {
                 max_fix_attempts: 2,
-                max_tokens_per_task: 50_000,
+                max_tokens_per_task: 150_000,
                 max_dollars_per_task: 2.0,
                 require_plan_review: true,
                 require_pr_review: true,
@@ -274,7 +274,7 @@ mod tests {
     fn default_config_has_sane_values() {
         let config = EngConfig::default();
         assert_eq!(config.limits.max_fix_attempts, 2);
-        assert_eq!(config.limits.max_tokens_per_task, 50_000);
+        assert_eq!(config.limits.max_tokens_per_task, 150_000);
         assert!((config.limits.max_dollars_per_task - 2.0).abs() < f64::EPSILON);
         assert!(config.intervention.pause_after_plan);
         assert!(config.intervention.pause_before_pr);
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(config.limits.max_fix_attempts, 5);
         assert!((config.limits.max_dollars_per_task - 5.0).abs() < f64::EPSILON);
         // Non-overridden values should keep defaults.
-        assert_eq!(config.limits.max_tokens_per_task, 50_000);
+        assert_eq!(config.limits.max_tokens_per_task, 150_000);
     }
 
     #[test]
