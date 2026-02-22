@@ -850,23 +850,28 @@ async fn apply_changes(worktree: &Path, changes: &[serde_json::Value]) -> Result
                 {
                     continue;
                 }
-                let content = change["content"]
-                    .as_str()
-                    .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| {
-                        format!(
+                match change["content"].as_str().filter(|s| !s.trim().is_empty()) {
+                    Some(content) => {
+                        if let Some(parent) = full_path.parent() {
+                            tokio::fs::create_dir_all(parent)
+                                .await
+                                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+                        }
+                        tokio::fs::write(&full_path, content)
+                            .await
+                            .map_err(|e| format!("write {file}: {e}"))?;
+                    }
+                    None if full_path.exists() => {
+                        // File already exists (likely written by tool-use loop) — skip.
+                        tracing::debug!(file, "skipping modify with no content — file exists");
+                    }
+                    None => {
+                        return Err(format!(
                             "modify action for `{file}` has no usable patch or content — \
                              the implementer failed to produce changes for this file"
-                        )
-                    })?;
-                if let Some(parent) = full_path.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+                        ));
+                    }
                 }
-                tokio::fs::write(&full_path, content)
-                    .await
-                    .map_err(|e| format!("write {file}: {e}"))?;
             }
         }
     }
@@ -1307,11 +1312,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_changes_modify_with_null_patch_and_content_errors() {
+    async fn apply_changes_modify_with_null_content_skips_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("existing.rs");
         tokio::fs::write(&file_path, "original").await.unwrap();
 
+        // When file exists (written by tool-use), null content should skip, not error.
         let changes = vec![serde_json::json!({
             "file": "existing.rs",
             "action": "modify",
@@ -1319,11 +1325,26 @@ mod tests {
             "content": null,
         })];
         let result = apply_changes(dir.path(), &changes).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no usable patch or content"));
+        assert!(result.is_ok(), "should skip existing file, got: {result:?}");
         // File should be untouched.
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "original");
+    }
+
+    #[tokio::test]
+    async fn apply_changes_modify_nonexistent_with_null_content_errors() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // When file does NOT exist and content is null, this should error.
+        let changes = vec![serde_json::json!({
+            "file": "missing.rs",
+            "action": "modify",
+            "patch": null,
+            "content": null,
+        })];
+        let result = apply_changes(dir.path(), &changes).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no usable patch or content"));
     }
 
     #[tokio::test]
