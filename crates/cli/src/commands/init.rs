@@ -16,6 +16,12 @@ pub async fn execute(path: &Path) -> Result<()> {
         tokio::fs::create_dir_all(dir).await?;
     }
 
+    // Write .gitignore to prevent tracking ephemeral data.
+    let gitignore_path = glitchlab_dir.join(".gitignore");
+    if !gitignore_path.exists() {
+        tokio::fs::write(&gitignore_path, "worktrees/\nlogs/\n").await?;
+    }
+
     // Write default config if it doesn't exist.
     let config_path = glitchlab_dir.join("config.yaml");
     if !config_path.exists() {
@@ -60,4 +66,44 @@ risk: low
     println!("  Created: .glitchlab/logs/");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn init_creates_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        execute(dir.path()).await.unwrap();
+
+        let gitignore_path = dir.path().join(".glitchlab").join(".gitignore");
+        assert!(gitignore_path.exists(), ".gitignore should be created");
+        let content = tokio::fs::read_to_string(&gitignore_path).await.unwrap();
+        assert!(content.contains("worktrees/"));
+        assert!(content.contains("logs/"));
+    }
+
+    #[tokio::test]
+    async fn init_creates_config_and_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        execute(dir.path()).await.unwrap();
+
+        assert!(dir.path().join(".glitchlab/config.yaml").exists());
+        assert!(dir.path().join(".glitchlab/tasks").is_dir());
+        assert!(dir.path().join(".glitchlab/worktrees").is_dir());
+        assert!(dir.path().join(".glitchlab/logs").is_dir());
+    }
+
+    #[tokio::test]
+    async fn init_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        execute(dir.path()).await.unwrap();
+        // Running again should not fail or overwrite.
+        execute(dir.path()).await.unwrap();
+        let content = tokio::fs::read_to_string(dir.path().join(".glitchlab/.gitignore"))
+            .await
+            .unwrap();
+        assert!(content.contains("worktrees/"));
+    }
 }
