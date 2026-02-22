@@ -67,8 +67,9 @@ impl Provider for OpenAiProvider {
                         MessageRole::System => "system".into(),
                         MessageRole::User => "user".into(),
                         MessageRole::Assistant => "assistant".into(),
+                        MessageRole::Tool => "tool".into(),
                     },
-                    content: m.content.clone(),
+                    content: m.content.text(),
                 })
                 .collect();
 
@@ -143,6 +144,8 @@ impl Provider for OpenAiProvider {
                 total_tokens,
                 cost,
                 latency_ms,
+                tool_calls: vec![],
+                stop_reason: None,
             })
         })
     }
@@ -230,7 +233,7 @@ fn estimate_openai_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glitchlab_kernel::agent::{Message, MessageRole};
+    use glitchlab_kernel::agent::{Message, MessageContent, MessageRole};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -260,11 +263,11 @@ mod tests {
         vec![
             Message {
                 role: MessageRole::System,
-                content: "System prompt".into(),
+                content: MessageContent::Text("System prompt".into()),
             },
             Message {
                 role: MessageRole::User,
-                content: "Hello".into(),
+                content: MessageContent::Text("Hello".into()),
             },
         ]
     }
@@ -364,19 +367,19 @@ mod tests {
         let messages = vec![
             Message {
                 role: MessageRole::System,
-                content: "System".into(),
+                content: MessageContent::Text("System".into()),
             },
             Message {
                 role: MessageRole::User,
-                content: "Hi".into(),
+                content: MessageContent::Text("Hi".into()),
             },
             Message {
                 role: MessageRole::Assistant,
-                content: "Hello".into(),
+                content: MessageContent::Text("Hello".into()),
             },
             Message {
                 role: MessageRole::User,
-                content: "Follow up".into(),
+                content: MessageContent::Text("Follow up".into()),
             },
         ];
         let result = provider

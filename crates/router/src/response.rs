@@ -1,3 +1,4 @@
+use glitchlab_kernel::tool::ToolCall;
 use serde::{Deserialize, Serialize};
 
 /// Response from an LLM completion call.
@@ -23,4 +24,12 @@ pub struct RouterResponse {
 
     /// Roundtrip latency in milliseconds.
     pub latency_ms: u64,
+
+    /// Tool calls requested by the LLM (empty for non-tool responses).
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+
+    /// Why the model stopped generating: "tool_use", "end_turn", etc.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
 }

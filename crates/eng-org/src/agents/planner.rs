@@ -1,5 +1,5 @@
 use glitchlab_kernel::agent::{
-    Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageRole,
+    Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageContent, MessageRole,
 };
 use glitchlab_kernel::error;
 
@@ -62,11 +62,11 @@ impl Agent for PlannerAgent {
         let messages = vec![
             Message {
                 role: MessageRole::System,
-                content: SYSTEM_PROMPT.into(),
+                content: MessageContent::Text(SYSTEM_PROMPT.into()),
             },
             Message {
                 role: MessageRole::User,
-                content: build_user_message(ctx),
+                content: MessageContent::Text(build_user_message(ctx)),
             },
         ];
 

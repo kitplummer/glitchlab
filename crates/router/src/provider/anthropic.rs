@@ -58,7 +58,7 @@ impl Provider for AnthropicProvider {
             let system: String = messages
                 .iter()
                 .filter(|m| m.role == MessageRole::System)
-                .map(|m| m.content.as_str())
+                .map(|m| m.content.text())
                 .collect::<Vec<_>>()
                 .join("\n\n");
 
@@ -67,11 +67,11 @@ impl Provider for AnthropicProvider {
                 .filter(|m| m.role != MessageRole::System)
                 .map(|m| AnthropicMessage {
                     role: match m.role {
-                        MessageRole::User => "user".into(),
+                        MessageRole::User | MessageRole::Tool => "user".into(),
                         MessageRole::Assistant => "assistant".into(),
                         MessageRole::System => unreachable!(),
                     },
-                    content: m.content.clone(),
+                    content: m.content.text(),
                 })
                 .collect();
 
@@ -151,6 +151,8 @@ impl Provider for AnthropicProvider {
                 total_tokens,
                 cost,
                 latency_ms,
+                tool_calls: vec![],
+                stop_reason: None,
             })
         })
     }
@@ -213,7 +215,7 @@ fn estimate_anthropic_cost(model: &str, prompt_tokens: u64, completion_tokens: u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glitchlab_kernel::agent::{Message, MessageRole};
+    use glitchlab_kernel::agent::{Message, MessageContent, MessageRole};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -243,11 +245,11 @@ mod tests {
         vec![
             Message {
                 role: MessageRole::System,
-                content: "System prompt".into(),
+                content: MessageContent::Text("System prompt".into()),
             },
             Message {
                 role: MessageRole::User,
-                content: "Hello".into(),
+                content: MessageContent::Text("Hello".into()),
             },
         ]
     }
@@ -331,7 +333,7 @@ mod tests {
         let provider = AnthropicProvider::with_base_url("test-key".into(), url);
         let messages = vec![Message {
             role: MessageRole::User,
-            content: "Hi".into(),
+            content: MessageContent::Text("Hi".into()),
         }];
         let result = provider
             .complete("claude-haiku-3-20240307", &messages, 0.5, 1024, None)

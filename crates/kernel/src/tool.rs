@@ -51,6 +51,58 @@ impl ToolPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// ToolDefinition — schema for a tool offered to an LLM
+// ---------------------------------------------------------------------------
+
+/// Definition of a tool that can be offered to an LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    /// Tool name (e.g. "read_file", "run_command").
+    pub name: String,
+    /// Human-readable description for the LLM.
+    pub description: String,
+    /// JSON Schema for the tool's input parameters.
+    pub input_schema: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// ToolCall — a tool invocation requested by the LLM
+// ---------------------------------------------------------------------------
+
+/// A tool call requested by the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Unique ID for this call (provider-assigned, used to correlate results).
+    pub id: String,
+    /// Name of the tool to invoke.
+    pub name: String,
+    /// Arguments as a JSON object.
+    pub input: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// ToolCallResult — result sent back to the LLM
+// ---------------------------------------------------------------------------
+
+/// Result of executing a tool call, sent back to the LLM.
+///
+/// This is the *conversation-level* result — a simplified representation of
+/// what happened. The existing `ToolResult` is the *execution-level* result
+/// (command stdout/stderr/returncode). A `ToolResult` from
+/// `ToolExecutor::execute()` gets condensed into a `ToolCallResult` by the
+/// agent loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallResult {
+    /// ID of the `ToolCall` this is responding to.
+    pub tool_call_id: String,
+    /// Output content (stdout, file contents, error message, etc.).
+    pub content: String,
+    /// True if the tool execution failed.
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+// ---------------------------------------------------------------------------
 // ToolResult — output from a tool execution
 // ---------------------------------------------------------------------------
 
@@ -272,5 +324,67 @@ mod tests {
         let executor = ToolExecutor::new(policy, dir, Duration::from_secs(10));
         let result = executor.execute("sh -c 'echo err >&2'").await.unwrap();
         assert!(result.stderr.contains("err"));
+    }
+
+    #[test]
+    fn tool_definition_serde_roundtrip() {
+        let def = ToolDefinition {
+            name: "read_file".into(),
+            description: "Read a file from disk".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"]
+            }),
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        let parsed: ToolDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "read_file");
+        assert_eq!(parsed.description, "Read a file from disk");
+        assert!(
+            parsed.input_schema["properties"]["path"]["type"]
+                .as_str()
+                .unwrap()
+                .contains("string")
+        );
+    }
+
+    #[test]
+    fn tool_call_serde_roundtrip() {
+        let call = ToolCall {
+            id: "call_123".into(),
+            name: "run_command".into(),
+            input: serde_json::json!({"command": "cargo test"}),
+        };
+        let json = serde_json::to_string(&call).unwrap();
+        let parsed: ToolCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "call_123");
+        assert_eq!(parsed.name, "run_command");
+        assert_eq!(parsed.input["command"], "cargo test");
+    }
+
+    #[test]
+    fn tool_call_result_serde_default_is_error() {
+        let json = r#"{"tool_call_id": "call_1", "content": "file contents here"}"#;
+        let result: ToolCallResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.tool_call_id, "call_1");
+        assert_eq!(result.content, "file contents here");
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn tool_call_result_with_error() {
+        let result = ToolCallResult {
+            tool_call_id: "call_2".into(),
+            content: "command failed: exit code 1".into(),
+            is_error: true,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: ToolCallResult = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_error);
+        assert_eq!(parsed.tool_call_id, "call_2");
+        assert!(parsed.content.contains("exit code 1"));
     }
 }

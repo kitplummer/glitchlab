@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use glitchlab_kernel::agent::Message;
+use glitchlab_kernel::tool::ToolDefinition;
 
 use crate::response::RouterResponse;
 
@@ -30,6 +31,24 @@ pub trait Provider: Send + Sync {
         max_tokens: u32,
         response_format: Option<&serde_json::Value>,
     ) -> ProviderFuture<'_>;
+
+    /// Complete with tool definitions available.
+    ///
+    /// Default implementation ignores tools and delegates to `complete()`.
+    /// Provider implementations override this in Phase 1 to marshal tool
+    /// definitions into provider-specific request formats.
+    fn complete_with_tools(
+        &self,
+        model: &str,
+        messages: &[Message],
+        temperature: f32,
+        max_tokens: u32,
+        tools: &[ToolDefinition],
+        response_format: Option<&serde_json::Value>,
+    ) -> ProviderFuture<'_> {
+        let _ = tools;
+        self.complete(model, messages, temperature, max_tokens, response_format)
+    }
 }
 
 /// Errors from a provider.

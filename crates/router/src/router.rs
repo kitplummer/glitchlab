@@ -202,7 +202,7 @@ mod tests {
     use super::*;
     use crate::provider::{Provider, ProviderError, ProviderFuture};
     use crate::response::RouterResponse;
-    use glitchlab_kernel::agent::{Message, MessageRole};
+    use glitchlab_kernel::agent::{Message, MessageContent, MessageRole};
     use glitchlab_kernel::budget::BudgetTracker;
 
     struct MockProvider {
@@ -220,6 +220,8 @@ mod tests {
                     total_tokens: 150,
                     cost: 0.001,
                     latency_ms: 42,
+                    tool_calls: vec![],
+                    stop_reason: None,
                 },
             }
         }
@@ -258,11 +260,11 @@ mod tests {
         vec![
             Message {
                 role: MessageRole::System,
-                content: "You are a test.".into(),
+                content: MessageContent::Text("You are a test.".into()),
             },
             Message {
                 role: MessageRole::User,
-                content: "Hello".into(),
+                content: MessageContent::Text("Hello".into()),
             },
         ]
     }

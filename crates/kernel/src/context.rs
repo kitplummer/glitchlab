@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{Message, MessageRole};
+use crate::agent::{Message, MessageContent, MessageRole};
 
 // ---------------------------------------------------------------------------
 // ContextSegment — a typed block of content for the context window
@@ -137,11 +137,11 @@ impl ContextAssembler {
         let messages = vec![
             Message {
                 role: MessageRole::System,
-                content: system_parts.join("\n\n"),
+                content: MessageContent::Text(system_parts.join("\n\n")),
             },
             Message {
                 role: MessageRole::User,
-                content: user_parts.join("\n\n---\n\n"),
+                content: MessageContent::Text(user_parts.join("\n\n---\n\n")),
             },
         ];
 
@@ -280,8 +280,13 @@ mod tests {
         assert_eq!(result.included.len(), 2);
         assert!(result.dropped.is_empty());
         assert_eq!(result.messages.len(), 2);
-        assert!(result.messages[0].content.contains("You are an agent"));
-        assert!(result.messages[1].content.contains("Fix the bug"));
+        assert!(
+            result.messages[0]
+                .content
+                .text()
+                .contains("You are an agent")
+        );
+        assert!(result.messages[1].content.text().contains("Fix the bug"));
     }
 
     #[test]

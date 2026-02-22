@@ -83,6 +83,8 @@ pub(crate) mod test_helpers {
                     total_tokens: 150,
                     cost: 0.001,
                     latency_ms: 42,
+                    tool_calls: vec![],
+                    stop_reason: None,
                 })
             })
         }
