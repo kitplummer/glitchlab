@@ -14,6 +14,8 @@ pub struct EngConfig {
     pub allowed_tools: Vec<String>,
     pub blocked_patterns: Vec<String>,
     pub boundaries: BoundariesConfig,
+    #[serde(default)]
+    pub test_command_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +126,7 @@ impl Default for EngConfig {
             boundaries: BoundariesConfig {
                 protected_paths: vec![],
             },
+            test_command_override: None,
         }
     }
 }

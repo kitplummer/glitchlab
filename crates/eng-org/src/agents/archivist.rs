@@ -3,6 +3,7 @@ use glitchlab_kernel::agent::{
 };
 use glitchlab_kernel::error;
 
+use super::build_user_message;
 use super::parse::parse_json_response;
 use crate::agents::RouterRef;
 
@@ -66,7 +67,7 @@ impl Agent for ArchivistAgent {
             },
             Message {
                 role: MessageRole::User,
-                content: ctx.objective.clone(),
+                content: build_user_message(ctx),
             },
         ];
 
@@ -111,6 +112,15 @@ mod tests {
     async fn execute_returns_output() {
         let agent = ArchivistAgent::new(mock_router_ref());
         let ctx = test_agent_context();
+        let output = agent.execute(&ctx).await.unwrap();
+        assert_eq!(output.metadata.agent, "archivist");
+    }
+
+    #[tokio::test]
+    async fn execute_with_previous_output() {
+        let agent = ArchivistAgent::new(mock_router_ref());
+        let mut ctx = test_agent_context();
+        ctx.previous_output = serde_json::json!({"plan": {}, "implementation": {}});
         let output = agent.execute(&ctx).await.unwrap();
         assert_eq!(output.metadata.agent, "archivist");
     }

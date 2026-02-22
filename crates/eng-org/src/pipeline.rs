@@ -269,7 +269,11 @@ impl EngineeringPipeline {
 
         // --- Stage 8-9: Test / debug loop ---
         ctx.current_stage = Some("test".into());
-        let test_cmd = crate::config::detect_test_command(repo_path);
+        let test_cmd = self
+            .config
+            .test_command_override
+            .clone()
+            .or_else(|| crate::config::detect_test_command(repo_path));
         let mut fix_attempts = 0u32;
         let max_fixes = self.config.limits.max_fix_attempts;
 

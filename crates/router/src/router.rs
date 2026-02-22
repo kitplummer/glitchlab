@@ -162,6 +162,30 @@ impl Router {
         })
     }
 
+    /// Pre-flight check: verify that all configured roles have available
+    /// providers. Returns a list of `(role, error_message)` for any role
+    /// whose provider is missing (e.g. API key not set).
+    ///
+    /// Call this before starting the pipeline to catch configuration errors
+    /// early instead of failing deep in a multi-stage run.
+    pub fn preflight_check(&self) -> Vec<(String, String)> {
+        let mut errors = Vec::new();
+        for (role, model_string) in &self.routing {
+            let (provider_name, _model_id) = parse_model_string(model_string);
+            if !self.providers.contains_key(provider_name) {
+                errors.push((
+                    role.clone(),
+                    format!(
+                        "provider `{provider_name}` not available for role `{role}` \
+                         (model: {model_string}). Set the appropriate API key."
+                    ),
+                ));
+            }
+        }
+        errors.sort_by(|a, b| a.0.cmp(&b.0));
+        errors
+    }
+
     /// Get a snapshot of the current budget state.
     pub async fn budget_summary(&self) -> glitchlab_kernel::budget::BudgetSummary {
         self.budget.lock().await.summary()
@@ -359,6 +383,49 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("exhausted retries"), "got: {err_msg}");
+    }
+
+    #[test]
+    fn preflight_check_all_providers_present() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget);
+        router.register_provider("mock".into(), Arc::new(MockProvider::ok()));
+        let errors = router.preflight_check();
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn preflight_check_missing_provider() {
+        let routing = HashMap::from([
+            ("planner".to_string(), "anthropic/claude-sonnet".to_string()),
+            ("debugger".to_string(), "openai/gpt-4".to_string()),
+        ]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        // No providers registered (new() may init from env, but not "anthropic"/"openai" in test)
+        let mut router = Router::new(HashMap::new(), budget);
+        router.routing = routing;
+        router.providers.clear();
+
+        let errors = router.preflight_check();
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn preflight_check_reports_correct_provider_names() {
+        let routing = HashMap::from([(
+            "implementer".to_string(),
+            "gemini/gemini-2.5-flash".to_string(),
+        )]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(HashMap::new(), budget);
+        router.routing = routing;
+        router.providers.clear();
+
+        let errors = router.preflight_check();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "implementer");
+        assert!(errors[0].1.contains("gemini"));
     }
 
     #[tokio::test]

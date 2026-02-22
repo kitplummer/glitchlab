@@ -133,9 +133,27 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { repo, verbose, .. } => {
+        Commands::Run {
+            repo,
+            issue,
+            local_task,
+            task_file,
+            allow_core,
+            auto_approve,
+            test,
+            verbose,
+        } => {
             commands::setup_logging(verbose);
-            commands::run::execute(&repo).await
+            commands::run::execute(
+                &repo,
+                issue,
+                local_task,
+                task_file.as_deref(),
+                allow_core,
+                auto_approve,
+                test.as_deref(),
+            )
+            .await
         }
         Commands::Interactive { repo, verbose, .. } => {
             commands::setup_logging(verbose);
