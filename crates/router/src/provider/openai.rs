@@ -10,8 +10,6 @@ use super::{Provider, ProviderError, ProviderFuture};
 use crate::response::RouterResponse;
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
-const GEMINI_OPENAI_URL: &str =
-    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
 pub struct OpenAiProvider {
     client: Client,
@@ -34,13 +32,6 @@ impl OpenAiProvider {
         let key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| ProviderError::MissingApiKey("OPENAI_API_KEY".into()))?;
         Ok(Self::new(key, OPENAI_API_URL.into(), "openai".into()))
-    }
-
-    pub fn gemini_from_env() -> Result<Self, ProviderError> {
-        let key = std::env::var("GOOGLE_API_KEY")
-            .or_else(|_| std::env::var("GEMINI_API_KEY"))
-            .map_err(|_| ProviderError::MissingApiKey("GOOGLE_API_KEY or GEMINI_API_KEY".into()))?;
-        Ok(Self::new(key, GEMINI_OPENAI_URL.into(), "gemini".into()))
     }
 
     pub fn custom(api_key: String, base_url: String, name: String) -> Self {
@@ -325,34 +316,19 @@ struct OaiUsage {
 }
 
 fn estimate_openai_cost(
-    provider: &str,
+    _provider: &str,
     model: &str,
     prompt_tokens: u64,
     completion_tokens: u64,
 ) -> f64 {
-    let (input_per_m, output_per_m) = match provider {
-        "gemini" => {
-            if model.contains("flash-lite") {
-                (0.075, 0.30)
-            } else if model.contains("flash") {
-                (0.15, 0.60)
-            } else if model.contains("pro") {
-                (1.25, 5.00)
-            } else {
-                (0.15, 0.60)
-            }
-        }
-        _ => {
-            if model.contains("gpt-4o-mini") {
-                (0.15, 0.60)
-            } else if model.contains("gpt-4o") {
-                (2.50, 10.0)
-            } else if model.contains("o1") || model.contains("o3") {
-                (10.0, 40.0)
-            } else {
-                (2.50, 10.0)
-            }
-        }
+    let (input_per_m, output_per_m) = if model.contains("gpt-4o-mini") {
+        (0.15, 0.60)
+    } else if model.contains("gpt-4o") {
+        (2.50, 10.0)
+    } else if model.contains("o1") || model.contains("o3") {
+        (10.0, 40.0)
+    } else {
+        (2.50, 10.0)
     };
 
     let input_cost = (prompt_tokens as f64 / 1_000_000.0) * input_per_m;
@@ -483,22 +459,6 @@ mod tests {
             .complete("gpt-4o", &test_messages(), 0.2, 4096, None)
             .await;
         assert!(matches!(result, Err(ProviderError::Api { .. })));
-    }
-
-    #[tokio::test]
-    async fn complete_gemini_provider() {
-        let body = serde_json::json!({
-            "choices": [{"message": {"content": "hello"}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-        });
-        let url = mock_server(200, body.to_string()).await;
-        let provider = OpenAiProvider::new("test-key".into(), url, "gemini".into());
-        let result = provider
-            .complete("gemini-2.5-flash", &test_messages(), 0.2, 4096, None)
-            .await;
-        assert!(result.is_ok());
-        let resp = result.unwrap();
-        assert!(resp.model.contains("gemini"));
     }
 
     #[tokio::test]
@@ -711,30 +671,6 @@ mod tests {
             .unwrap();
         // Malformed tool call is gracefully skipped.
         assert!(result.tool_calls.is_empty());
-    }
-
-    #[test]
-    fn gemini_flash_lite_cost() {
-        let cost = estimate_openai_cost("gemini", "gemini-2.5-flash-lite", 1_000_000, 1_000_000);
-        assert!((cost - 0.375).abs() < 0.01);
-    }
-
-    #[test]
-    fn gemini_flash_cost() {
-        let cost = estimate_openai_cost("gemini", "gemini-2.5-flash", 1_000_000, 1_000_000);
-        assert!((cost - 0.75).abs() < 0.01);
-    }
-
-    #[test]
-    fn gemini_pro_cost() {
-        let cost = estimate_openai_cost("gemini", "gemini-pro", 1_000_000, 1_000_000);
-        assert!((cost - 6.25).abs() < 0.01);
-    }
-
-    #[test]
-    fn gemini_unknown_defaults_to_flash() {
-        let cost = estimate_openai_cost("gemini", "gemini-whatever", 1_000_000, 1_000_000);
-        assert!((cost - 0.75).abs() < 0.01);
     }
 
     #[test]

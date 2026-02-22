@@ -10,5 +10,13 @@ boundaries:
     - ".glitchlab/config.yaml"
 
 limits:
-  max_tool_turns: 10
-  max_tokens_per_task: 150000
+  max_tool_turns: 20
+  max_tokens_per_task: 200000
+
+routing:
+  planner: "gemini/gemini-2.5-flash"
+  implementer: "gemini/gemini-2.5-flash"
+  debugger: "gemini/gemini-2.5-flash"
+  security: "gemini/gemini-2.5-flash"
+  release: "gemini/gemini-2.5-flash"
+  archivist: "gemini/gemini-2.5-flash"

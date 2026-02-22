@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::provider::anthropic::AnthropicProvider;
+use crate::provider::gemini::GeminiProvider;
 use crate::provider::openai::OpenAiProvider;
 use crate::provider::{Provider, ProviderError, parse_model_string};
 use crate::response::RouterResponse;
@@ -46,7 +47,7 @@ impl Router {
         if let Ok(p) = OpenAiProvider::openai_from_env() {
             providers.insert("openai".into(), Arc::new(p));
         }
-        if let Ok(p) = OpenAiProvider::gemini_from_env() {
+        if let Ok(p) = GeminiProvider::from_env() {
             providers.insert("gemini".into(), Arc::new(p));
         }
 
