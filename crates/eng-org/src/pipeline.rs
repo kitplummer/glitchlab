@@ -246,6 +246,17 @@ impl EngineeringPipeline {
         // --- Stage 6: Implement ---
         ctx.current_stage = Some("implement".into());
         ctx.agent_context.previous_output = plan_output.data.clone();
+
+        // Load files the planner identified into file_context so the
+        // implementer can see actual source code, not just filenames.
+        let planner_files = read_relevant_files(repo_path, "", &files_affected).await;
+        for (path, content) in planner_files {
+            ctx.agent_context
+                .file_context
+                .entry(path)
+                .or_insert(content);
+        }
+
         let implementer = ImplementerAgent::new(Arc::clone(&self.router));
         let impl_output = match implementer.execute(&ctx.agent_context).await {
             Ok(o) => o,
@@ -486,7 +497,17 @@ impl EngineeringPipeline {
             .unwrap_or("chore: automated changes by GLITCHLAB");
 
         let commit_sha = match workspace.commit(commit_msg).await {
-            Ok(sha) => sha,
+            Ok(Some(sha)) => sha,
+            Ok(None) => {
+                return self
+                    .fail(
+                        ctx,
+                        PipelineStatus::ImplementationFailed,
+                        "no changes produced — implementer output resulted in an empty commit"
+                            .into(),
+                    )
+                    .await;
+            }
             Err(e) => {
                 return self
                     .fail(ctx, PipelineStatus::Error, format!("commit failed: {e}"))

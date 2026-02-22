@@ -62,12 +62,12 @@ impl Default for EngConfig {
     fn default() -> Self {
         Self {
             routing: RoutingConfig {
-                planner: "gemini/gemini-2.5-flash-lite".into(),
+                planner: "anthropic/claude-haiku-4-5-20251001".into(),
                 implementer: "anthropic/claude-sonnet-4-20250514".into(),
                 debugger: "anthropic/claude-sonnet-4-20250514".into(),
-                security: "gemini/gemini-2.5-flash-lite".into(),
-                release: "gemini/gemini-2.5-flash".into(),
-                archivist: "gemini/gemini-2.5-flash-lite".into(),
+                security: "anthropic/claude-haiku-4-5-20251001".into(),
+                release: "anthropic/claude-haiku-4-5-20251001".into(),
+                archivist: "anthropic/claude-haiku-4-5-20251001".into(),
             },
             limits: LimitsConfig {
                 max_fix_attempts: 4,
@@ -244,7 +244,7 @@ mod tests {
         assert!(!config.allowed_tools.is_empty());
         assert!(!config.blocked_patterns.is_empty());
         assert!(config.routing.implementer.contains("anthropic"));
-        assert!(config.routing.planner.contains("gemini"));
+        assert!(config.routing.planner.contains("anthropic"));
     }
 
     #[test]
