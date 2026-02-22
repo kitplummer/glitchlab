@@ -553,6 +553,22 @@ impl EngineeringPipeline {
         );
         ctx.stage_outputs.insert("archive".into(), archive_output);
 
+        // --- Stage 12b: Auto-format (best-effort) ---
+        // Run `cargo fmt` (Rust) or equivalent before committing so that
+        // pre-commit hooks and CI checks don't reject the commit on style.
+        if workspace.is_created() {
+            let wt = workspace.worktree_path();
+            if wt.join("Cargo.toml").exists() {
+                let _ = Command::new("cargo")
+                    .args(["fmt", "--all"])
+                    .current_dir(wt)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+            }
+        }
+
         // --- Stage 13: Commit ---
         ctx.current_stage = Some("commit".into());
         let commit_msg = impl_output.data["commit_message"]
