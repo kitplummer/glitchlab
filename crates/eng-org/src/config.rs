@@ -99,13 +99,13 @@ impl Default for EngConfig {
                 archivist: "anthropic/claude-haiku-4-5-20251001".into(),
             },
             limits: LimitsConfig {
-                max_fix_attempts: 4,
-                max_tokens_per_task: 150_000,
-                max_dollars_per_task: 10.0,
+                max_fix_attempts: 2,
+                max_tokens_per_task: 50_000,
+                max_dollars_per_task: 2.0,
                 require_plan_review: true,
                 require_pr_review: true,
-                max_tool_turns: 20,
-                max_pipeline_duration_secs: 3600,
+                max_tool_turns: 10,
+                max_pipeline_duration_secs: 600,
             },
             intervention: InterventionConfig {
                 pause_after_plan: true,
@@ -273,17 +273,17 @@ mod tests {
     #[test]
     fn default_config_has_sane_values() {
         let config = EngConfig::default();
-        assert_eq!(config.limits.max_fix_attempts, 4);
-        assert_eq!(config.limits.max_tokens_per_task, 150_000);
-        assert!((config.limits.max_dollars_per_task - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.limits.max_fix_attempts, 2);
+        assert_eq!(config.limits.max_tokens_per_task, 50_000);
+        assert!((config.limits.max_dollars_per_task - 2.0).abs() < f64::EPSILON);
         assert!(config.intervention.pause_after_plan);
         assert!(config.intervention.pause_before_pr);
         assert!(!config.allowed_tools.is_empty());
         assert!(!config.blocked_patterns.is_empty());
         assert!(config.routing.implementer.contains("anthropic"));
         assert!(config.routing.planner.contains("anthropic"));
-        assert_eq!(config.limits.max_tool_turns, 20);
-        assert_eq!(config.limits.max_pipeline_duration_secs, 3600);
+        assert_eq!(config.limits.max_tool_turns, 10);
+        assert_eq!(config.limits.max_pipeline_duration_secs, 600);
     }
 
     #[test]
@@ -302,14 +302,14 @@ mod tests {
     #[test]
     fn load_without_repo_returns_defaults() {
         let config = EngConfig::load(None).unwrap();
-        assert_eq!(config.limits.max_fix_attempts, 4);
+        assert_eq!(config.limits.max_fix_attempts, 2);
     }
 
     #[test]
     fn load_with_nonexistent_override_returns_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let config = EngConfig::load(Some(dir.path())).unwrap();
-        assert_eq!(config.limits.max_fix_attempts, 4);
+        assert_eq!(config.limits.max_fix_attempts, 2);
     }
 
     #[test]
@@ -323,7 +323,7 @@ mod tests {
         )
         .unwrap();
         let config = EngConfig::load(Some(dir.path())).unwrap();
-        assert_eq!(config.limits.max_fix_attempts, 4);
+        assert_eq!(config.limits.max_fix_attempts, 2);
         assert!(config.routing.planner.contains("anthropic"));
     }
 
@@ -334,15 +334,15 @@ mod tests {
         std::fs::create_dir_all(&glitchlab_dir).unwrap();
         std::fs::write(
             glitchlab_dir.join("config.yaml"),
-            "limits:\n  max_fix_attempts: 2\n  max_dollars_per_task: 5.0\n",
+            "limits:\n  max_fix_attempts: 5\n  max_dollars_per_task: 5.0\n",
         )
         .unwrap();
 
         let config = EngConfig::load(Some(dir.path())).unwrap();
-        assert_eq!(config.limits.max_fix_attempts, 2);
+        assert_eq!(config.limits.max_fix_attempts, 5);
         assert!((config.limits.max_dollars_per_task - 5.0).abs() < f64::EPSILON);
         // Non-overridden values should keep defaults.
-        assert_eq!(config.limits.max_tokens_per_task, 150_000);
+        assert_eq!(config.limits.max_tokens_per_task, 50_000);
     }
 
     #[test]
