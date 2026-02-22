@@ -102,16 +102,10 @@ impl BoundaryEnforcer {
 
     /// Check files and return an error if violations are found
     /// and `allow_core` is false.
-    pub fn enforce(
-        &self,
-        files: &[impl AsRef<Path>],
-        allow_core: bool,
-    ) -> Result<Vec<PathBuf>> {
+    pub fn enforce(&self, files: &[impl AsRef<Path>], allow_core: bool) -> Result<Vec<PathBuf>> {
         let violations = self.check(files);
         if !violations.is_empty() && !allow_core {
-            return Err(Error::BoundaryViolation {
-                paths: violations,
-            });
+            return Err(Error::BoundaryViolation { paths: violations });
         }
         Ok(violations)
     }

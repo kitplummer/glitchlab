@@ -136,10 +136,7 @@ impl RepoIndex {
 
 /// Build a repo index using `git ls-files`.
 pub async fn build_index(repo_path: &Path) -> Result<RepoIndex> {
-    let root = repo_path
-        .to_str()
-        .unwrap_or(".")
-        .to_string();
+    let root = repo_path.to_str().unwrap_or(".").to_string();
 
     // Use git ls-files for accurate, .gitignore-respecting file list.
     let output = Command::new("git")
@@ -166,7 +163,10 @@ pub async fn build_index(repo_path: &Path) -> Result<RepoIndex> {
         }
 
         // Skip known junk directories.
-        if SKIP_DIRS.iter().any(|d| path.starts_with(d) || path.contains(&format!("/{d}/"))) {
+        if SKIP_DIRS
+            .iter()
+            .any(|d| path.starts_with(d) || path.contains(&format!("/{d}/")))
+        {
             continue;
         }
 
@@ -178,10 +178,10 @@ pub async fn build_index(repo_path: &Path) -> Result<RepoIndex> {
         }
 
         // Language detection by extension.
-        if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
-            if CODE_EXTENSIONS.contains(&ext) {
-                *languages.entry(ext.to_string()).or_default() += 1;
-            }
+        if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str())
+            && CODE_EXTENSIONS.contains(&ext)
+        {
+            *languages.entry(ext.to_string()).or_default() += 1;
         }
 
         // Key file detection.
@@ -282,7 +282,11 @@ mod tests {
             root: "/tmp/repo".into(),
             total_files: 3,
             languages: HashMap::from([("rs".into(), 2), ("toml".into(), 1)]),
-            files: vec!["src/main.rs".into(), "src/lib.rs".into(), "Cargo.toml".into()],
+            files: vec![
+                "src/main.rs".into(),
+                "src/lib.rs".into(),
+                "Cargo.toml".into(),
+            ],
             directories: vec!["src".into()],
             key_files: vec!["Cargo.toml".into()],
             test_files: vec!["src/tests/mod.rs".into()],
@@ -421,7 +425,10 @@ mod tests {
         let index = build_index(dir.path()).await.unwrap();
         // node_modules files should be filtered out.
         for file in &index.files {
-            assert!(!file.contains("node_modules"), "should skip node_modules: {file}");
+            assert!(
+                !file.contains("node_modules"),
+                "should skip node_modules: {file}"
+            );
         }
     }
 

@@ -1,4 +1,6 @@
-use glitchlab_kernel::agent::{Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageRole};
+use glitchlab_kernel::agent::{
+    Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageRole,
+};
 use glitchlab_kernel::error;
 
 use super::parse::parse_json_response;
@@ -67,7 +69,10 @@ impl Agent for PlannerAgent {
             },
         ];
 
-        let response = self.router.complete("planner", &messages, 0.2, 4096, None).await?;
+        let response = self
+            .router
+            .complete("planner", &messages, 0.2, 4096, None)
+            .await?;
 
         let metadata = AgentMetadata {
             agent: "planner".into(),

@@ -87,7 +87,8 @@ mod tests {
 
     #[test]
     fn agent_context_default_risk() {
-        let json = r#"{"task_id": "t1", "objective": "test", "repo_path": "/tmp", "working_dir": "/tmp"}"#;
+        let json =
+            r#"{"task_id": "t1", "objective": "test", "repo_path": "/tmp", "working_dir": "/tmp"}"#;
         let ctx: AgentContext = serde_json::from_str(json).unwrap();
         assert_eq!(ctx.risk_level, "low");
     }
@@ -111,7 +112,8 @@ mod tests {
 
     #[test]
     fn agent_context_defaults() {
-        let json = r#"{"task_id": "t1", "objective": "test", "repo_path": "/tmp", "working_dir": "/tmp"}"#;
+        let json =
+            r#"{"task_id": "t1", "objective": "test", "repo_path": "/tmp", "working_dir": "/tmp"}"#;
         let ctx: AgentContext = serde_json::from_str(json).unwrap();
         assert!(ctx.file_context.is_empty());
         assert!(ctx.constraints.is_empty());

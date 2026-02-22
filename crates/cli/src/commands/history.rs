@@ -27,7 +27,10 @@ pub async fn execute(repo: &Path, count: usize, stats: bool) -> Result<()> {
     for entry in &entries {
         let cost = format!("${:.4}", entry.budget.estimated_cost);
         let tokens = entry.budget.total_tokens;
-        print!("  {} | {} | {cost} | {tokens} tokens", entry.task_id, entry.status);
+        print!(
+            "  {} | {} | {cost} | {tokens} tokens",
+            entry.task_id, entry.status
+        );
         if let Some(url) = &entry.pr_url {
             print!(" | {url}");
         }

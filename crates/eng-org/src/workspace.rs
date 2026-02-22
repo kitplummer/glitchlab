@@ -225,11 +225,7 @@ mod tests {
 
     #[test]
     fn workspace_new() {
-        let ws = Workspace::new(
-            Path::new("/tmp/repo"),
-            "task-123",
-            ".glitchlab/worktrees",
-        );
+        let ws = Workspace::new(Path::new("/tmp/repo"), "task-123", ".glitchlab/worktrees");
         assert_eq!(ws.repo_path(), Path::new("/tmp/repo"));
         assert_eq!(ws.task_id(), "task-123");
         assert_eq!(ws.branch_name(), "glitchlab/task-123");
@@ -310,11 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_noop_when_not_created() {
-        let mut ws = Workspace::new(
-            Path::new("/tmp/repo"),
-            "task-456",
-            ".worktrees",
-        );
+        let mut ws = Workspace::new(Path::new("/tmp/repo"), "task-456", ".worktrees");
         ws.cleanup().await.unwrap();
     }
 

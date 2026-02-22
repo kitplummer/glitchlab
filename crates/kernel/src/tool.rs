@@ -35,9 +35,7 @@ impl ToolPolicy {
         // Blocklist takes priority.
         for pattern in &self.blocked {
             if trimmed.contains(pattern.as_str()) {
-                return Err(format!(
-                    "blocked by pattern `{pattern}`"
-                ));
+                return Err(format!("blocked by pattern `{pattern}`"));
             }
         }
 
@@ -108,10 +106,12 @@ impl ToolExecutor {
     /// Execute a shell command if it passes policy checks.
     pub async fn execute(&self, command: &str) -> Result<ToolResult> {
         // Policy check.
-        self.policy.check(command).map_err(|reason| Error::ToolViolation {
-            command: command.into(),
-            reason,
-        })?;
+        self.policy
+            .check(command)
+            .map_err(|reason| Error::ToolViolation {
+                command: command.into(),
+                reason,
+            })?;
 
         // Run via shell, scoped to working_dir.
         let result = tokio::time::timeout(self.timeout, async {
@@ -198,10 +198,7 @@ mod tests {
     fn blocklist_takes_priority() {
         // Even if "curl" were somehow in the allowlist,
         // the blocklist should still reject it.
-        let policy = ToolPolicy::new(
-            vec!["curl".into()],
-            vec!["curl".into()],
-        );
+        let policy = ToolPolicy::new(vec!["curl".into()], vec!["curl".into()]);
         assert!(policy.check("curl http://example.com").is_err());
     }
 

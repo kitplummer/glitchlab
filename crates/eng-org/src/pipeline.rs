@@ -13,13 +13,13 @@ use glitchlab_memory::history::{BudgetSnapshot, EventsSummary, HistoryEntry, Tas
 use tokio::process::Command;
 use tracing::{info, warn};
 
+use crate::agents::RouterRef;
 use crate::agents::archivist::ArchivistAgent;
 use crate::agents::debugger::DebuggerAgent;
 use crate::agents::implementer::ImplementerAgent;
 use crate::agents::planner::PlannerAgent;
 use crate::agents::release::ReleaseAgent;
 use crate::agents::security::SecurityAgent;
-use crate::agents::RouterRef;
 use crate::config::EngConfig;
 use crate::indexer;
 use crate::workspace::Workspace;
@@ -93,11 +93,7 @@ impl EngineeringPipeline {
     ) -> PipelineResult {
         info!(task_id, "pipeline starting");
 
-        let mut workspace = Workspace::new(
-            repo_path,
-            task_id,
-            &self.config.workspace.worktree_dir,
-        );
+        let mut workspace = Workspace::new(repo_path, task_id, &self.config.workspace.worktree_dir);
 
         let result = self
             .run_stages(task_id, objective, repo_path, base_branch, &mut workspace)
@@ -143,11 +139,7 @@ impl EngineeringPipeline {
         // --- Stage 1: Create workspace ---
         let wt_path = match workspace.create(base_branch).await {
             Ok(p) => p.to_path_buf(),
-            Err(e) => {
-                return self
-                    .fail(ctx, PipelineStatus::Error, e.to_string())
-                    .await
-            }
+            Err(e) => return self.fail(ctx, PipelineStatus::Error, e.to_string()).await,
         };
         ctx.agent_context.working_dir = wt_path.to_string_lossy().into();
         self.emit(
@@ -188,12 +180,11 @@ impl EngineeringPipeline {
             Err(e) => {
                 return self
                     .fail(ctx, PipelineStatus::PlanFailed, e.to_string())
-                    .await
+                    .await;
             }
         };
         self.emit(&mut ctx, EventKind::PlanCreated, plan_output.data.clone());
-        ctx.stage_outputs
-            .insert("plan".into(), plan_output.clone());
+        ctx.stage_outputs.insert("plan".into(), plan_output.clone());
 
         // --- Stage 4: Boundary check ---
         ctx.current_stage = Some("boundary_check".into());
@@ -253,7 +244,7 @@ impl EngineeringPipeline {
             Err(e) => {
                 return self
                     .fail(ctx, PipelineStatus::ImplementationFailed, e.to_string())
-                    .await
+                    .await;
             }
         };
         self.emit(
@@ -308,9 +299,7 @@ impl EngineeringPipeline {
                                 .fail(
                                     ctx,
                                     PipelineStatus::TestsFailed,
-                                    format!(
-                                        "tests failing after {max_fixes} fix attempts"
-                                    ),
+                                    format!("tests failing after {max_fixes} fix attempts"),
                                 )
                                 .await;
                         }
@@ -325,36 +314,25 @@ impl EngineeringPipeline {
                             "fix_attempt": fix_attempts,
                         });
 
-                        let debugger =
-                            DebuggerAgent::new(Arc::clone(&self.router));
-                        let debug_out =
-                            match debugger.execute(&ctx.agent_context).await {
-                                Ok(o) => o,
-                                Err(e) => {
-                                    return self
-                                        .fail(
-                                            ctx,
-                                            PipelineStatus::TestsFailed,
-                                            format!("debugger failed: {e}"),
-                                        )
-                                        .await
-                                }
-                            };
+                        let debugger = DebuggerAgent::new(Arc::clone(&self.router));
+                        let debug_out = match debugger.execute(&ctx.agent_context).await {
+                            Ok(o) => o,
+                            Err(e) => {
+                                return self
+                                    .fail(
+                                        ctx,
+                                        PipelineStatus::TestsFailed,
+                                        format!("debugger failed: {e}"),
+                                    )
+                                    .await;
+                            }
+                        };
 
-                        self.emit(
-                            &mut ctx,
-                            EventKind::DebugAttempt,
-                            debug_out.data.clone(),
-                        );
-                        ctx.stage_outputs.insert(
-                            format!("debug_{fix_attempts}"),
-                            debug_out.clone(),
-                        );
+                        self.emit(&mut ctx, EventKind::DebugAttempt, debug_out.data.clone());
+                        ctx.stage_outputs
+                            .insert(format!("debug_{fix_attempts}"), debug_out.clone());
 
-                        if !debug_out.data["should_retry"]
-                            .as_bool()
-                            .unwrap_or(true)
-                        {
+                        if !debug_out.data["should_retry"].as_bool().unwrap_or(true) {
                             return self
                                 .fail(
                                     ctx,
@@ -370,9 +348,7 @@ impl EngineeringPipeline {
                             .get("fix")
                             .map(extract_changes)
                             .unwrap_or_default();
-                        if let Err(e) =
-                            apply_changes(&wt_path, &fix_changes).await
-                        {
+                        if let Err(e) = apply_changes(&wt_path, &fix_changes).await {
                             return self
                                 .fail(
                                     ctx,
@@ -413,9 +389,7 @@ impl EngineeringPipeline {
             }
         };
 
-        let verdict = security_output.data["verdict"]
-            .as_str()
-            .unwrap_or("pass");
+        let verdict = security_output.data["verdict"].as_str().unwrap_or("pass");
         self.emit(
             &mut ctx,
             EventKind::SecurityReview,
@@ -504,7 +478,7 @@ impl EngineeringPipeline {
             Err(e) => {
                 return self
                     .fail(ctx, PipelineStatus::Error, format!("commit failed: {e}"))
-                    .await
+                    .await;
             }
         };
         self.emit(
@@ -515,10 +489,7 @@ impl EngineeringPipeline {
 
         // --- Stage 14: Human gate — PR review ---
         if self.config.intervention.pause_before_pr {
-            let stat = workspace
-                .diff_stat(base_branch)
-                .await
-                .unwrap_or_default();
+            let stat = workspace.diff_stat(base_branch).await.unwrap_or_default();
             if !self
                 .handler
                 .request_approval(
@@ -601,12 +572,7 @@ impl EngineeringPipeline {
         }
     }
 
-    fn emit(
-        &self,
-        ctx: &mut PipelineContext,
-        kind: EventKind,
-        data: serde_json::Value,
-    ) {
+    fn emit(&self, ctx: &mut PipelineContext, kind: EventKind, data: serde_json::Value) {
         ctx.emit(PipelineEvent {
             kind,
             timestamp: Utc::now().to_rfc3339(),
@@ -664,10 +630,7 @@ fn extract_changes(data: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 /// Apply file changes to the worktree.
-async fn apply_changes(
-    worktree: &Path,
-    changes: &[serde_json::Value],
-) -> Result<(), String> {
+async fn apply_changes(worktree: &Path, changes: &[serde_json::Value]) -> Result<(), String> {
     for change in changes {
         let file = change["file"]
             .as_str()
@@ -696,20 +659,17 @@ async fn apply_changes(
             }
             _ => {
                 // modify or any unknown action: try patch, fall back to content.
-                if let Some(patch) = change["patch"].as_str() {
-                    if !patch.is_empty()
-                        && try_git_apply(worktree, patch).await.is_ok()
-                    {
-                        continue;
-                    }
+                if let Some(patch) = change["patch"].as_str()
+                    && !patch.is_empty()
+                    && try_git_apply(worktree, patch).await.is_ok()
+                {
+                    continue;
                 }
                 if let Some(content) = change["content"].as_str() {
                     if let Some(parent) = full_path.parent() {
                         tokio::fs::create_dir_all(parent)
                             .await
-                            .map_err(|e| {
-                                format!("mkdir {}: {e}", parent.display())
-                            })?;
+                            .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
                     }
                     tokio::fs::write(&full_path, content)
                         .await
@@ -726,13 +686,7 @@ async fn try_git_apply(worktree: &Path, patch: &str) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
     let mut child = Command::new("git")
-        .args([
-            "-C",
-            &worktree.to_string_lossy(),
-            "apply",
-            "--3way",
-            "-",
-        ])
+        .args(["-C", &worktree.to_string_lossy(), "apply", "--3way", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -906,7 +860,7 @@ fn fallback_output(agent: &str, data: serde_json::Value) -> AgentOutput {
 }
 
 fn build_history_entry(task_id: &str, result: &PipelineResult) -> HistoryEntry {
-    let status = serde_json::to_value(&result.status)
+    let status = serde_json::to_value(result.status)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| format!("{:?}", result.status));
@@ -929,9 +883,7 @@ fn build_history_entry(task_id: &str, result: &PipelineResult) -> HistoryEntry {
     }
 }
 
-fn build_events_summary(
-    stage_outputs: &HashMap<String, AgentOutput>,
-) -> EventsSummary {
+fn build_events_summary(stage_outputs: &HashMap<String, AgentOutput>) -> EventsSummary {
     let plan_steps = stage_outputs
         .get("plan")
         .and_then(|o| o.data["steps"].as_array())
@@ -1048,10 +1000,9 @@ mod tests {
             "content": "fn main() {}",
         })];
         apply_changes(dir.path(), &changes).await.unwrap();
-        let content =
-            tokio::fs::read_to_string(dir.path().join("src/new.rs"))
-                .await
-                .unwrap();
+        let content = tokio::fs::read_to_string(dir.path().join("src/new.rs"))
+            .await
+            .unwrap();
         assert_eq!(content, "fn main() {}");
     }
 
@@ -1093,8 +1044,7 @@ mod tests {
             "content": "new content",
         })];
         apply_changes(dir.path(), &changes).await.unwrap();
-        let content =
-            tokio::fs::read_to_string(&file_path).await.unwrap();
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "new content");
     }
 
@@ -1191,10 +1141,7 @@ mod tests {
 
     #[test]
     fn fallback_output_construction() {
-        let output = fallback_output(
-            "test-agent",
-            serde_json::json!({"key": "value"}),
-        );
+        let output = fallback_output("test-agent", serde_json::json!({"key": "value"}));
         assert_eq!(output.metadata.agent, "test-agent");
         assert_eq!(output.metadata.model, "none");
         assert!(output.parse_error);
@@ -1417,8 +1364,7 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
-        let base_branch =
-            String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let base_branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         let router = mock_router_ref();
         let mut config = EngConfig::default();
@@ -1456,9 +1402,7 @@ mod tests {
             _gate: &str,
             _summary: &str,
             _data: &serde_json::Value,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = bool> + Send + '_>,
-        > {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
             Box::pin(async { false })
         }
     }
@@ -1499,8 +1443,7 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
-        let base_branch =
-            String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let base_branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         let router = mock_router_ref();
         let mut config = EngConfig::default();
@@ -1572,14 +1515,12 @@ mod tests {
             .output()
             .unwrap();
 
-        let patch =
-            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
         try_git_apply(dir.path(), patch).await.unwrap();
 
-        let content =
-            tokio::fs::read_to_string(dir.path().join("f.txt"))
-                .await
-                .unwrap();
+        let content = tokio::fs::read_to_string(dir.path().join("f.txt"))
+            .await
+            .unwrap();
         assert!(content.contains("B"));
     }
 
@@ -1598,8 +1539,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_test_repo(dir.path());
 
-        std::fs::write(dir.path().join("src.rs"), "fn old() {}\n")
-            .unwrap();
+        std::fs::write(dir.path().join("src.rs"), "fn old() {}\n").unwrap();
         std::process::Command::new("git")
             .args(["add", "src.rs"])
             .current_dir(dir.path())
@@ -1619,10 +1559,9 @@ mod tests {
         })];
 
         apply_changes(dir.path(), &changes).await.unwrap();
-        let content =
-            tokio::fs::read_to_string(dir.path().join("src.rs"))
-                .await
-                .unwrap();
+        let content = tokio::fs::read_to_string(dir.path().join("src.rs"))
+            .await
+            .unwrap();
         assert!(content.contains("new_func"));
     }
 
@@ -1638,11 +1577,7 @@ mod tests {
         let base_branch = init_test_repo(dir.path());
 
         // Add a Makefile with a test target that succeeds.
-        std::fs::write(
-            dir.path().join("Makefile"),
-            "test:\n\t@echo tests pass\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("Makefile"), "test:\n\t@echo tests pass\n").unwrap();
         std::process::Command::new("git")
             .args(["add", "Makefile"])
             .current_dir(dir.path())
@@ -1663,12 +1598,7 @@ mod tests {
         let pipeline = EngineeringPipeline::new(router, config, handler);
 
         let result = pipeline
-            .run(
-                "test-with-tests",
-                "Fix a bug",
-                dir.path(),
-                &base_branch,
-            )
+            .run("test-with-tests", "Fix a bug", dir.path(), &base_branch)
             .await;
 
         // Tests should pass, then push fails (no remote) → Committed.
@@ -1697,9 +1627,7 @@ mod tests {
             gate: &str,
             _summary: &str,
             _data: &serde_json::Value,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = bool> + Send + '_>,
-        > {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
             let approve = gate != "pr_review";
             Box::pin(async move { approve })
         }
@@ -1719,12 +1647,7 @@ mod tests {
         let pipeline = EngineeringPipeline::new(router, config, handler);
 
         let result = pipeline
-            .run(
-                "test-pr-reject",
-                "Fix something",
-                dir.path(),
-                &base_branch,
-            )
+            .run("test-pr-reject", "Fix something", dir.path(), &base_branch)
             .await;
 
         // Pipeline should commit but stop before PR.
@@ -1765,12 +1688,7 @@ mod tests {
         let pipeline = EngineeringPipeline::new(router, config, handler);
 
         let result = pipeline
-            .run(
-                "test-fail-debug",
-                "Fix a bug",
-                dir.path(),
-                &base_branch,
-            )
+            .run("test-fail-debug", "Fix a bug", dir.path(), &base_branch)
             .await;
 
         // Mock debugger returns should_retry: false, so pipeline stops.
@@ -1803,10 +1721,7 @@ mod tests {
                 "risk_level": "low"
             }),
         );
-        let security = fallback_output(
-            "security",
-            serde_json::json!({"verdict": "pass"}),
-        );
+        let security = fallback_output("security", serde_json::json!({"verdict": "pass"}));
 
         // gh pr create will fail — no git repo, no remote.
         let result = create_pr(

@@ -301,13 +301,13 @@ mod tests {
         let merged = deep_merge(base, over);
         let merged_map = merged.as_mapping().unwrap();
         let routing = merged_map
-            .get(&serde_yaml::Value::String("routing".into()))
+            .get(serde_yaml::Value::String("routing".into()))
             .unwrap()
             .as_mapping()
             .unwrap();
         assert_eq!(
             routing
-                .get(&serde_yaml::Value::String("planner".into()))
+                .get(serde_yaml::Value::String("planner".into()))
                 .unwrap()
                 .as_str()
                 .unwrap(),
@@ -315,7 +315,7 @@ mod tests {
         );
         assert_eq!(
             routing
-                .get(&serde_yaml::Value::String("implementer".into()))
+                .get(serde_yaml::Value::String("implementer".into()))
                 .unwrap()
                 .as_str()
                 .unwrap(),
@@ -327,7 +327,10 @@ mod tests {
     fn deep_merge_scalar_override() {
         let base = serde_yaml::Value::String("old".into());
         let over = serde_yaml::Value::String("new".into());
-        assert_eq!(deep_merge(base, over), serde_yaml::Value::String("new".into()));
+        assert_eq!(
+            deep_merge(base, over),
+            serde_yaml::Value::String("new".into())
+        );
     }
 
     #[test]
@@ -398,7 +401,10 @@ mod tests {
         let config = EngConfig::default();
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed: EngConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(parsed.limits.max_fix_attempts, config.limits.max_fix_attempts);
+        assert_eq!(
+            parsed.limits.max_fix_attempts,
+            config.limits.max_fix_attempts
+        );
         assert_eq!(parsed.routing.planner, config.routing.planner);
     }
 }

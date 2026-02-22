@@ -133,11 +133,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run {
-            repo,
-            verbose,
-            ..
-        } => {
+        Commands::Run { repo, verbose, .. } => {
             commands::setup_logging(verbose);
             commands::run::execute(&repo).await
         }
@@ -145,18 +141,14 @@ async fn main() -> Result<()> {
             commands::setup_logging(verbose);
             commands::interactive::execute(&repo).await
         }
-        Commands::Batch {
-            repo, verbose, ..
-        } => {
+        Commands::Batch { repo, verbose, .. } => {
             commands::setup_logging(verbose);
             commands::batch::execute(&repo).await
         }
         Commands::Init { path } => commands::init::execute(&path).await,
         Commands::Status { repo } => commands::status::execute(repo.as_deref()).await,
-        Commands::History {
-            repo,
-            count,
-            stats,
-        } => commands::history::execute(&repo, count, stats).await,
+        Commands::History { repo, count, stats } => {
+            commands::history::execute(&repo, count, stats).await
+        }
     }
 }

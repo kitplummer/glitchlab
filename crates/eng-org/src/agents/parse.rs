@@ -33,18 +33,21 @@ pub fn parse_json_response(
     }
 
     // Attempt 3: extract first JSON object.
-    if let Some(extracted) = extract_json_object(&stripped) {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&extracted) {
-            return AgentOutput {
-                data,
-                metadata,
-                parse_error: false,
-            };
-        }
+    if let Some(extracted) = extract_json_object(&stripped)
+        && let Ok(data) = serde_json::from_str::<serde_json::Value>(&extracted)
+    {
+        return AgentOutput {
+            data,
+            metadata,
+            parse_error: false,
+        };
     }
 
     // Fallback.
-    warn!(raw_len = raw.len(), "failed to parse agent JSON response, using fallback");
+    warn!(
+        raw_len = raw.len(),
+        "failed to parse agent JSON response, using fallback"
+    );
     AgentOutput {
         data: fallback,
         metadata,
@@ -55,15 +58,15 @@ pub fn parse_json_response(
 /// Strip markdown code fences (```json ... ``` or ``` ... ```).
 fn strip_code_fences(s: &str) -> String {
     let trimmed = s.trim();
-    if let Some(rest) = trimmed.strip_prefix("```json") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim().to_string();
-        }
+    if let Some(rest) = trimmed.strip_prefix("```json")
+        && let Some(inner) = rest.strip_suffix("```")
+    {
+        return inner.trim().to_string();
     }
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim().to_string();
-        }
+    if let Some(rest) = trimmed.strip_prefix("```")
+        && let Some(inner) = rest.strip_suffix("```")
+    {
+        return inner.trim().to_string();
     }
     trimmed.to_string()
 }

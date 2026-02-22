@@ -1,4 +1,6 @@
-use glitchlab_kernel::agent::{Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageRole};
+use glitchlab_kernel::agent::{
+    Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageRole,
+};
 use glitchlab_kernel::error;
 
 use super::parse::parse_json_response;
@@ -68,7 +70,10 @@ impl Agent for ArchivistAgent {
             },
         ];
 
-        let response = self.router.complete("archivist", &messages, 0.2, 4096, None).await?;
+        let response = self
+            .router
+            .complete("archivist", &messages, 0.2, 4096, None)
+            .await?;
 
         let metadata = AgentMetadata {
             agent: "archivist".into(),

@@ -37,9 +37,7 @@ impl OpenAiProvider {
     pub fn gemini_from_env() -> Result<Self, ProviderError> {
         let key = std::env::var("GOOGLE_API_KEY")
             .or_else(|_| std::env::var("GEMINI_API_KEY"))
-            .map_err(|_| {
-                ProviderError::MissingApiKey("GOOGLE_API_KEY or GEMINI_API_KEY".into())
-            })?;
+            .map_err(|_| ProviderError::MissingApiKey("GOOGLE_API_KEY or GEMINI_API_KEY".into()))?;
         Ok(Self::new(key, GEMINI_OPENAI_URL.into(), "gemini".into()))
     }
 
@@ -260,8 +258,14 @@ mod tests {
 
     fn test_messages() -> Vec<Message> {
         vec![
-            Message { role: MessageRole::System, content: "System prompt".into() },
-            Message { role: MessageRole::User, content: "Hello".into() },
+            Message {
+                role: MessageRole::System,
+                content: "System prompt".into(),
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hello".into(),
+            },
         ]
     }
 
@@ -272,7 +276,11 @@ mod tests {
 
     #[test]
     fn custom_provider() {
-        let _p = OpenAiProvider::custom("key".into(), "http://localhost:8080/v1".into(), "ollama".into());
+        let _p = OpenAiProvider::custom(
+            "key".into(),
+            "http://localhost:8080/v1".into(),
+            "ollama".into(),
+        );
     }
 
     #[tokio::test]
@@ -283,7 +291,9 @@ mod tests {
         });
         let url = mock_server(200, body.to_string()).await;
         let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
-        let result = provider.complete("gpt-4o", &test_messages(), 0.2, 4096, None).await;
+        let result = provider
+            .complete("gpt-4o", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert!(response.content.contains("result"));
@@ -296,7 +306,9 @@ mod tests {
     async fn complete_rate_limited() {
         let url = mock_server(429, "{}".into()).await;
         let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
-        let result = provider.complete("gpt-4o", &test_messages(), 0.2, 4096, None).await;
+        let result = provider
+            .complete("gpt-4o", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(matches!(result, Err(ProviderError::RateLimited { .. })));
     }
 
@@ -304,7 +316,9 @@ mod tests {
     async fn complete_api_error() {
         let url = mock_server(500, r#"{"error": "internal"}"#.into()).await;
         let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
-        let result = provider.complete("gpt-4o", &test_messages(), 0.2, 4096, None).await;
+        let result = provider
+            .complete("gpt-4o", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(matches!(result, Err(ProviderError::Api { .. })));
     }
 
@@ -316,7 +330,9 @@ mod tests {
         });
         let url = mock_server(200, body.to_string()).await;
         let provider = OpenAiProvider::new("test-key".into(), url, "gemini".into());
-        let result = provider.complete("gemini-2.5-flash", &test_messages(), 0.2, 4096, None).await;
+        let result = provider
+            .complete("gemini-2.5-flash", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert!(resp.model.contains("gemini"));
@@ -331,7 +347,9 @@ mod tests {
         let url = mock_server(200, body.to_string()).await;
         let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
         let format = serde_json::json!({"type": "json_object"});
-        let result = provider.complete("gpt-4o", &test_messages(), 0.2, 4096, Some(&format)).await;
+        let result = provider
+            .complete("gpt-4o", &test_messages(), 0.2, 4096, Some(&format))
+            .await;
         assert!(result.is_ok());
     }
 
@@ -344,12 +362,26 @@ mod tests {
         let url = mock_server(200, body.to_string()).await;
         let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
         let messages = vec![
-            Message { role: MessageRole::System, content: "System".into() },
-            Message { role: MessageRole::User, content: "Hi".into() },
-            Message { role: MessageRole::Assistant, content: "Hello".into() },
-            Message { role: MessageRole::User, content: "Follow up".into() },
+            Message {
+                role: MessageRole::System,
+                content: "System".into(),
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hi".into(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: "Hello".into(),
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Follow up".into(),
+            },
         ];
-        let result = provider.complete("gpt-4o", &messages, 0.2, 4096, None).await;
+        let result = provider
+            .complete("gpt-4o", &messages, 0.2, 4096, None)
+            .await;
         assert!(result.is_ok());
     }
 

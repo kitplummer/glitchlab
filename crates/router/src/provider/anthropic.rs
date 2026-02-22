@@ -241,8 +241,14 @@ mod tests {
 
     fn test_messages() -> Vec<Message> {
         vec![
-            Message { role: MessageRole::System, content: "System prompt".into() },
-            Message { role: MessageRole::User, content: "Hello".into() },
+            Message {
+                role: MessageRole::System,
+                content: "System prompt".into(),
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hello".into(),
+            },
         ]
     }
 
@@ -265,7 +271,15 @@ mod tests {
         });
         let url = mock_server(200, body.to_string()).await;
         let provider = AnthropicProvider::with_base_url("test-key".into(), url);
-        let result = provider.complete("claude-sonnet-4-20250514", &test_messages(), 0.2, 4096, None).await;
+        let result = provider
+            .complete(
+                "claude-sonnet-4-20250514",
+                &test_messages(),
+                0.2,
+                4096,
+                None,
+            )
+            .await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert!(response.content.contains("result"));
@@ -279,7 +293,15 @@ mod tests {
     async fn complete_rate_limited() {
         let url = mock_server(429, "{}".into()).await;
         let provider = AnthropicProvider::with_base_url("test-key".into(), url);
-        let result = provider.complete("claude-sonnet-4-20250514", &test_messages(), 0.2, 4096, None).await;
+        let result = provider
+            .complete(
+                "claude-sonnet-4-20250514",
+                &test_messages(),
+                0.2,
+                4096,
+                None,
+            )
+            .await;
         assert!(matches!(result, Err(ProviderError::RateLimited { .. })));
     }
 
@@ -287,7 +309,15 @@ mod tests {
     async fn complete_api_error() {
         let url = mock_server(500, r#"{"error": "internal"}"#.into()).await;
         let provider = AnthropicProvider::with_base_url("test-key".into(), url);
-        let result = provider.complete("claude-sonnet-4-20250514", &test_messages(), 0.2, 4096, None).await;
+        let result = provider
+            .complete(
+                "claude-sonnet-4-20250514",
+                &test_messages(),
+                0.2,
+                4096,
+                None,
+            )
+            .await;
         assert!(matches!(result, Err(ProviderError::Api { .. })));
     }
 
@@ -299,10 +329,13 @@ mod tests {
         });
         let url = mock_server(200, body.to_string()).await;
         let provider = AnthropicProvider::with_base_url("test-key".into(), url);
-        let messages = vec![
-            Message { role: MessageRole::User, content: "Hi".into() },
-        ];
-        let result = provider.complete("claude-haiku-3-20240307", &messages, 0.5, 1024, None).await;
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: "Hi".into(),
+        }];
+        let result = provider
+            .complete("claude-haiku-3-20240307", &messages, 0.5, 1024, None)
+            .await;
         assert!(result.is_ok());
     }
 

@@ -124,9 +124,7 @@ impl ContextAssembler {
                             // In practice, use a collected String.
                             Box::leak(truncated.into_boxed_str()),
                         ),
-                        _ => user_parts.push(
-                            Box::leak(truncated.into_boxed_str()),
-                        ),
+                        _ => user_parts.push(Box::leak(truncated.into_boxed_str())),
                     }
                     used_tokens += truncated_tokens;
                     included.push(segment.kind);
@@ -194,18 +192,12 @@ impl ContextAssembler {
         }
 
         // Priority 3: previous pipeline output.
-        if let Some(prev) = previous_output {
-            if !prev.is_null() {
-                let text = format!(
-                    "## Previous Stage Output\n\n```json\n{}\n```",
-                    serde_json::to_string_pretty(prev).unwrap_or_default()
-                );
-                segments.push(ContextSegment::new(
-                    SegmentKind::PreviousOutput,
-                    text,
-                    3,
-                ));
-            }
+        if let Some(prev) = previous_output.filter(|p| !p.is_null()) {
+            let text = format!(
+                "## Previous Stage Output\n\n```json\n{}\n```",
+                serde_json::to_string_pretty(prev).unwrap_or_default()
+            );
+            segments.push(ContextSegment::new(SegmentKind::PreviousOutput, text, 3));
         }
 
         // Priority 4: file contents.
@@ -215,16 +207,9 @@ impl ContextAssembler {
         }
 
         // Priority 5: failure history.
-        if let Some(history) = failure_history {
-            if !history.is_empty() {
-                let text =
-                    format!("## Recent Failure Patterns (avoid repeating)\n\n{history}");
-                segments.push(ContextSegment::new(
-                    SegmentKind::FailureHistory,
-                    text,
-                    5,
-                ));
-            }
+        if let Some(history) = failure_history.filter(|h| !h.is_empty()) {
+            let text = format!("## Recent Failure Patterns (avoid repeating)\n\n{history}");
+            segments.push(ContextSegment::new(SegmentKind::FailureHistory, text, 5));
         }
 
         segments
@@ -254,7 +239,7 @@ fn estimate_tokens(text: &str) -> usize {
     // Use byte length / 4 as a rough estimate.
     // This is deliberately conservative (overestimates for ASCII,
     // reasonable for mixed content).
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Truncate text to approximately `max_tokens` tokens.
@@ -268,10 +253,8 @@ fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
     let truncated = &text[..max_chars.min(text.len())];
 
     // Try to break at the last newline for clean output.
-    if let Some(last_nl) = truncated.rfind('\n') {
-        if last_nl > max_chars / 2 {
-            return format!("{}\n\n[... truncated]", &truncated[..last_nl]);
-        }
+    if let Some(last_nl) = truncated.rfind('\n').filter(|&pos| pos > max_chars / 2) {
+        return format!("{}\n\n[... truncated]", &truncated[..last_nl]);
     }
 
     format!("{truncated}\n\n[... truncated]")
@@ -307,11 +290,7 @@ mod tests {
         let assembler = ContextAssembler::new(10);
         let segments = vec![
             ContextSegment::new(SegmentKind::SystemPrompt, "Agent.".into(), 0),
-            ContextSegment::new(
-                SegmentKind::FileContents,
-                "x".repeat(1000),
-                4,
-            ),
+            ContextSegment::new(SegmentKind::FileContents, "x".repeat(1000), 4),
         ];
 
         let result = assembler.assemble(&segments);
@@ -361,7 +340,7 @@ mod tests {
     fn token_estimation_is_reasonable() {
         // 100 ASCII chars should be ~25 tokens.
         let tokens = estimate_tokens(&"x".repeat(100));
-        assert!(tokens >= 20 && tokens <= 30);
+        assert!((20..=30).contains(&tokens));
     }
 
     #[test]

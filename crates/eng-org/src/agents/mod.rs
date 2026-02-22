@@ -15,11 +15,11 @@ pub type RouterRef = Arc<glitchlab_router::Router>;
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
-    use std::collections::HashMap;
     use glitchlab_kernel::agent::{AgentContext, Message};
     use glitchlab_kernel::budget::BudgetTracker;
-    use glitchlab_router::provider::{Provider, ProviderFuture};
     use glitchlab_router::RouterResponse;
+    use glitchlab_router::provider::{Provider, ProviderFuture};
+    use std::collections::HashMap;
 
     pub(crate) struct MockProvider;
 

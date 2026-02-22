@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::openai::OpenAiProvider;
-use crate::provider::{parse_model_string, Provider, ProviderError};
+use crate::provider::{Provider, ProviderError, parse_model_string};
 use crate::response::RouterResponse;
 
 // ---------------------------------------------------------------------------
@@ -80,10 +80,9 @@ impl Router {
         }
 
         // Resolve role → model string.
-        let model_string = self
-            .routing
-            .get(role)
-            .ok_or_else(|| error::Error::Config(format!("no model configured for role `{role}`")))?;
+        let model_string = self.routing.get(role).ok_or_else(|| {
+            error::Error::Config(format!("no model configured for role `{role}`"))
+        })?;
 
         let (provider_name, model_id) = parse_model_string(model_string);
 
@@ -94,11 +93,7 @@ impl Router {
             ))
         })?;
 
-        info!(
-            role,
-            model = model_string,
-            "router: calling LLM"
-        );
+        info!(role, model = model_string, "router: calling LLM");
 
         // Call with retry (up to 3 attempts on transient errors).
         let mut last_err = None;
@@ -181,10 +176,10 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glitchlab_kernel::agent::{Message, MessageRole};
-    use glitchlab_kernel::budget::BudgetTracker;
     use crate::provider::{Provider, ProviderError, ProviderFuture};
     use crate::response::RouterResponse;
+    use glitchlab_kernel::agent::{Message, MessageRole};
+    use glitchlab_kernel::budget::BudgetTracker;
 
     struct MockProvider {
         response: RouterResponse,
@@ -231,16 +226,20 @@ mod tests {
             _max_tokens: u32,
             _response_format: Option<&serde_json::Value>,
         ) -> ProviderFuture<'_> {
-            Box::pin(async move {
-                Err(ProviderError::Parse("test error".into()))
-            })
+            Box::pin(async move { Err(ProviderError::Parse("test error".into())) })
         }
     }
 
     fn test_messages() -> Vec<Message> {
         vec![
-            Message { role: MessageRole::System, content: "You are a test.".into() },
-            Message { role: MessageRole::User, content: "Hello".into() },
+            Message {
+                role: MessageRole::System,
+                content: "You are a test.".into(),
+            },
+            Message {
+                role: MessageRole::User,
+                content: "Hello".into(),
+            },
         ]
     }
 
@@ -251,7 +250,9 @@ mod tests {
         let mut router = Router::new(routing, budget);
         router.register_provider("mock".into(), Arc::new(MockProvider::ok()));
 
-        let result = router.complete("planner", &test_messages(), 0.2, 4096, None).await;
+        let result = router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(result.is_ok());
         let response = result.unwrap();
         assert_eq!(response.content, r#"{"result": "ok"}"#);
@@ -265,7 +266,10 @@ mod tests {
         let mut router = Router::new(routing, budget);
         router.register_provider("mock".into(), Arc::new(MockProvider::ok()));
 
-        router.complete("planner", &test_messages(), 0.2, 4096, None).await.unwrap();
+        router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await
+            .unwrap();
 
         let summary = router.budget_summary().await;
         assert_eq!(summary.total_tokens, 150);
@@ -279,7 +283,9 @@ mod tests {
         let budget = BudgetTracker::new(100_000, 10.0);
         let router = Router::new(routing, budget);
 
-        let result = router.complete("nonexistent", &test_messages(), 0.2, 4096, None).await;
+        let result = router
+            .complete("nonexistent", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -289,7 +295,9 @@ mod tests {
         let budget = BudgetTracker::new(100_000, 10.0);
         let router = Router::new(routing, budget);
 
-        let result = router.complete("planner", &test_messages(), 0.2, 4096, None).await;
+        let result = router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -300,7 +308,9 @@ mod tests {
         let mut router = Router::new(routing, budget);
         router.register_provider("err".into(), Arc::new(ErrorProvider));
 
-        let result = router.complete("planner", &test_messages(), 0.2, 4096, None).await;
+        let result = router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -311,7 +321,9 @@ mod tests {
         let mut router = Router::new(routing, budget);
         router.register_provider("local".into(), Arc::new(MockProvider::ok()));
 
-        let result = router.complete("custom", &test_messages(), 0.2, 4096, None).await;
+        let result = router
+            .complete("custom", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(result.is_ok());
     }
 
@@ -357,10 +369,15 @@ mod tests {
         router.register_provider("mock".into(), Arc::new(MockProvider::ok()));
 
         // First call succeeds and uses up budget.
-        router.complete("planner", &test_messages(), 0.2, 4096, None).await.unwrap();
+        router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await
+            .unwrap();
 
         // Second call should fail due to budget.
-        let result = router.complete("planner", &test_messages(), 0.2, 4096, None).await;
+        let result = router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await;
         assert!(result.is_err());
     }
 }

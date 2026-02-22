@@ -231,7 +231,9 @@ mod tests {
     #[test]
     fn record_and_read() {
         let (_dir, history) = temp_history();
-        history.record(&sample_entry("task-1", "pr_created")).unwrap();
+        history
+            .record(&sample_entry("task-1", "pr_created"))
+            .unwrap();
         history.record(&sample_entry("task-2", "error")).unwrap();
 
         let recent = history.get_recent(10).unwrap();
@@ -243,10 +245,16 @@ mod tests {
     #[test]
     fn failures_only() {
         let (_dir, history) = temp_history();
-        history.record(&sample_entry("task-1", "pr_created")).unwrap();
+        history
+            .record(&sample_entry("task-1", "pr_created"))
+            .unwrap();
         history.record(&sample_entry("task-2", "error")).unwrap();
-        history.record(&sample_entry("task-3", "tests_failed")).unwrap();
-        history.record(&sample_entry("task-4", "committed")).unwrap();
+        history
+            .record(&sample_entry("task-3", "tests_failed"))
+            .unwrap();
+        history
+            .record(&sample_entry("task-4", "committed"))
+            .unwrap();
 
         let failures = history.get_failures(10).unwrap();
         assert_eq!(failures.len(), 2);
@@ -272,9 +280,13 @@ mod tests {
     #[test]
     fn stats() {
         let (_dir, history) = temp_history();
-        history.record(&sample_entry("task-1", "pr_created")).unwrap();
+        history
+            .record(&sample_entry("task-1", "pr_created"))
+            .unwrap();
         history.record(&sample_entry("task-2", "error")).unwrap();
-        history.record(&sample_entry("task-3", "pr_created")).unwrap();
+        history
+            .record(&sample_entry("task-3", "pr_created"))
+            .unwrap();
 
         let stats = history.get_stats().unwrap();
         assert_eq!(stats.total_runs, 3);

@@ -41,12 +41,7 @@ impl BudgetTracker {
     }
 
     /// Record usage from an LLM call.
-    pub fn record(
-        &mut self,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        cost: f64,
-    ) {
+    pub fn record(&mut self, prompt_tokens: u64, completion_tokens: u64, cost: f64) {
         self.usage.prompt_tokens += prompt_tokens;
         self.usage.completion_tokens += completion_tokens;
         self.usage.total_tokens += prompt_tokens + completion_tokens;
@@ -56,8 +51,7 @@ impl BudgetTracker {
 
     /// True if either token or dollar limit has been exceeded.
     pub fn exceeded(&self) -> bool {
-        self.usage.total_tokens > self.max_tokens
-            || self.usage.estimated_cost > self.max_dollars
+        self.usage.total_tokens > self.max_tokens || self.usage.estimated_cost > self.max_dollars
     }
 
     /// Tokens remaining before hitting the limit.

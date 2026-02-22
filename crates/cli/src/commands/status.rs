@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use glitchlab_eng_org::config::{check_api_keys, detect_test_command, EngConfig};
+use glitchlab_eng_org::config::{EngConfig, check_api_keys, detect_test_command};
 
 pub async fn execute(repo: Option<&Path>) -> Result<()> {
     println!("GLITCHLAB Status\n");
@@ -27,8 +27,14 @@ pub async fn execute(repo: Option<&Path>) -> Result<()> {
 
     println!("Limits:");
     println!("  max fix attempts:   {}", config.limits.max_fix_attempts);
-    println!("  max tokens/task:    {}", config.limits.max_tokens_per_task);
-    println!("  max dollars/task:   ${:.2}", config.limits.max_dollars_per_task);
+    println!(
+        "  max tokens/task:    {}",
+        config.limits.max_tokens_per_task
+    );
+    println!(
+        "  max dollars/task:   ${:.2}",
+        config.limits.max_dollars_per_task
+    );
     println!();
 
     // Repo-specific info.
