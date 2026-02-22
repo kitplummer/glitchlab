@@ -315,6 +315,40 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    struct RateLimitedProvider;
+
+    impl Provider for RateLimitedProvider {
+        fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _temperature: f32,
+            _max_tokens: u32,
+            _response_format: Option<&serde_json::Value>,
+        ) -> ProviderFuture<'_> {
+            Box::pin(async move {
+                Err(ProviderError::RateLimited {
+                    retry_after_ms: Some(1),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_retries_on_rate_limit_then_exhausts() {
+        let routing = HashMap::from([("planner".to_string(), "rl/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget);
+        router.register_provider("rl".into(), Arc::new(RateLimitedProvider));
+
+        let result = router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("exhausted retries"), "got: {err_msg}");
+    }
+
     #[tokio::test]
     async fn budget_exceeded_blocks_call() {
         let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);

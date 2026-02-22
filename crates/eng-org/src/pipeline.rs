@@ -1516,4 +1516,315 @@ mod tests {
         assert_eq!(result.status, PipelineStatus::Interrupted);
         assert!(result.error.as_deref().unwrap().contains("rejected"));
     }
+
+    /// Helper: initialize a git repo with a commit, return the base branch name.
+    fn init_test_repo(dir: &Path) -> String {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        let output = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn try_git_apply_valid_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+
+        // Create a tracked file.
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "f.txt"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add f"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let patch =
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+        try_git_apply(dir.path(), patch).await.unwrap();
+
+        let content =
+            tokio::fs::read_to_string(dir.path().join("f.txt"))
+                .await
+                .unwrap();
+        assert!(content.contains("B"));
+    }
+
+    #[tokio::test]
+    async fn try_git_apply_invalid_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+
+        let result = try_git_apply(dir.path(), "not a valid patch").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("git apply failed"));
+    }
+
+    #[tokio::test]
+    async fn apply_changes_modify_with_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+
+        std::fs::write(dir.path().join("src.rs"), "fn old() {}\n")
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "src.rs"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add src"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let patch = "--- a/src.rs\n+++ b/src.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new_func() {}\n";
+        let changes = vec![serde_json::json!({
+            "file": "src.rs",
+            "action": "modify",
+            "patch": patch,
+        })];
+
+        apply_changes(dir.path(), &changes).await.unwrap();
+        let content =
+            tokio::fs::read_to_string(dir.path().join("src.rs"))
+                .await
+                .unwrap();
+        assert!(content.contains("new_func"));
+    }
+
+    #[tokio::test]
+    async fn run_tests_empty_command() {
+        let dir = tempfile::tempdir().unwrap();
+        run_tests("", dir.path()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pipeline_with_test_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Add a Makefile with a test target that succeeds.
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "test:\n\t@echo tests pass\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "Makefile"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add Makefile"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let router = mock_router_ref();
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let pipeline = EngineeringPipeline::new(router, config, handler);
+
+        let result = pipeline
+            .run(
+                "test-with-tests",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+            )
+            .await;
+
+        // Tests should pass, then push fails (no remote) → Committed.
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated,
+            "unexpected status: {:?}",
+            result.status
+        );
+        // Check that TestsPassed event was emitted.
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::TestsPassed),
+            "expected TestsPassed event"
+        );
+    }
+
+    /// Handler that approves plan review but rejects PR review.
+    struct PrRejectHandler;
+
+    impl InterventionHandler for PrRejectHandler {
+        fn request_approval(
+            &self,
+            gate: &str,
+            _summary: &str,
+            _data: &serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = bool> + Send + '_>,
+        > {
+            let approve = gate != "pr_review";
+            Box::pin(async move { approve })
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_pr_review_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let router = mock_router_ref();
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = true;
+        config.intervention.pause_before_pr = true;
+
+        let handler = Arc::new(PrRejectHandler);
+        let pipeline = EngineeringPipeline::new(router, config, handler);
+
+        let result = pipeline
+            .run(
+                "test-pr-reject",
+                "Fix something",
+                dir.path(),
+                &base_branch,
+            )
+            .await;
+
+        // Pipeline should commit but stop before PR.
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(result.error.is_none());
+        assert!(result.branch.is_some());
+        assert!(result.pr_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn pipeline_tests_fail_debug_no_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Makefile with test target that always fails.
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "test:\n\t@echo FAIL && exit 1\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "Makefile"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add failing test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let router = mock_router_ref();
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let pipeline = EngineeringPipeline::new(router, config, handler);
+
+        let result = pipeline
+            .run(
+                "test-fail-debug",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+            )
+            .await;
+
+        // Mock debugger returns should_retry: false, so pipeline stops.
+        assert_eq!(result.status, PipelineStatus::TestsFailed);
+        assert!(result.error.is_some());
+        // Should have TestsFailed and DebugAttempt events.
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::TestsFailed)
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::DebugAttempt)
+        );
+        // Should have a debug_1 stage output.
+        assert!(result.stage_outputs.contains_key("debug_1"));
+    }
+
+    #[tokio::test]
+    async fn create_pr_without_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fallback_output(
+            "planner",
+            serde_json::json!({
+                "steps": [{"description": "step 1"}],
+                "risk_level": "low"
+            }),
+        );
+        let security = fallback_output(
+            "security",
+            serde_json::json!({"verdict": "pass"}),
+        );
+
+        // gh pr create will fail — no git repo, no remote.
+        let result = create_pr(
+            dir.path(),
+            "test-branch",
+            "main",
+            "Test PR",
+            &plan,
+            &security,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_tests_multiword_command() {
+        let dir = tempfile::tempdir().unwrap();
+        // Multi-word command that succeeds.
+        run_tests("echo hello world", dir.path()).await.unwrap();
+    }
 }
