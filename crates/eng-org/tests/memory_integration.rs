@@ -4,11 +4,13 @@
 //! failure context fetched -> agents see it on the next run.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use glitchlab_kernel::agent::Message;
 use glitchlab_kernel::budget::{BudgetSummary, BudgetTracker};
+use glitchlab_kernel::tool::{ToolCall, ToolDefinition};
 use glitchlab_memory::composite::CompositeHistory;
 use glitchlab_memory::history::{
     EventsSummary, HistoryBackend, HistoryEntry, HistoryQuery, JsonlHistory,
@@ -26,9 +28,20 @@ use glitchlab_eng_org::pipeline::{AutoApproveHandler, EngineeringPipeline};
 
 type RouterRef = Arc<glitchlab_router::Router>;
 
-struct MockProvider;
+/// Sequential mock provider: returns pre-scripted responses in order.
+struct SequentialMockProvider {
+    responses: Mutex<VecDeque<RouterResponse>>,
+}
 
-impl Provider for MockProvider {
+impl SequentialMockProvider {
+    fn new(responses: Vec<RouterResponse>) -> Self {
+        Self {
+            responses: Mutex::new(VecDeque::from(responses)),
+        }
+    }
+}
+
+impl Provider for SequentialMockProvider {
     fn complete(
         &self,
         _model: &str,
@@ -37,34 +50,137 @@ impl Provider for MockProvider {
         _max_tokens: u32,
         _response_format: Option<&serde_json::Value>,
     ) -> ProviderFuture<'_> {
-        Box::pin(async move {
-            Ok(RouterResponse {
-                content: r#"{"result": "ok", "steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "trivial", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false, "verdict": "pass", "issues": [], "version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": [], "diagnosis": "none", "root_cause": "none", "fix": {"changes": []}, "confidence": "high", "should_retry": false, "changes": [{"file": "src/new.rs", "action": "create", "content": "pub fn greet() -> &'static str { \"hello\" }\n", "description": "add greet function"}], "tests_added": [], "commit_message": "feat: add greet function", "summary": "test", "adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#.into(),
-                model: "mock/test-model".into(),
-                prompt_tokens: 100,
-                completion_tokens: 50,
-                total_tokens: 150,
-                cost: 0.001,
-                latency_ms: 42,
+        let response = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| RouterResponse {
+                content: "no more responses".into(),
+                model: "mock/test".into(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                cost: 0.0,
+                latency_ms: 0,
                 tool_calls: vec![],
                 stop_reason: None,
-            })
-        })
+            });
+        Box::pin(async move { Ok(response) })
+    }
+
+    fn complete_with_tools(
+        &self,
+        model: &str,
+        messages: &[Message],
+        temperature: f32,
+        max_tokens: u32,
+        _tools: &[ToolDefinition],
+        response_format: Option<&serde_json::Value>,
+    ) -> ProviderFuture<'_> {
+        self.complete(model, messages, temperature, max_tokens, response_format)
     }
 }
 
-fn mock_router_ref() -> RouterRef {
+fn final_response(content: &str) -> RouterResponse {
+    RouterResponse {
+        content: content.into(),
+        model: "mock/test".into(),
+        prompt_tokens: 50,
+        completion_tokens: 25,
+        total_tokens: 75,
+        cost: 0.0005,
+        latency_ms: 20,
+        tool_calls: vec![],
+        stop_reason: Some("end_turn".into()),
+    }
+}
+
+fn tool_response(calls: Vec<ToolCall>) -> RouterResponse {
+    RouterResponse {
+        content: String::new(),
+        model: "mock/test".into(),
+        prompt_tokens: 50,
+        completion_tokens: 25,
+        total_tokens: 75,
+        cost: 0.0005,
+        latency_ms: 20,
+        tool_calls: calls,
+        stop_reason: Some("tool_use".into()),
+    }
+}
+
+/// Full pipeline mock responses: planner → implementer (tool + final) →
+/// security → release → archivist.
+fn pipeline_mock_responses() -> Vec<RouterResponse> {
+    vec![
+        // 1. Planner
+        final_response(
+            r#"{"steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "trivial", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+        ),
+        // 2. Implementer — write_file tool call
+        tool_response(vec![ToolCall {
+            id: "toolu_01".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() -> &'static str { \"hello\" }\n"}),
+        }]),
+        // 3. Implementer — final metadata
+        final_response(
+            r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: add greet function", "summary": "test"}"#,
+        ),
+        // 4. Security
+        final_response(r#"{"verdict": "pass", "issues": [], "summary": "no issues"}"#),
+        // 5. Release
+        final_response(
+            r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
+        ),
+        // 6. Archivist
+        final_response(
+            r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
+        ),
+    ]
+}
+
+/// Pipeline mock responses for failing-test scenario:
+/// planner → implementer (tool + final) → debugger (should_retry: false).
+fn pipeline_debug_fail_responses() -> Vec<RouterResponse> {
+    vec![
+        // 1. Planner
+        final_response(
+            r#"{"steps": [{"step_number": 1, "description": "fix bug"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+        ),
+        // 2. Implementer — write_file tool call
+        tool_response(vec![ToolCall {
+            id: "toolu_01".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() -> &'static str { \"hello\" }\n"}),
+        }]),
+        // 3. Implementer — final metadata
+        final_response(
+            r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "fix: bug", "summary": "fixed"}"#,
+        ),
+        // 4. Debugger — should_retry: false
+        final_response(
+            r#"{"diagnosis": "test failure", "root_cause": "bug", "files_changed": [], "confidence": "low", "should_retry": false, "notes": null}"#,
+        ),
+    ]
+}
+
+fn sequential_router_ref(responses: Vec<RouterResponse>) -> RouterRef {
     let routing = HashMap::from([
-        ("planner".to_string(), "mock/test".to_string()),
-        ("implementer".to_string(), "mock/test".to_string()),
-        ("debugger".to_string(), "mock/test".to_string()),
-        ("security".to_string(), "mock/test".to_string()),
-        ("release".to_string(), "mock/test".to_string()),
-        ("archivist".to_string(), "mock/test".to_string()),
+        ("planner".to_string(), "seq/test".to_string()),
+        ("implementer".to_string(), "seq/test".to_string()),
+        ("debugger".to_string(), "seq/test".to_string()),
+        ("security".to_string(), "seq/test".to_string()),
+        ("release".to_string(), "seq/test".to_string()),
+        ("archivist".to_string(), "seq/test".to_string()),
     ]);
     let budget = BudgetTracker::new(1_000_000, 100.0);
     let mut router = glitchlab_router::Router::new(routing, budget);
-    router.register_provider("mock".into(), Arc::new(MockProvider));
+    router.register_provider(
+        "seq".into(),
+        Arc::new(SequentialMockProvider::new(responses)),
+    );
     Arc::new(router)
 }
 
@@ -141,8 +257,8 @@ async fn pipeline_records_history_to_composite() {
     let composite: Arc<dyn HistoryBackend> =
         Arc::new(CompositeHistory::new(vec![b1.clone(), b2.clone()]));
 
-    // Build pipeline with mock router + auto-approve + composite history.
-    let router = mock_router_ref();
+    // Build pipeline with sequential mock router + auto-approve + composite history.
+    let router = sequential_router_ref(pipeline_mock_responses());
     let mut config = EngConfig::default();
     config.intervention.pause_after_plan = false;
     config.intervention.pause_before_pr = false;
@@ -210,7 +326,7 @@ async fn failure_context_flows_across_runs() {
     let composite: Arc<dyn HistoryBackend> = Arc::new(CompositeHistory::new(vec![jsonl.clone()]));
 
     // Run 1: pipeline for "task-fail" -> should fail (TestsFailed).
-    let router = mock_router_ref();
+    let router = sequential_router_ref(pipeline_debug_fail_responses());
     let mut config = EngConfig::default();
     config.intervention.pause_after_plan = false;
     config.intervention.pause_before_pr = false;
@@ -271,7 +387,7 @@ async fn failure_context_flows_across_runs() {
         .unwrap();
 
     // Run 2: pipeline for "task-2".
-    let router2 = mock_router_ref();
+    let router2 = sequential_router_ref(pipeline_mock_responses());
     let mut config2 = EngConfig::default();
     config2.intervention.pause_after_plan = false;
     config2.intervention.pause_before_pr = false;
@@ -330,7 +446,7 @@ async fn history_persists_across_pipeline_instances() {
         let jsonl: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(hist_dir.path()));
         let composite: Arc<dyn HistoryBackend> = Arc::new(CompositeHistory::new(vec![jsonl]));
 
-        let router = mock_router_ref();
+        let router = sequential_router_ref(pipeline_mock_responses());
         let mut config = EngConfig::default();
         config.intervention.pause_after_plan = false;
         config.intervention.pause_before_pr = false;

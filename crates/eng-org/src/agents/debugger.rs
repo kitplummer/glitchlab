@@ -35,22 +35,16 @@ Do not refactor, add features, or clean up code.
 
 When you are done debugging, emit a final text response with this JSON schema:
 {
-  "diagnosis": "<what went wrong and why>",
-  "root_cause": "<the specific root cause>",
-  "fix": {
-    "changes": [
-      {
-        "file": "<path/to/file>",
-        "action": "modify",
-        "patch": "<unified diff of the fix>",
-        "description": "<what this fixes>"
-      }
-    ]
-  },
+  "diagnosis": "<what went wrong>",
+  "root_cause": "<root cause>",
+  "files_changed": ["path/to/file", ...],
   "confidence": "high|medium|low",
   "should_retry": <bool>,
-  "notes": "<any additional context>"
+  "notes": "<additional context>"
 }
+
+Do NOT include patches or file content in your final JSON — your tool calls already wrote
+the fixes. The final JSON is metadata only.
 
 Rules:
 - Fix ONLY what is broken. Minimal diff.
@@ -116,7 +110,7 @@ impl Agent for DebuggerAgent {
         let fallback = serde_json::json!({
             "diagnosis": "Failed to parse debugger output",
             "root_cause": "unknown",
-            "fix": { "changes": [] },
+            "files_changed": [],
             "confidence": "low",
             "should_retry": false,
             "notes": null
@@ -181,7 +175,7 @@ mod tests {
             }]),
             // Turn 2: final diagnosis
             final_response(
-                r#"{"diagnosis": "found the bug", "root_cause": "typo", "fix": {"changes": []}, "confidence": "high", "should_retry": false, "notes": null}"#,
+                r#"{"diagnosis": "found the bug", "root_cause": "typo", "files_changed": ["bug.rs"], "confidence": "high", "should_retry": false, "notes": null}"#,
             ),
         ];
         let router = sequential_router_ref(responses);

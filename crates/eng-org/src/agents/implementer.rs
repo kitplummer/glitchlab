@@ -33,25 +33,14 @@ You receive a plan and implement it by iteratively reading, editing, and testing
 
 When you are done implementing, emit a final text response with this JSON schema:
 {
-  "changes": [
-    {
-      "file": "<path/to/file>",
-      "action": "modify|create|delete",
-      "content": "<full file content if create, or null for delete>",
-      "patch": "<unified diff for modify (preferred for existing files)>",
-      "description": "<what this change does>"
-    }
-  ],
-  "tests_added": [
-    {
-      "file": "<path/to/test_file>",
-      "content": "<full test file content or additions>",
-      "description": "<what this tests>"
-    }
-  ],
+  "files_changed": ["path/to/file", ...],
+  "tests_added": ["path/to/test_file", ...],
   "commit_message": "<conventional commit message>",
-  "summary": "<brief human-readable summary of all changes>"
+  "summary": "<brief human-readable summary>"
 }
+
+Do NOT include file content or patches in your final JSON — your tool calls already wrote
+the files. The final JSON is metadata only.
 
 Rules:
 - Follow the plan exactly. No feature creep.
@@ -115,7 +104,7 @@ impl Agent for ImplementerAgent {
         };
 
         let fallback = serde_json::json!({
-            "changes": [],
+            "files_changed": [],
             "tests_added": [],
             "commit_message": "chore: no changes produced",
             "summary": "Failed to parse implementer output"
@@ -181,7 +170,7 @@ mod tests {
             }]),
             // Turn 2: final response
             final_response(
-                r#"{"changes": [], "tests_added": [], "commit_message": "feat: done", "summary": "implemented"}"#,
+                r#"{"files_changed": ["lib.rs"], "tests_added": [], "commit_message": "feat: done", "summary": "implemented"}"#,
             ),
         ];
         let router = sequential_router_ref(responses);

@@ -323,19 +323,7 @@ impl EngineeringPipeline {
         ctx.stage_outputs
             .insert("implement".into(), impl_output.clone());
 
-        // --- Stage 7: Apply changes ---
-        let changes = extract_changes(&impl_output.data);
-        if let Err(e) = apply_changes(&wt_path, &changes).await {
-            return self
-                .fail(
-                    ctx,
-                    PipelineStatus::ImplementationFailed,
-                    format!("apply changes failed: {e}"),
-                )
-                .await;
-        }
-
-        // --- Stage 8-9: Test / debug loop ---
+        // --- Stage 7: Test / debug loop ---
         ctx.current_stage = Some("test".into());
         let test_cmd = self
             .config
@@ -424,22 +412,6 @@ impl EngineeringPipeline {
                                     ctx,
                                     PipelineStatus::TestsFailed,
                                     "debugger recommends not retrying".into(),
-                                )
-                                .await;
-                        }
-
-                        // Apply debug fix.
-                        let fix_changes = debug_out
-                            .data
-                            .get("fix")
-                            .map(extract_changes)
-                            .unwrap_or_default();
-                        if let Err(e) = apply_changes(&wt_path, &fix_changes).await {
-                            return self
-                                .fail(
-                                    ctx,
-                                    PipelineStatus::TestsFailed,
-                                    format!("apply debug fix failed: {e}"),
                                 )
                                 .await;
                         }
@@ -781,136 +753,6 @@ async fn read_relevant_files(
 }
 
 // ---------------------------------------------------------------------------
-// Change application
-// ---------------------------------------------------------------------------
-
-/// Extract the changes array from agent output data.
-/// Handles both implementer format (`changes` + `tests_added`) and
-/// debugger format (`changes` only).
-fn extract_changes(data: &serde_json::Value) -> Vec<serde_json::Value> {
-    let mut changes = Vec::new();
-
-    if let Some(arr) = data["changes"].as_array() {
-        changes.extend(arr.iter().cloned());
-    }
-
-    // Implementer also produces tests_added — treat as creates.
-    if let Some(arr) = data["tests_added"].as_array() {
-        for test in arr {
-            changes.push(serde_json::json!({
-                "file": test["file"],
-                "action": "create",
-                "content": test["content"],
-                "description": test["description"],
-            }));
-        }
-    }
-
-    changes
-}
-
-/// Apply file changes to the worktree.
-async fn apply_changes(worktree: &Path, changes: &[serde_json::Value]) -> Result<(), String> {
-    for change in changes {
-        let file = change["file"]
-            .as_str()
-            .ok_or_else(|| "change missing 'file' field".to_string())?;
-        let action = change["action"].as_str().unwrap_or("modify");
-        let full_path = worktree.join(file);
-
-        match action {
-            "create" => {
-                let content = change["content"]
-                    .as_str()
-                    .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| {
-                        format!("create action for `{file}` has empty or missing content")
-                    })?;
-                if let Some(parent) = full_path.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-                }
-                tokio::fs::write(&full_path, content)
-                    .await
-                    .map_err(|e| format!("write {file}: {e}"))?;
-            }
-            "delete" => {
-                if full_path.exists() {
-                    tokio::fs::remove_file(&full_path)
-                        .await
-                        .map_err(|e| format!("delete {file}: {e}"))?;
-                }
-            }
-            _ => {
-                // modify or any unknown action: try patch, fall back to content.
-                if let Some(patch) = change["patch"].as_str()
-                    && !patch.is_empty()
-                    && try_git_apply(worktree, patch).await.is_ok()
-                {
-                    continue;
-                }
-                match change["content"].as_str().filter(|s| !s.trim().is_empty()) {
-                    Some(content) => {
-                        if let Some(parent) = full_path.parent() {
-                            tokio::fs::create_dir_all(parent)
-                                .await
-                                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-                        }
-                        tokio::fs::write(&full_path, content)
-                            .await
-                            .map_err(|e| format!("write {file}: {e}"))?;
-                    }
-                    None if full_path.exists() => {
-                        // File already exists (likely written by tool-use loop) — skip.
-                        tracing::debug!(file, "skipping modify with no content — file exists");
-                    }
-                    None => {
-                        return Err(format!(
-                            "modify action for `{file}` has no usable patch or content — \
-                             the implementer failed to produce changes for this file"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Try to apply a unified diff via `git apply`.
-async fn try_git_apply(worktree: &Path, patch: &str) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut child = Command::new("git")
-        .args(["-C", &worktree.to_string_lossy(), "apply", "--3way", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn git apply: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(patch.as_bytes())
-            .await
-            .map_err(|e| format!("write patch: {e}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("wait git apply: {e}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("git apply failed: {stderr}"))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
 
@@ -1152,10 +994,46 @@ fn build_events_summary(stage_outputs: &HashMap<String, AgentOutput>) -> EventsS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::test_helpers::mock_router_ref;
+    use crate::agents::test_helpers::{
+        final_response, mock_router_ref, sequential_router_ref, tool_response,
+    };
     use glitchlab_kernel::agent::{AgentMetadata, AgentOutput};
     use glitchlab_kernel::budget::BudgetSummary;
+    use glitchlab_kernel::tool::ToolCall;
     use glitchlab_memory::history::JsonlHistory;
+
+    /// Build the scripted sequence of LLM responses for a full pipeline run.
+    ///
+    /// Order: planner → implementer (tool_use) → implementer (final) →
+    ///        security → release → archivist.
+    fn pipeline_mock_responses() -> Vec<glitchlab_router::RouterResponse> {
+        vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "trivial", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Implementer — write_file tool call
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() -> &'static str { \"hello\" }\n"}),
+            }]),
+            // 3. Implementer — final metadata
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: add greet function", "summary": "test"}"#,
+            ),
+            // 4. Security
+            final_response(r#"{"verdict": "pass", "issues": [], "summary": "no issues"}"#),
+            // 5. Release
+            final_response(
+                r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
+            ),
+            // 6. Archivist
+            final_response(
+                r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
+            ),
+        ]
+    }
 
     #[tokio::test]
     async fn auto_approve_handler() {
@@ -1174,189 +1052,6 @@ mod tests {
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
         let _pipeline = EngineeringPipeline::new(router, config, handler, history);
-    }
-
-    #[test]
-    fn extract_changes_from_implementer() {
-        let data = serde_json::json!({
-            "changes": [
-                {"file": "src/lib.rs", "action": "modify", "content": "code"},
-            ],
-            "tests_added": [
-                {"file": "tests/test.rs", "content": "test code", "description": "unit tests"},
-            ],
-        });
-        let changes = extract_changes(&data);
-        assert_eq!(changes.len(), 2);
-        assert_eq!(changes[0]["file"], "src/lib.rs");
-        assert_eq!(changes[1]["action"], "create");
-    }
-
-    #[test]
-    fn extract_changes_from_debugger() {
-        let data = serde_json::json!({
-            "changes": [
-                {"file": "src/bug.rs", "action": "modify", "patch": "diff"},
-            ],
-        });
-        let changes = extract_changes(&data);
-        assert_eq!(changes.len(), 1);
-    }
-
-    #[test]
-    fn extract_changes_empty() {
-        let data = serde_json::json!({});
-        let changes = extract_changes(&data);
-        assert!(changes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn apply_changes_create_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let changes = vec![serde_json::json!({
-            "file": "src/new.rs",
-            "action": "create",
-            "content": "fn main() {}",
-        })];
-        apply_changes(dir.path(), &changes).await.unwrap();
-        let content = tokio::fs::read_to_string(dir.path().join("src/new.rs"))
-            .await
-            .unwrap();
-        assert_eq!(content, "fn main() {}");
-    }
-
-    #[tokio::test]
-    async fn apply_changes_delete_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("to_delete.txt");
-        tokio::fs::write(&file_path, "goodbye").await.unwrap();
-        assert!(file_path.exists());
-
-        let changes = vec![serde_json::json!({
-            "file": "to_delete.txt",
-            "action": "delete",
-        })];
-        apply_changes(dir.path(), &changes).await.unwrap();
-        assert!(!file_path.exists());
-    }
-
-    #[tokio::test]
-    async fn apply_changes_delete_nonexistent() {
-        let dir = tempfile::tempdir().unwrap();
-        let changes = vec![serde_json::json!({
-            "file": "nonexistent.txt",
-            "action": "delete",
-        })];
-        // Should not error when file doesn't exist.
-        apply_changes(dir.path(), &changes).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn apply_changes_modify_with_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("existing.rs");
-        tokio::fs::write(&file_path, "old content").await.unwrap();
-
-        let changes = vec![serde_json::json!({
-            "file": "existing.rs",
-            "action": "modify",
-            "content": "new content",
-        })];
-        apply_changes(dir.path(), &changes).await.unwrap();
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "new content");
-    }
-
-    #[tokio::test]
-    async fn apply_changes_missing_file_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let changes = vec![serde_json::json!({
-            "action": "create",
-            "content": "code",
-        })];
-        let result = apply_changes(dir.path(), &changes).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("missing 'file' field"));
-    }
-
-    #[tokio::test]
-    async fn apply_changes_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        apply_changes(dir.path(), &[]).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn apply_changes_create_with_null_content_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let changes = vec![serde_json::json!({
-            "file": "src/empty.rs",
-            "action": "create",
-            "content": null,
-        })];
-        let result = apply_changes(dir.path(), &changes).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("empty or missing content"));
-    }
-
-    #[tokio::test]
-    async fn apply_changes_create_with_empty_content_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let changes = vec![serde_json::json!({
-            "file": "src/empty.rs",
-            "action": "create",
-            "content": "   ",
-        })];
-        let result = apply_changes(dir.path(), &changes).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("empty or missing content"));
-    }
-
-    #[tokio::test]
-    async fn apply_changes_modify_with_null_content_skips_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("existing.rs");
-        tokio::fs::write(&file_path, "original").await.unwrap();
-
-        // When file exists (written by tool-use), null content should skip, not error.
-        let changes = vec![serde_json::json!({
-            "file": "existing.rs",
-            "action": "modify",
-            "patch": null,
-            "content": null,
-        })];
-        let result = apply_changes(dir.path(), &changes).await;
-        assert!(result.is_ok(), "should skip existing file, got: {result:?}");
-        // File should be untouched.
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "original");
-    }
-
-    #[tokio::test]
-    async fn apply_changes_modify_nonexistent_with_null_content_errors() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // When file does NOT exist and content is null, this should error.
-        let changes = vec![serde_json::json!({
-            "file": "missing.rs",
-            "action": "modify",
-            "patch": null,
-            "content": null,
-        })];
-        let result = apply_changes(dir.path(), &changes).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no usable patch or content"));
-    }
-
-    #[tokio::test]
-    async fn apply_changes_modify_with_missing_patch_and_content_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let changes = vec![serde_json::json!({
-            "file": "existing.rs",
-            "action": "modify",
-        })];
-        let result = apply_changes(dir.path(), &changes).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no usable patch or content"));
     }
 
     #[tokio::test]
@@ -1690,7 +1385,7 @@ mod tests {
             .unwrap();
         let base_branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-        let router = mock_router_ref();
+        let router = sequential_router_ref(pipeline_mock_responses());
         let mut config = EngConfig::default();
         config.intervention.pause_after_plan = false;
         config.intervention.pause_before_pr = false;
@@ -1708,8 +1403,9 @@ mod tests {
         assert!(
             result.status == PipelineStatus::Committed
                 || result.status == PipelineStatus::PrCreated,
-            "unexpected status: {:?}",
-            result.status
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
         );
         assert!(!result.events.is_empty());
         assert!(result.stage_outputs.contains_key("plan"));
@@ -1824,74 +1520,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_git_apply_valid_patch() {
-        let dir = tempfile::tempdir().unwrap();
-        init_test_repo(dir.path());
-
-        // Create a tracked file.
-        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "f.txt"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "add f"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-
-        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
-        try_git_apply(dir.path(), patch).await.unwrap();
-
-        let content = tokio::fs::read_to_string(dir.path().join("f.txt"))
-            .await
-            .unwrap();
-        assert!(content.contains("B"));
-    }
-
-    #[tokio::test]
-    async fn try_git_apply_invalid_patch() {
-        let dir = tempfile::tempdir().unwrap();
-        init_test_repo(dir.path());
-
-        let result = try_git_apply(dir.path(), "not a valid patch").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("git apply failed"));
-    }
-
-    #[tokio::test]
-    async fn apply_changes_modify_with_patch() {
-        let dir = tempfile::tempdir().unwrap();
-        init_test_repo(dir.path());
-
-        std::fs::write(dir.path().join("src.rs"), "fn old() {}\n").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "src.rs"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "add src"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-
-        let patch = "--- a/src.rs\n+++ b/src.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new_func() {}\n";
-        let changes = vec![serde_json::json!({
-            "file": "src.rs",
-            "action": "modify",
-            "patch": patch,
-        })];
-
-        apply_changes(dir.path(), &changes).await.unwrap();
-        let content = tokio::fs::read_to_string(dir.path().join("src.rs"))
-            .await
-            .unwrap();
-        assert!(content.contains("new_func"));
-    }
-
-    #[tokio::test]
     async fn run_tests_empty_command() {
         let dir = tempfile::tempdir().unwrap();
         run_tests("", dir.path()).await.unwrap();
@@ -1915,7 +1543,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let router = mock_router_ref();
+        let router = sequential_router_ref(pipeline_mock_responses());
         let mut config = EngConfig::default();
         config.intervention.pause_after_plan = false;
         config.intervention.pause_before_pr = false;
@@ -1932,8 +1560,9 @@ mod tests {
         assert!(
             result.status == PipelineStatus::Committed
                 || result.status == PipelineStatus::PrCreated,
-            "unexpected status: {:?}",
-            result.status
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
         );
         // Check that TestsPassed event was emitted.
         assert!(
@@ -1965,7 +1594,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base_branch = init_test_repo(dir.path());
 
-        let router = mock_router_ref();
+        let router = sequential_router_ref(pipeline_mock_responses());
         let mut config = EngConfig::default();
         config.intervention.pause_after_plan = true;
         config.intervention.pause_before_pr = true;
@@ -2007,7 +1636,27 @@ mod tests {
             .output()
             .unwrap();
 
-        let router = mock_router_ref();
+        let responses = vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "fix bug"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Implementer — write_file tool call
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() -> &'static str { \"hello\" }\n"}),
+            }]),
+            // 3. Implementer — final metadata
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "fix: bug", "summary": "fixed"}"#,
+            ),
+            // 4. Debugger — should_retry: false
+            final_response(
+                r#"{"diagnosis": "test failure", "root_cause": "bug", "files_changed": [], "confidence": "low", "should_retry": false, "notes": null}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
         let mut config = EngConfig::default();
         config.intervention.pause_after_plan = false;
         config.intervention.pause_before_pr = false;
@@ -2194,7 +1843,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let router = mock_router_ref();
+        let router = sequential_router_ref(pipeline_mock_responses());
         let mut config = EngConfig::default();
         config.intervention.pause_after_plan = false;
         config.intervention.pause_before_pr = false;

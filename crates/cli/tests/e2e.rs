@@ -17,31 +17,44 @@ use tokio::process::Command;
 // Mock Anthropic API server
 // ---------------------------------------------------------------------------
 
-/// The agent JSON response — valid for all 6 agent roles.
-/// Same content as the MockProvider in eng-org test_helpers.
-const AGENT_RESPONSE: &str = r#"{"result": "ok", "steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "trivial", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false, "verdict": "pass", "issues": [], "version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": [], "diagnosis": "none", "root_cause": "none", "fix": {"changes": []}, "confidence": "high", "should_retry": false, "changes": [{"file": "src/new.rs", "action": "create", "content": "pub fn greet() -> &'static str { \"hello\" }\n", "description": "add greet function"}], "tests_added": [], "commit_message": "feat: add greet function", "summary": "test", "adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#;
+/// Metadata-only agent JSON response — valid for all 6 agent roles.
+/// No file content or patches; tools handle file writes.
+const AGENT_RESPONSE: &str = r#"{"result": "ok", "steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "trivial", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false, "verdict": "pass", "issues": [], "version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": [], "diagnosis": "none", "root_cause": "none", "files_changed": ["src/new.rs"], "confidence": "high", "should_retry": false, "notes": null, "tests_added": [], "commit_message": "feat: add greet function", "summary": "test", "adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#;
 
 /// Start a mock Anthropic API server that handles multiple requests.
 /// Returns the join handle and port.
+///
+/// The server is request-aware to support tool-use flow:
+/// - If the request has `"tools"` and no `"tool_result"` in messages → tool_use response
+/// - Otherwise → end_turn text response with `AGENT_RESPONSE`
 async fn start_mock_anthropic() -> (tokio::task::JoinHandle<()>, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    // Build the Anthropic-shaped response once.
-    let api_body = serde_json::json!({
-        "content": [{"type": "text", "text": AGENT_RESPONSE}],
-        "usage": {"input_tokens": 100, "output_tokens": 50},
-        "stop_reason": "end_turn"
-    })
-    .to_string();
-
     let handle = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
-            let body = api_body.clone();
             tokio::spawn(async move {
-                // Consume the full HTTP request so the client doesn't stall.
-                drain_request(&mut stream).await;
-                // Respond with mock Anthropic API response.
+                // Read the full HTTP request including body.
+                let body = read_request(&mut stream).await;
+
+                // Decide which response to send based on request content.
+                let api_body = if is_first_tool_call(&body) {
+                    // First implementer/debugger call: return a write_file tool use.
+                    serde_json::json!({
+                        "content": [{"type": "tool_use", "id": "toolu_01", "name": "write_file", "input": {"path": "src/new.rs", "content": "pub fn greet() -> &'static str { \"hello\" }\n"}}],
+                        "usage": {"input_tokens": 100, "output_tokens": 50},
+                        "stop_reason": "tool_use"
+                    }).to_string()
+                } else {
+                    // All other calls: return end_turn with agent metadata.
+                    serde_json::json!({
+                        "content": [{"type": "text", "text": AGENT_RESPONSE}],
+                        "usage": {"input_tokens": 100, "output_tokens": 50},
+                        "stop_reason": "end_turn"
+                    })
+                    .to_string()
+                };
+
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\n\
                      Content-Type: application/json\r\n\
@@ -49,8 +62,8 @@ async fn start_mock_anthropic() -> (tokio::task::JoinHandle<()>, u16) {
                      Connection: close\r\n\
                      \r\n\
                      {}",
-                    body.len(),
-                    body
+                    api_body.len(),
+                    api_body
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
                 let _ = stream.shutdown().await;
@@ -61,8 +74,35 @@ async fn start_mock_anthropic() -> (tokio::task::JoinHandle<()>, u16) {
     (handle, port)
 }
 
-/// Read the full HTTP request from the stream (headers + body).
-async fn drain_request(stream: &mut tokio::net::TcpStream) {
+/// Check if this is the first tool-use call (has tools, no tool_result yet).
+fn is_first_tool_call(body: &str) -> bool {
+    // If body is empty or not JSON, default to end_turn.
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    // Must have a "tools" array.
+    let has_tools =
+        json["tools"].is_array() && !json["tools"].as_array().unwrap_or(&vec![]).is_empty();
+    if !has_tools {
+        return false;
+    }
+    // Must NOT have any tool_result content block in messages.
+    let has_tool_result = json["messages"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .any(|msg| {
+            msg["content"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .any(|block| block["type"] == "tool_result")
+        });
+    !has_tool_result
+}
+
+/// Read the full HTTP request from the stream (headers + body), return the body.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
     let mut buf = Vec::with_capacity(65536);
     let mut tmp = [0u8; 16384];
 
@@ -70,7 +110,7 @@ async fn drain_request(stream: &mut tokio::net::TcpStream) {
     loop {
         let n = stream.read(&mut tmp).await.unwrap_or(0);
         if n == 0 {
-            return;
+            return String::new();
         }
         buf.extend_from_slice(&tmp[..n]);
 
@@ -99,8 +139,9 @@ async fn drain_request(stream: &mut tokio::net::TcpStream) {
                     }
                     read += n;
                 }
+                buf.extend_from_slice(&body_buf[..read]);
             }
-            return;
+            return String::from_utf8_lossy(&buf[body_start..]).to_string();
         }
     }
 }
