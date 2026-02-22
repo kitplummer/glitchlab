@@ -18,6 +18,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+glob.workspace = true
 
 [features]
 live = []
