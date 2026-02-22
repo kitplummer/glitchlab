@@ -73,7 +73,7 @@ impl Agent for ImplementerAgent {
 
         let response = self
             .router
-            .complete("implementer", &messages, 0.2, 8192, None)
+            .complete("implementer", &messages, 0.2, 16384, None)
             .await?;
 
         let metadata = AgentMetadata {

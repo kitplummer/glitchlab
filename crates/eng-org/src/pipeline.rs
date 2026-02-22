@@ -149,11 +149,15 @@ impl EngineeringPipeline {
         );
 
         // --- Stage 2: Index + context enrichment ---
-        let repo_context = match indexer::build_index(repo_path).await {
-            Ok(index) => index.to_agent_context(100),
+        let (repo_context, indexed_files) = match indexer::build_index(repo_path).await {
+            Ok(index) => {
+                let ctx_str = index.to_agent_context(100);
+                let files = index.files.clone();
+                (ctx_str, files)
+            }
             Err(e) => {
                 warn!(task_id, error = %e, "indexer failed, continuing");
-                String::new()
+                (String::new(), Vec::new())
             }
         };
 
@@ -171,6 +175,10 @@ impl EngineeringPipeline {
             enriched.push_str(&failure_context);
         }
         ctx.agent_context.objective = enriched;
+
+        // Feed relevant source files into agent context.
+        ctx.agent_context.file_context =
+            read_relevant_files(repo_path, objective, &indexed_files).await;
 
         // --- Stage 3: Plan ---
         ctx.current_stage = Some("plan".into());
@@ -602,6 +610,74 @@ impl EngineeringPipeline {
             error: Some(error),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// File context loading
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes for a single file included in context.
+const MAX_FILE_BYTES: usize = 8 * 1024;
+/// Maximum total bytes for all files included in context.
+const MAX_TOTAL_BYTES: usize = 50 * 1024;
+
+/// Key config files that are always included if they exist in the index.
+const CONTEXT_KEY_FILES: &[&str] = &["Cargo.toml", "README.md", "pyproject.toml", "package.json"];
+
+/// Read files relevant to the task from the repo, for injection into agent
+/// context. Includes key project files and any files mentioned in the
+/// objective text.
+async fn read_relevant_files(
+    repo_path: &Path,
+    objective: &str,
+    indexed_files: &[String],
+) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let mut total_bytes = 0usize;
+
+    // Collect files to read: key files first, then files mentioned in the objective.
+    let mut files_to_read = Vec::new();
+
+    // Always include key config files if they exist in the index.
+    for &key_file in CONTEXT_KEY_FILES {
+        for indexed in indexed_files {
+            // Match both top-level "Cargo.toml" and nested paths like "crates/cli/Cargo.toml"
+            // but only include the root-level key file by default.
+            if indexed == key_file {
+                files_to_read.push(indexed.clone());
+            }
+        }
+    }
+
+    // Scan the objective for file paths that match indexed files.
+    for indexed in indexed_files {
+        if !files_to_read.contains(indexed) && objective.contains(indexed.as_str()) {
+            files_to_read.push(indexed.clone());
+        }
+    }
+
+    for file in &files_to_read {
+        if total_bytes >= MAX_TOTAL_BYTES {
+            break;
+        }
+        let full_path = repo_path.join(file);
+        match tokio::fs::read_to_string(&full_path).await {
+            Ok(content) => {
+                let truncated = if content.len() > MAX_FILE_BYTES {
+                    format!("{}...\n[truncated]", &content[..MAX_FILE_BYTES])
+                } else {
+                    content
+                };
+                total_bytes += truncated.len();
+                result.insert(file.clone(), truncated);
+            }
+            Err(_) => {
+                // File missing or unreadable — skip silently.
+            }
+        }
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1745,5 +1821,75 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Multi-word command that succeeds.
         run_tests("echo hello world", dir.path()).await.unwrap();
+    }
+
+    // --- read_relevant_files tests ---
+
+    #[tokio::test]
+    async fn read_relevant_files_includes_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("README.md"), "# Hello")
+            .await
+            .unwrap();
+
+        let indexed = vec!["Cargo.toml".to_string(), "README.md".to_string()];
+        let result = read_relevant_files(dir.path(), "some objective", &indexed).await;
+
+        assert!(result.contains_key("Cargo.toml"));
+        assert!(result.contains_key("README.md"));
+    }
+
+    #[tokio::test]
+    async fn read_relevant_files_picks_up_mentioned_files() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("src/lib.rs"), "pub fn hello() {}")
+            .await
+            .unwrap();
+
+        let indexed = vec!["src/lib.rs".to_string()];
+        let result =
+            read_relevant_files(dir.path(), "Fix the bug in src/lib.rs please", &indexed).await;
+
+        assert!(result.contains_key("src/lib.rs"));
+        assert!(result["src/lib.rs"].contains("pub fn hello()"));
+    }
+
+    #[tokio::test]
+    async fn read_relevant_files_respects_total_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create files that together exceed MAX_TOTAL_BYTES (50KB).
+        let big_content = "x".repeat(MAX_FILE_BYTES); // 8KB each
+        let mut indexed = Vec::new();
+        for i in 0..10 {
+            let name = format!("file_{i}.rs");
+            tokio::fs::write(dir.path().join(&name), &big_content)
+                .await
+                .unwrap();
+            indexed.push(name.clone());
+        }
+
+        // Mention all files in objective so they're candidates.
+        let objective = indexed.join(" ");
+        let result = read_relevant_files(dir.path(), &objective, &indexed).await;
+
+        let total: usize = result.values().map(|v| v.len()).sum();
+        assert!(
+            total <= MAX_TOTAL_BYTES + MAX_FILE_BYTES,
+            "total {total} should be bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_relevant_files_handles_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexed = vec!["nonexistent.rs".to_string()];
+        let result = read_relevant_files(dir.path(), "Fix nonexistent.rs", &indexed).await;
+        assert!(result.is_empty());
     }
 }
