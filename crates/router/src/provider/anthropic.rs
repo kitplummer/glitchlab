@@ -29,7 +29,10 @@ impl AnthropicProvider {
     pub fn from_env() -> Result<Self, ProviderError> {
         let key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| ProviderError::MissingApiKey("ANTHROPIC_API_KEY".into()))?;
-        Ok(Self::new(key))
+        match std::env::var("ANTHROPIC_BASE_URL") {
+            Ok(url) => Ok(Self::with_base_url(key, url)),
+            Err(_) => Ok(Self::new(key)),
+        }
     }
 
     /// Custom base URL (for testing or proxying).
@@ -380,6 +383,21 @@ mod tests {
     fn provider_with_base_url() {
         let p = AnthropicProvider::with_base_url("key".into(), "http://localhost:1234".into());
         assert_eq!(p.base_url, "http://localhost:1234");
+    }
+
+    #[test]
+    fn from_env_uses_base_url_when_set() {
+        // Temporarily set env vars for this test.
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key-env");
+            std::env::set_var("ANTHROPIC_BASE_URL", "http://localhost:9999");
+        }
+        let p = AnthropicProvider::from_env().unwrap();
+        assert_eq!(p.base_url, "http://localhost:9999");
+        assert_eq!(p.api_key, "test-key-env");
+        unsafe {
+            std::env::remove_var("ANTHROPIC_BASE_URL");
+        }
     }
 
     #[tokio::test]

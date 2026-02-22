@@ -1,4 +1,4 @@
-.PHONY: build check test coverage lint fmt clean
+.PHONY: build check test test-functional coverage lint fmt clean
 
 # Build all crates
 build:
@@ -15,6 +15,11 @@ test:
 # Run tests for a specific crate (usage: make test-crate CRATE=kernel)
 test-crate:
 	cargo test -p glitchlab-$(CRATE)
+
+# Run functional/E2E test suite (CLI binary + mock server + history verification)
+test-functional:
+	cargo test -p glitchlab-cli --test e2e
+	cargo test -p glitchlab-eng-org --test memory_integration
 
 # Measure test coverage (excludes CLI binary)
 coverage:
