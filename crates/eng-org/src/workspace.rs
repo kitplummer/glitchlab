@@ -59,6 +59,9 @@ impl Workspace {
 
     /// Create the isolated worktree and branch.
     pub async fn create(&mut self, base_branch: &str) -> Result<&Path> {
+        // Remove any stale branch from a previous run with the same task_id.
+        let _ = self.git_repo(&["branch", "-D", &self.branch_name]).await;
+
         // Create the branch from base.
         self.git_repo(&["branch", &self.branch_name, base_branch])
             .await
@@ -141,6 +144,12 @@ impl Workspace {
 
         // Prune stale worktrees.
         let _ = self.git_repo(&["worktree", "prune"]).await;
+
+        // Delete the task branch so the next run with the same task_id
+        // doesn't collide.
+        if let Err(e) = self.git_repo(&["branch", "-D", &self.branch_name]).await {
+            warn!(error = %e, "git branch delete failed (may already be gone)");
+        }
 
         self.created = false;
         info!(task_id = %self.task_id, "workspace cleaned up");
@@ -302,6 +311,67 @@ mod tests {
         // Cleanup.
         ws.cleanup().await.unwrap();
         assert!(!ws.is_created());
+
+        // Branch should be gone after cleanup.
+        let branches = std::process::Command::new("git")
+            .args(["-C", &dir.path().to_string_lossy(), "branch"])
+            .output()
+            .unwrap();
+        let branch_list = String::from_utf8_lossy(&branches.stdout);
+        assert!(
+            !branch_list.contains("glitchlab/test-task"),
+            "branch should be deleted after cleanup, got: {branch_list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_create_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Initialize a git repo with a commit.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let output = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base_branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // First run: create and cleanup (leaves no branch thanks to cleanup).
+        let mut ws1 = Workspace::new(dir.path(), "reuse-task", ".worktrees");
+        ws1.create(&base_branch).await.unwrap();
+        ws1.cleanup().await.unwrap();
+
+        // Second run: should succeed even though the branch was just used.
+        let mut ws2 = Workspace::new(dir.path(), "reuse-task", ".worktrees");
+        let path = ws2.create(&base_branch).await.unwrap();
+        assert!(path.exists());
+        ws2.cleanup().await.unwrap();
     }
 
     #[tokio::test]
