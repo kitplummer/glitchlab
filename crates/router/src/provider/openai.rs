@@ -1,8 +1,10 @@
 use std::time::Instant;
 
 use glitchlab_kernel::agent::{Message, MessageRole};
+use glitchlab_kernel::tool::ToolDefinition;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::{Provider, ProviderError, ProviderFuture};
 use crate::response::RouterResponse;
@@ -44,6 +46,125 @@ impl OpenAiProvider {
     pub fn custom(api_key: String, base_url: String, name: String) -> Self {
         Self::new(api_key, base_url, name)
     }
+
+    // -----------------------------------------------------------------------
+    // Private helpers — shared by complete() and complete_with_tools()
+    // -----------------------------------------------------------------------
+
+    /// POST a JSON body to the OpenAI-compatible API, handle status codes,
+    /// return `(response_text, latency_ms)`.
+    async fn send_request(&self, body: &impl Serialize) -> Result<(String, u64), ProviderError> {
+        let start = Instant::now();
+
+        let resp = self
+            .client
+            .post(&self.base_url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+        let status = resp.status().as_u16();
+
+        if status == 429 {
+            return Err(ProviderError::RateLimited {
+                retry_after_ms: resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|s| s * 1000),
+            });
+        }
+
+        let resp_text = resp.text().await?;
+
+        if status >= 400 {
+            return Err(ProviderError::Api {
+                status,
+                body: resp_text,
+            });
+        }
+
+        Ok((resp_text, latency_ms))
+    }
+
+    /// Convert kernel `Message`s into OpenAI format.
+    fn build_messages(messages: &[Message]) -> Vec<OaiMessage> {
+        messages
+            .iter()
+            .map(|m| OaiMessage {
+                role: match m.role {
+                    MessageRole::System => "system".into(),
+                    MessageRole::User => "user".into(),
+                    MessageRole::Assistant => "assistant".into(),
+                    MessageRole::Tool => "tool".into(),
+                },
+                content: m.content.text(),
+            })
+            .collect()
+    }
+
+    /// Parse an OpenAI-compatible response body, extracting text, tool calls,
+    /// usage, finish_reason, and cost.
+    fn parse_response(
+        &self,
+        resp_text: &str,
+        model: &str,
+        latency_ms: u64,
+    ) -> Result<RouterResponse, ProviderError> {
+        let parsed: OaiResponse = serde_json::from_str(resp_text)
+            .map_err(|e| ProviderError::Parse(format!("{e}: {resp_text}")))?;
+
+        let choice = parsed
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| ProviderError::Parse("no choices in response".into()))?;
+
+        let content = choice.message.content.unwrap_or_default();
+
+        let mut tool_calls = Vec::new();
+        for oai_tc in choice.message.tool_calls {
+            match serde_json::from_str::<serde_json::Value>(&oai_tc.function.arguments) {
+                Ok(input) => {
+                    tool_calls.push(glitchlab_kernel::tool::ToolCall {
+                        id: oai_tc.id,
+                        name: oai_tc.function.name,
+                        input,
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        tool_call_id = %oai_tc.id,
+                        tool_name = %oai_tc.function.name,
+                        error = %e,
+                        "skipping tool call with malformed arguments"
+                    );
+                }
+            }
+        }
+
+        let prompt_tokens = parsed.usage.prompt_tokens;
+        let completion_tokens = parsed.usage.completion_tokens;
+        let total_tokens = parsed.usage.total_tokens;
+        let cost =
+            estimate_openai_cost(&self.provider_name, model, prompt_tokens, completion_tokens);
+
+        Ok(RouterResponse {
+            content,
+            model: format!("{}/{model}", self.provider_name),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cost,
+            latency_ms,
+            tool_calls,
+            stop_reason: choice.finish_reason,
+        })
+    }
 }
 
 impl Provider for OpenAiProvider {
@@ -60,18 +181,7 @@ impl Provider for OpenAiProvider {
         let response_format = response_format.cloned();
 
         Box::pin(async move {
-            let oai_messages: Vec<OaiMessage> = messages
-                .iter()
-                .map(|m| OaiMessage {
-                    role: match m.role {
-                        MessageRole::System => "system".into(),
-                        MessageRole::User => "user".into(),
-                        MessageRole::Assistant => "assistant".into(),
-                        MessageRole::Tool => "tool".into(),
-                    },
-                    content: m.content.text(),
-                })
-                .collect();
+            let oai_messages = Self::build_messages(&messages);
 
             let body = OaiRequest {
                 model: &model,
@@ -81,72 +191,51 @@ impl Provider for OpenAiProvider {
                 response_format: response_format.as_ref(),
             };
 
-            let start = Instant::now();
+            let (resp_text, latency_ms) = self.send_request(&body).await?;
+            self.parse_response(&resp_text, &model, latency_ms)
+        })
+    }
 
-            let resp = self
-                .client
-                .post(&self.base_url)
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await?;
+    fn complete_with_tools(
+        &self,
+        model: &str,
+        messages: &[Message],
+        temperature: f32,
+        max_tokens: u32,
+        tools: &[ToolDefinition],
+        response_format: Option<&serde_json::Value>,
+    ) -> ProviderFuture<'_> {
+        let model = model.to_string();
+        let messages = messages.to_vec();
+        let tools = tools.to_vec();
+        let response_format = response_format.cloned();
 
-            let latency_ms = start.elapsed().as_millis() as u64;
-            let status = resp.status().as_u16();
+        Box::pin(async move {
+            let oai_messages = Self::build_messages(&messages);
 
-            if status == 429 {
-                return Err(ProviderError::RateLimited {
-                    retry_after_ms: resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(|s| s * 1000),
-                });
-            }
+            let tool_defs: Vec<OaiToolDef<'_>> = tools
+                .iter()
+                .map(|t| OaiToolDef {
+                    r#type: "function",
+                    function: OaiFunctionDef {
+                        name: &t.name,
+                        description: &t.description,
+                        parameters: &t.input_schema,
+                    },
+                })
+                .collect();
 
-            let resp_text = resp.text().await?;
+            let body = OaiToolRequest {
+                model: &model,
+                messages: &oai_messages,
+                temperature,
+                max_tokens,
+                response_format: response_format.as_ref(),
+                tools: &tool_defs,
+            };
 
-            if status >= 400 {
-                return Err(ProviderError::Api {
-                    status,
-                    body: resp_text,
-                });
-            }
-
-            let parsed: OaiResponse = serde_json::from_str(&resp_text)
-                .map_err(|e| ProviderError::Parse(format!("{e}: {resp_text}")))?;
-
-            let choice = parsed
-                .choices
-                .into_iter()
-                .next()
-                .ok_or_else(|| ProviderError::Parse("no choices in response".into()))?;
-
-            let content = choice.message.content.unwrap_or_default();
-
-            let prompt_tokens = parsed.usage.prompt_tokens;
-            let completion_tokens = parsed.usage.completion_tokens;
-            let total_tokens = parsed.usage.total_tokens;
-            let cost = estimate_openai_cost(
-                &self.provider_name,
-                &model,
-                prompt_tokens,
-                completion_tokens,
-            );
-
-            Ok(RouterResponse {
-                content,
-                model: format!("{}/{model}", self.provider_name),
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                cost,
-                latency_ms,
-                tool_calls: vec![],
-                stop_reason: None,
-            })
+            let (resp_text, latency_ms) = self.send_request(&body).await?;
+            self.parse_response(&resp_text, &model, latency_ms)
         })
     }
 }
@@ -166,6 +255,30 @@ struct OaiRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct OaiToolRequest<'a> {
+    model: &'a str,
+    messages: &'a [OaiMessage],
+    temperature: f32,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<&'a serde_json::Value>,
+    tools: &'a [OaiToolDef<'a>],
+}
+
+#[derive(Serialize)]
+struct OaiToolDef<'a> {
+    r#type: &'static str,
+    function: OaiFunctionDef<'a>,
+}
+
+#[derive(Serialize)]
+struct OaiFunctionDef<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
+}
+
+#[derive(Serialize)]
 struct OaiMessage {
     role: String,
     content: String,
@@ -180,11 +293,27 @@ struct OaiResponse {
 #[derive(Deserialize)]
 struct OaiChoice {
     message: OaiChoiceMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct OaiChoiceMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OaiToolCall>,
+}
+
+#[derive(Deserialize)]
+struct OaiToolCall {
+    id: String,
+    function: OaiToolCallFunction,
+}
+
+#[derive(Deserialize)]
+struct OaiToolCallFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]
@@ -270,6 +399,20 @@ mod tests {
                 content: MessageContent::Text("Hello".into()),
             },
         ]
+    }
+
+    fn test_tool_defs() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "Read a file from disk".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"]
+            }),
+        }]
     }
 
     #[test]
@@ -386,6 +529,171 @@ mod tests {
             .complete("gpt-4o", &messages, 0.2, 4096, None)
             .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn complete_finish_reason_populated() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let url = mock_server(200, body.to_string()).await;
+        let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
+        let result = provider
+            .complete("gpt-4o", &test_messages(), 0.2, 4096, None)
+            .await
+            .unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_text_only() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "No tools needed."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+        });
+        let url = mock_server(200, body.to_string()).await;
+        let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
+        let result = provider
+            .complete_with_tools(
+                "gpt-4o",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.content, "No tools needed.");
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_single_tool_call() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"src/lib.rs\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+        });
+        let url = mock_server(200, body.to_string()).await;
+        let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
+        let result = provider
+            .complete_with_tools(
+                "gpt-4o",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.content.is_empty());
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "call_abc");
+        assert_eq!(result.tool_calls[0].name, "read_file");
+        assert_eq!(result.tool_calls[0].input["path"], "src/lib.rs");
+        assert_eq!(result.stop_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_multiple_tool_calls() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Checking files.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"a.rs\"}"
+                            }
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"b.rs\"}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 80, "total_tokens": 180}
+        });
+        let url = mock_server(200, body.to_string()).await;
+        let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
+        let result = provider
+            .complete_with_tools(
+                "gpt-4o",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.content, "Checking files.");
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        assert_eq!(result.tool_calls[0].input["path"], "a.rs");
+        assert_eq!(result.tool_calls[1].id, "call_2");
+        assert_eq!(result.tool_calls[1].input["path"], "b.rs");
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_malformed_arguments() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_bad",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "not valid json {{{"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let url = mock_server(200, body.to_string()).await;
+        let provider = OpenAiProvider::new("test-key".into(), url, "openai".into());
+        let result = provider
+            .complete_with_tools(
+                "gpt-4o",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await
+            .unwrap();
+        // Malformed tool call is gracefully skipped.
+        assert!(result.tool_calls.is_empty());
     }
 
     #[test]

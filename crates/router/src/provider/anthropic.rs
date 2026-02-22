@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use glitchlab_kernel::agent::{Message, MessageRole};
+use glitchlab_kernel::tool::ToolDefinition;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,126 @@ impl AnthropicProvider {
             base_url,
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Private helpers — shared by complete() and complete_with_tools()
+    // -----------------------------------------------------------------------
+
+    /// POST a JSON body to the Anthropic API, handle status codes,
+    /// return `(response_text, latency_ms)`.
+    async fn send_request(&self, body: &impl Serialize) -> Result<(String, u64), ProviderError> {
+        let start = Instant::now();
+
+        let resp = self
+            .client
+            .post(&self.base_url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await?;
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+        let status = resp.status().as_u16();
+
+        if status == 429 {
+            return Err(ProviderError::RateLimited {
+                retry_after_ms: resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|s| s * 1000),
+            });
+        }
+
+        let resp_text = resp.text().await?;
+
+        if status >= 400 {
+            return Err(ProviderError::Api {
+                status,
+                body: resp_text,
+            });
+        }
+
+        Ok((resp_text, latency_ms))
+    }
+
+    /// Convert kernel `Message`s into Anthropic format, separating the
+    /// system prompt from conversation messages.
+    fn build_messages(messages: &[Message]) -> (String, Vec<AnthropicMessage>) {
+        let system: String = messages
+            .iter()
+            .filter(|m| m.role == MessageRole::System)
+            .map(|m| m.content.text())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let conversation: Vec<_> = messages
+            .iter()
+            .filter(|m| m.role != MessageRole::System)
+            .map(|m| AnthropicMessage {
+                role: match m.role {
+                    MessageRole::User | MessageRole::Tool => "user".into(),
+                    MessageRole::Assistant => "assistant".into(),
+                    MessageRole::System => unreachable!(),
+                },
+                content: m.content.text(),
+            })
+            .collect();
+
+        (system, conversation)
+    }
+
+    /// Parse an Anthropic response body, extracting text, tool calls,
+    /// usage, stop_reason, and cost.
+    fn parse_response(
+        resp_text: &str,
+        model: &str,
+        latency_ms: u64,
+    ) -> Result<RouterResponse, ProviderError> {
+        let parsed: AnthropicResponse = serde_json::from_str(resp_text)
+            .map_err(|e| ProviderError::Parse(format!("{e}: {resp_text}")))?;
+
+        let mut text_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+
+        for block in parsed.content {
+            match block.r#type.as_str() {
+                "text" => {
+                    if let Some(text) = block.text {
+                        text_parts.push(text);
+                    }
+                }
+                "tool_use" => {
+                    if let (Some(id), Some(name), Some(input)) = (block.id, block.name, block.input)
+                    {
+                        tool_calls.push(glitchlab_kernel::tool::ToolCall { id, name, input });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let content = text_parts.join("");
+        let prompt_tokens = parsed.usage.input_tokens;
+        let completion_tokens = parsed.usage.output_tokens;
+        let total_tokens = prompt_tokens + completion_tokens;
+        let cost = estimate_anthropic_cost(model, prompt_tokens, completion_tokens);
+
+        Ok(RouterResponse {
+            content,
+            model: format!("anthropic/{model}"),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cost,
+            latency_ms,
+            tool_calls,
+            stop_reason: parsed.stop_reason,
+        })
+    }
 }
 
 impl Provider for AnthropicProvider {
@@ -54,26 +175,7 @@ impl Provider for AnthropicProvider {
         let messages = messages.to_vec();
 
         Box::pin(async move {
-            // Separate system from conversation messages.
-            let system: String = messages
-                .iter()
-                .filter(|m| m.role == MessageRole::System)
-                .map(|m| m.content.text())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-
-            let conversation: Vec<_> = messages
-                .iter()
-                .filter(|m| m.role != MessageRole::System)
-                .map(|m| AnthropicMessage {
-                    role: match m.role {
-                        MessageRole::User | MessageRole::Tool => "user".into(),
-                        MessageRole::Assistant => "assistant".into(),
-                        MessageRole::System => unreachable!(),
-                    },
-                    content: m.content.text(),
-                })
-                .collect();
+            let (system, conversation) = Self::build_messages(&messages);
 
             let body = AnthropicRequest {
                 model: &model,
@@ -87,73 +189,51 @@ impl Provider for AnthropicProvider {
                 messages: &conversation,
             };
 
-            let start = Instant::now();
+            let (resp_text, latency_ms) = self.send_request(&body).await?;
+            Self::parse_response(&resp_text, &model, latency_ms)
+        })
+    }
 
-            let resp = self
-                .client
-                .post(&self.base_url)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .header("content-type", "application/json")
-                .json(&body)
-                .send()
-                .await?;
+    fn complete_with_tools(
+        &self,
+        model: &str,
+        messages: &[Message],
+        temperature: f32,
+        max_tokens: u32,
+        tools: &[ToolDefinition],
+        _response_format: Option<&serde_json::Value>,
+    ) -> ProviderFuture<'_> {
+        let model = model.to_string();
+        let messages = messages.to_vec();
+        let tools = tools.to_vec();
 
-            let latency_ms = start.elapsed().as_millis() as u64;
-            let status = resp.status().as_u16();
+        Box::pin(async move {
+            let (system, conversation) = Self::build_messages(&messages);
 
-            if status == 429 {
-                return Err(ProviderError::RateLimited {
-                    retry_after_ms: resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(|s| s * 1000),
-                });
-            }
-
-            let resp_text = resp.text().await?;
-
-            if status >= 400 {
-                return Err(ProviderError::Api {
-                    status,
-                    body: resp_text,
-                });
-            }
-
-            let parsed: AnthropicResponse = serde_json::from_str(&resp_text)
-                .map_err(|e| ProviderError::Parse(format!("{e}: {resp_text}")))?;
-
-            let content = parsed
-                .content
-                .into_iter()
-                .filter_map(|block| {
-                    if block.r#type == "text" {
-                        block.text
-                    } else {
-                        None
-                    }
+            let tool_defs: Vec<AnthropicToolDef<'_>> = tools
+                .iter()
+                .map(|t| AnthropicToolDef {
+                    name: &t.name,
+                    description: &t.description,
+                    input_schema: &t.input_schema,
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect();
 
-            let prompt_tokens = parsed.usage.input_tokens;
-            let completion_tokens = parsed.usage.output_tokens;
-            let total_tokens = prompt_tokens + completion_tokens;
-            let cost = estimate_anthropic_cost(&model, prompt_tokens, completion_tokens);
+            let body = AnthropicToolRequest {
+                model: &model,
+                max_tokens,
+                temperature,
+                system: if system.is_empty() {
+                    None
+                } else {
+                    Some(&system)
+                },
+                messages: &conversation,
+                tools: &tool_defs,
+            };
 
-            Ok(RouterResponse {
-                content,
-                model: format!("anthropic/{model}"),
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
-                cost,
-                latency_ms,
-                tool_calls: vec![],
-                stop_reason: None,
-            })
+            let (resp_text, latency_ms) = self.send_request(&body).await?;
+            Self::parse_response(&resp_text, &model, latency_ms)
         })
     }
 }
@@ -173,6 +253,24 @@ struct AnthropicRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct AnthropicToolRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<&'a str>,
+    messages: &'a [AnthropicMessage],
+    tools: &'a [AnthropicToolDef<'a>],
+}
+
+#[derive(Serialize)]
+struct AnthropicToolDef<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: &'a serde_json::Value,
+}
+
+#[derive(Serialize)]
 struct AnthropicMessage {
     role: String,
     content: String,
@@ -182,12 +280,17 @@ struct AnthropicMessage {
 struct AnthropicResponse {
     content: Vec<ContentBlock>,
     usage: Usage,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ContentBlock {
     r#type: String,
     text: Option<String>,
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +355,20 @@ mod tests {
                 content: MessageContent::Text("Hello".into()),
             },
         ]
+    }
+
+    fn test_tool_defs() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "Read a file from disk".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"]
+            }),
+        }]
     }
 
     #[test]
@@ -339,6 +456,115 @@ mod tests {
             .complete("claude-haiku-3-20240307", &messages, 0.5, 1024, None)
             .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn complete_stop_reason_populated() {
+        let body = serde_json::json!({
+            "content": [{"type": "text", "text": "done"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "stop_reason": "end_turn"
+        });
+        let url = mock_server(200, body.to_string()).await;
+        let provider = AnthropicProvider::with_base_url("test-key".into(), url);
+        let result = provider
+            .complete(
+                "claude-sonnet-4-20250514",
+                &test_messages(),
+                0.2,
+                4096,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_text_only() {
+        let body = serde_json::json!({
+            "content": [{"type": "text", "text": "I don't need any tools."}],
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+            "stop_reason": "end_turn"
+        });
+        let url = mock_server(200, body.to_string()).await;
+        let provider = AnthropicProvider::with_base_url("test-key".into(), url);
+        let result = provider
+            .complete_with_tools(
+                "claude-sonnet-4-20250514",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.content, "I don't need any tools.");
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_single_tool_call() {
+        let body = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "toolu_123", "name": "read_file", "input": {"path": "src/lib.rs"}}
+            ],
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+            "stop_reason": "tool_use"
+        });
+        let url = mock_server(200, body.to_string()).await;
+        let provider = AnthropicProvider::with_base_url("test-key".into(), url);
+        let result = provider
+            .complete_with_tools(
+                "claude-sonnet-4-20250514",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.content.is_empty());
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "toolu_123");
+        assert_eq!(result.tool_calls[0].name, "read_file");
+        assert_eq!(result.tool_calls[0].input["path"], "src/lib.rs");
+        assert_eq!(result.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_multiple_tool_calls() {
+        let body = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "Let me check those files."},
+                {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.rs"}},
+                {"type": "tool_use", "id": "toolu_2", "name": "read_file", "input": {"path": "b.rs"}}
+            ],
+            "usage": {"input_tokens": 100, "output_tokens": 80},
+            "stop_reason": "tool_use"
+        });
+        let url = mock_server(200, body.to_string()).await;
+        let provider = AnthropicProvider::with_base_url("test-key".into(), url);
+        let result = provider
+            .complete_with_tools(
+                "claude-sonnet-4-20250514",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.content, "Let me check those files.");
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].id, "toolu_1");
+        assert_eq!(result.tool_calls[0].input["path"], "a.rs");
+        assert_eq!(result.tool_calls[1].id, "toolu_2");
+        assert_eq!(result.tool_calls[1].input["path"], "b.rs");
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use glitchlab_kernel::agent::Message;
 use glitchlab_kernel::budget::BudgetTracker;
 use glitchlab_kernel::error;
+use glitchlab_kernel::tool::ToolDefinition;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -118,6 +119,121 @@ impl Router {
                         cost = format!("${:.4}", response.cost),
                         latency_ms = response.latency_ms,
                         "router: LLM call complete"
+                    );
+
+                    return Ok(response);
+                }
+                Err(ProviderError::RateLimited { retry_after_ms }) => {
+                    let wait = retry_after_ms.unwrap_or(1000 * attempt);
+                    warn!(
+                        role,
+                        attempt,
+                        wait_ms = wait,
+                        "router: rate limited, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    last_err = Some(format!("rate limited on attempt {attempt}"));
+                }
+                Err(ProviderError::Http(e)) if attempt < 3 => {
+                    let wait = 1000 * attempt;
+                    warn!(
+                        role,
+                        attempt,
+                        error = %e,
+                        "router: transient HTTP error, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    last_err = Some(e.to_string());
+                }
+                Err(e) => {
+                    return Err(error::Error::Agent {
+                        agent: role.into(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        Err(error::Error::Agent {
+            agent: role.into(),
+            reason: format!(
+                "exhausted retries: {}",
+                last_err.unwrap_or_else(|| "unknown".into())
+            ),
+        })
+    }
+
+    /// Make a completion call with tool definitions for the given agent role.
+    ///
+    /// Same as `complete()` — resolves role, checks budget, retries — but
+    /// passes tool definitions through to the provider.
+    pub async fn complete_with_tools(
+        &self,
+        role: &str,
+        messages: &[Message],
+        temperature: f32,
+        max_tokens: u32,
+        tools: &[ToolDefinition],
+        response_format: Option<&serde_json::Value>,
+    ) -> error::Result<RouterResponse> {
+        // Check budget before calling.
+        {
+            let budget = self.budget.lock().await;
+            budget.check()?;
+        }
+
+        // Resolve role → model string.
+        let model_string = self.routing.get(role).ok_or_else(|| {
+            error::Error::Config(format!("no model configured for role `{role}`"))
+        })?;
+
+        let (provider_name, model_id) = parse_model_string(model_string);
+
+        // Look up provider.
+        let provider = self.providers.get(provider_name).ok_or_else(|| {
+            error::Error::Config(format!(
+                "provider `{provider_name}` not available (missing API key?)"
+            ))
+        })?;
+
+        info!(
+            role,
+            model = model_string,
+            tool_count = tools.len(),
+            "router: calling LLM with tools"
+        );
+
+        // Call with retry (up to 3 attempts on transient errors).
+        let mut last_err = None;
+        for attempt in 1..=3 {
+            match provider
+                .complete_with_tools(
+                    model_id,
+                    messages,
+                    temperature,
+                    max_tokens,
+                    tools,
+                    response_format,
+                )
+                .await
+            {
+                Ok(response) => {
+                    // Record usage.
+                    let mut budget = self.budget.lock().await;
+                    budget.record(
+                        response.prompt_tokens,
+                        response.completion_tokens,
+                        response.cost,
+                    );
+
+                    info!(
+                        role,
+                        model = %response.model,
+                        tokens = response.total_tokens,
+                        cost = format!("${:.4}", response.cost),
+                        latency_ms = response.latency_ms,
+                        tool_calls = response.tool_calls.len(),
+                        "router: LLM call with tools complete"
                     );
 
                     return Ok(response);
@@ -446,6 +562,205 @@ mod tests {
         // Second call should fail due to budget.
         let result = router
             .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // complete_with_tools tests
+    // -----------------------------------------------------------------------
+
+    fn test_tool_defs() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "Read a file from disk".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"]
+            }),
+        }]
+    }
+
+    struct MockToolProvider {
+        response: RouterResponse,
+    }
+
+    impl MockToolProvider {
+        fn with_tool_call() -> Self {
+            Self {
+                response: RouterResponse {
+                    content: String::new(),
+                    model: "mock/test-model".into(),
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    total_tokens: 150,
+                    cost: 0.001,
+                    latency_ms: 42,
+                    tool_calls: vec![glitchlab_kernel::tool::ToolCall {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "src/lib.rs"}),
+                    }],
+                    stop_reason: Some("tool_use".into()),
+                },
+            }
+        }
+    }
+
+    impl Provider for MockToolProvider {
+        fn complete(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _temperature: f32,
+            _max_tokens: u32,
+            _response_format: Option<&serde_json::Value>,
+        ) -> ProviderFuture<'_> {
+            let resp = self.response.clone();
+            Box::pin(async move { Ok(resp) })
+        }
+
+        fn complete_with_tools(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _temperature: f32,
+            _max_tokens: u32,
+            _tools: &[ToolDefinition],
+            _response_format: Option<&serde_json::Value>,
+        ) -> ProviderFuture<'_> {
+            let resp = self.response.clone();
+            Box::pin(async move { Ok(resp) })
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_with_mock_provider() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget);
+        router.register_provider("mock".into(), Arc::new(MockToolProvider::with_tool_call()));
+
+        let result = router
+            .complete_with_tools(
+                "planner",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(response.stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_tracks_budget() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget);
+        router.register_provider("mock".into(), Arc::new(MockToolProvider::with_tool_call()));
+
+        router
+            .complete_with_tools(
+                "planner",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let summary = router.budget_summary().await;
+        assert_eq!(summary.total_tokens, 150);
+        assert!((summary.estimated_cost - 0.001).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_unknown_role_errors() {
+        let routing = HashMap::new();
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget);
+
+        let result = router
+            .complete_with_tools(
+                "nonexistent",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_missing_provider_errors() {
+        let routing = HashMap::from([("planner".to_string(), "missing/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget);
+
+        let result = router
+            .complete_with_tools(
+                "planner",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_retries_on_rate_limit() {
+        let routing = HashMap::from([("planner".to_string(), "rl/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget);
+        router.register_provider("rl".into(), Arc::new(RateLimitedProvider));
+
+        let result = router
+            .complete_with_tools(
+                "planner",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("exhausted retries"), "got: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_non_retryable_error() {
+        let routing = HashMap::from([("planner".to_string(), "err/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget);
+        router.register_provider("err".into(), Arc::new(ErrorProvider));
+
+        let result = router
+            .complete_with_tools(
+                "planner",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
             .await;
         assert!(result.is_err());
     }
