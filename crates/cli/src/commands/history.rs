@@ -1,13 +1,13 @@
 use std::path::Path;
 
 use anyhow::Result;
-use glitchlab_memory::history::TaskHistory;
+use glitchlab_memory::history::{HistoryBackend, HistoryQuery, JsonlHistory};
 
 pub async fn execute(repo: &Path, count: usize, stats: bool) -> Result<()> {
-    let history = TaskHistory::new(repo);
+    let history = JsonlHistory::new(repo);
 
     if stats {
-        let s = history.get_stats()?;
+        let s = history.stats().await.map_err(|e| anyhow::anyhow!("{e}"))?;
         println!("GLITCHLAB History Stats\n");
         println!("  Total runs:    {}", s.total_runs);
         println!("  Successes:     {}", s.successes);
@@ -17,7 +17,14 @@ pub async fn execute(repo: &Path, count: usize, stats: bool) -> Result<()> {
         return Ok(());
     }
 
-    let entries = history.get_recent(count)?;
+    let query = HistoryQuery {
+        limit: count,
+        ..Default::default()
+    };
+    let entries = history
+        .query(&query)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     if entries.is_empty() {
         println!("No task history found.");
         return Ok(());

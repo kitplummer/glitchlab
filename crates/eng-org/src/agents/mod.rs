@@ -124,6 +124,14 @@ pub(crate) fn build_user_message(ctx: &AgentContext) -> String {
         }
     }
 
+    // Failure history (stored separately so ContextAssembler can drop it independently).
+    if let Some(serde_json::Value::String(fh)) = ctx.extra.get("failure_history")
+        && !fh.is_empty()
+    {
+        msg.push_str("\n\n## Failure History\n\n");
+        msg.push_str(fh);
+    }
+
     // Task constraints.
     if !ctx.constraints.is_empty() {
         msg.push_str("\n\n## Constraints\n\n");
@@ -400,6 +408,30 @@ mod tests {
         assert!(msg.contains("## Previous Stage Output"));
         assert!(msg.contains("## Relevant File Contents"));
         assert!(msg.contains("## Constraints"));
+    }
+
+    #[test]
+    fn build_user_message_with_failure_history() {
+        let mut ctx = base_ctx();
+        ctx.extra.insert(
+            "failure_history".into(),
+            serde_json::Value::String("Recent failures to avoid repeating:\n- Task `t1` failed with status `error`: crash\n".into()),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(msg.contains("## Failure History"));
+        assert!(msg.contains("Task `t1` failed"));
+        assert!(msg.contains("crash"));
+    }
+
+    #[test]
+    fn build_user_message_empty_failure_history_omitted() {
+        let mut ctx = base_ctx();
+        ctx.extra.insert(
+            "failure_history".into(),
+            serde_json::Value::String(String::new()),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(!msg.contains("## Failure History"));
     }
 
     // --- tool_use_loop tests ---

@@ -16,6 +16,33 @@ pub struct EngConfig {
     pub boundaries: BoundariesConfig,
     #[serde(default)]
     pub test_command_override: Option<String>,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// Configuration for the memory/persistence layer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// MySQL/Dolt connection string. If `None`, Dolt is not used.
+    #[serde(default)]
+    pub dolt_connection: Option<String>,
+    /// Whether to enable the Beads graph backend.
+    #[serde(default)]
+    pub beads_enabled: bool,
+    /// Path to the `bd` binary. If `None`, uses `BEADS_BD_PATH` or `"bd"` on PATH.
+    #[serde(default)]
+    pub beads_bd_path: Option<String>,
+}
+
+impl MemoryConfig {
+    /// Convert to the memory crate's config type.
+    pub fn to_backend_config(&self) -> glitchlab_memory::MemoryBackendConfig {
+        glitchlab_memory::MemoryBackendConfig {
+            dolt_connection: self.dolt_connection.clone(),
+            beads_enabled: self.beads_enabled,
+            beads_bd_path: self.beads_bd_path.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +156,7 @@ impl Default for EngConfig {
                 protected_paths: vec![],
             },
             test_command_override: None,
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -432,5 +460,84 @@ mod tests {
             config.limits.max_fix_attempts
         );
         assert_eq!(parsed.routing.planner, config.routing.planner);
+    }
+
+    #[test]
+    fn memory_config_default_has_all_disabled() {
+        let config = MemoryConfig::default();
+        assert!(config.dolt_connection.is_none());
+        assert!(!config.beads_enabled);
+        assert!(config.beads_bd_path.is_none());
+    }
+
+    #[test]
+    fn memory_config_yaml_roundtrip() {
+        let config = MemoryConfig {
+            dolt_connection: Some("mysql://localhost:3306/glitchlab".into()),
+            beads_enabled: true,
+            beads_bd_path: Some("/usr/local/bin/bd".into()),
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let parsed: MemoryConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.dolt_connection, config.dolt_connection);
+        assert_eq!(parsed.beads_enabled, config.beads_enabled);
+        assert_eq!(parsed.beads_bd_path, config.beads_bd_path);
+    }
+
+    #[test]
+    fn memory_config_to_backend_config() {
+        let config = MemoryConfig {
+            dolt_connection: Some("mysql://test".into()),
+            beads_enabled: true,
+            beads_bd_path: None,
+        };
+        let bc = config.to_backend_config();
+        assert_eq!(bc.dolt_connection, Some("mysql://test".into()));
+        assert!(bc.beads_enabled);
+        assert!(bc.beads_bd_path.is_none());
+    }
+
+    #[test]
+    fn eng_config_with_memory_section_parses() {
+        let yaml = r#"
+routing:
+  planner: "anthropic/claude-haiku-4-5-20251001"
+  implementer: "anthropic/claude-sonnet-4-20250514"
+  debugger: "anthropic/claude-sonnet-4-20250514"
+  security: "anthropic/claude-haiku-4-5-20251001"
+  release: "anthropic/claude-haiku-4-5-20251001"
+  archivist: "anthropic/claude-haiku-4-5-20251001"
+limits:
+  max_fix_attempts: 4
+  max_tokens_per_task: 150000
+  max_dollars_per_task: 10.0
+  require_plan_review: true
+  require_pr_review: true
+  max_tool_turns: 20
+intervention:
+  pause_after_plan: true
+  pause_before_pr: true
+  pause_on_core_change: true
+  pause_on_budget_exceeded: true
+workspace:
+  worktree_dir: ".glitchlab/worktrees"
+  task_dir: ".glitchlab/tasks"
+  log_dir: ".glitchlab/logs"
+allowed_tools: []
+blocked_patterns: []
+boundaries:
+  protected_paths: []
+memory:
+  dolt_connection: "mysql://localhost:3306/glitchlab"
+  beads_enabled: true
+  beads_bd_path: "/opt/bd"
+"#;
+        let config: EngConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            config.memory.dolt_connection,
+            Some("mysql://localhost:3306/glitchlab".into())
+        );
+        assert!(config.memory.beads_enabled);
+        assert_eq!(config.memory.beads_bd_path, Some("/opt/bd".into()));
     }
 }

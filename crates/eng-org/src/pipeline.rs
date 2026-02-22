@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use chrono::Utc;
 use glitchlab_kernel::agent::{Agent, AgentContext, AgentMetadata, AgentOutput};
+use glitchlab_kernel::budget::BudgetSummary;
 use glitchlab_kernel::governance::BoundaryEnforcer;
 use glitchlab_kernel::pipeline::{
     EventKind, PipelineContext, PipelineEvent, PipelineResult, PipelineStatus,
 };
 use glitchlab_kernel::tool::ToolPolicy;
-use glitchlab_memory::history::{BudgetSnapshot, EventsSummary, HistoryEntry, TaskHistory};
+use glitchlab_memory::history::{EventsSummary, HistoryBackend, HistoryEntry};
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -70,6 +71,7 @@ pub struct EngineeringPipeline {
     router: RouterRef,
     config: EngConfig,
     handler: Arc<dyn InterventionHandler>,
+    history: Arc<dyn HistoryBackend>,
 }
 
 impl EngineeringPipeline {
@@ -77,11 +79,13 @@ impl EngineeringPipeline {
         router: RouterRef,
         config: EngConfig,
         handler: Arc<dyn InterventionHandler>,
+        history: Arc<dyn HistoryBackend>,
     ) -> Self {
         Self {
             router,
             config,
             handler,
+            history,
         }
     }
 
@@ -108,9 +112,8 @@ impl EngineeringPipeline {
         }
 
         // Record history.
-        let history = TaskHistory::new(repo_path);
         let entry = build_history_entry(task_id, &result);
-        if let Err(e) = history.record(&entry) {
+        if let Err(e) = self.history.record(&entry).await {
             warn!(task_id, error = %e, "failed to record history");
         }
 
@@ -164,20 +167,23 @@ impl EngineeringPipeline {
             }
         };
 
-        let failure_context = TaskHistory::new(repo_path)
-            .build_failure_context(5)
-            .unwrap_or_default();
+        let failure_context = self.history.failure_context(5).await.unwrap_or_default();
 
         let mut enriched = format!("## Task\n\n{objective}");
         if !repo_context.is_empty() {
             enriched.push_str("\n\n");
             enriched.push_str(&repo_context);
         }
-        if !failure_context.is_empty() {
-            enriched.push_str("\n\n");
-            enriched.push_str(&failure_context);
-        }
         ctx.agent_context.objective = enriched;
+
+        // Store failure context separately in extra (independently droppable
+        // by ContextAssembler, rather than baked into the objective string).
+        if !failure_context.is_empty() {
+            ctx.agent_context.extra.insert(
+                "failure_history".into(),
+                serde_json::Value::String(failure_context),
+            );
+        }
 
         // Feed relevant source files into agent context.
         ctx.agent_context.file_context =
@@ -1010,13 +1016,13 @@ fn build_history_entry(task_id: &str, result: &PipelineResult) -> HistoryEntry {
         .unwrap_or_else(|| format!("{:?}", result.status));
 
     HistoryEntry {
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: Utc::now(),
         task_id: task_id.into(),
         status,
         pr_url: result.pr_url.clone(),
         branch: result.branch.clone(),
         error: result.error.clone(),
-        budget: BudgetSnapshot {
+        budget: BudgetSummary {
             total_tokens: result.budget.total_tokens,
             estimated_cost: result.budget.estimated_cost,
             call_count: result.budget.call_count,
@@ -1024,6 +1030,8 @@ fn build_history_entry(task_id: &str, result: &PipelineResult) -> HistoryEntry {
             dollars_remaining: result.budget.dollars_remaining,
         },
         events_summary: build_events_summary(&result.stage_outputs),
+        stage_outputs: None,
+        events: None,
     }
 }
 
@@ -1083,6 +1091,7 @@ mod tests {
     use crate::agents::test_helpers::mock_router_ref;
     use glitchlab_kernel::agent::{AgentMetadata, AgentOutput};
     use glitchlab_kernel::budget::BudgetSummary;
+    use glitchlab_memory::history::JsonlHistory;
 
     #[tokio::test]
     async fn auto_approve_handler() {
@@ -1095,10 +1104,12 @@ mod tests {
 
     #[test]
     fn pipeline_construction() {
+        let dir = tempfile::tempdir().unwrap();
         let router = mock_router_ref();
         let config = EngConfig::default();
         let handler = Arc::new(AutoApproveHandler);
-        let _pipeline = EngineeringPipeline::new(router, config, handler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let _pipeline = EngineeringPipeline::new(router, config, handler, history);
     }
 
     #[test]
@@ -1574,7 +1585,8 @@ mod tests {
         config.intervention.pause_before_pr = false;
 
         let handler = Arc::new(AutoApproveHandler);
-        let pipeline = EngineeringPipeline::new(router, config, handler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
             .run("test-task-1", "Fix a bug", dir.path(), &base_branch)
@@ -1652,7 +1664,8 @@ mod tests {
         config.intervention.pause_after_plan = true;
 
         let handler = Arc::new(RejectHandler);
-        let pipeline = EngineeringPipeline::new(router, config, handler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
             .run("test-reject", "Fix something", dir.path(), &base_branch)
@@ -1797,7 +1810,8 @@ mod tests {
         config.intervention.pause_before_pr = false;
 
         let handler = Arc::new(AutoApproveHandler);
-        let pipeline = EngineeringPipeline::new(router, config, handler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
             .run("test-with-tests", "Fix a bug", dir.path(), &base_branch)
@@ -1846,7 +1860,8 @@ mod tests {
         config.intervention.pause_before_pr = true;
 
         let handler = Arc::new(PrRejectHandler);
-        let pipeline = EngineeringPipeline::new(router, config, handler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
             .run("test-pr-reject", "Fix something", dir.path(), &base_branch)
@@ -1887,7 +1902,8 @@ mod tests {
         config.intervention.pause_before_pr = false;
 
         let handler = Arc::new(AutoApproveHandler);
-        let pipeline = EngineeringPipeline::new(router, config, handler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
             .run("test-fail-debug", "Fix a bug", dir.path(), &base_branch)
@@ -2073,7 +2089,8 @@ mod tests {
         config.intervention.pause_before_pr = false;
 
         let handler = Arc::new(AutoApproveHandler);
-        let pipeline = EngineeringPipeline::new(router, config, handler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
             .run(
@@ -2101,8 +2118,12 @@ mod tests {
         assert!(result.stage_outputs.contains_key("archive"));
 
         // Verify history was recorded.
-        let history = TaskHistory::new(dir.path());
-        let entries = history.get_recent(10).unwrap_or_default();
+        let history = JsonlHistory::new(dir.path());
+        let query = glitchlab_memory::history::HistoryQuery {
+            limit: 10,
+            ..Default::default()
+        };
+        let entries = history.query(&query).await.unwrap_or_default();
         assert!(
             !entries.is_empty(),
             "history should have at least one entry"

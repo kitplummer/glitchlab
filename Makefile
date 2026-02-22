@@ -18,11 +18,11 @@ test-crate:
 
 # Measure test coverage (excludes CLI binary)
 coverage:
-	cargo tarpaulin --exclude-files 'crates/cli/*' --skip-clean -o stdout
+	cargo tarpaulin --exclude-files 'crates/cli/*' 'crates/memory/src/dolt.rs' --skip-clean -o stdout
 
 # Coverage with HTML report
 coverage-html:
-	cargo tarpaulin --exclude-files 'crates/cli/*' --skip-clean -o html
+	cargo tarpaulin --exclude-files 'crates/cli/*' 'crates/memory/src/dolt.rs' --skip-clean -o html
 	@echo "Report: tarpaulin-report.html"
 
 # Run clippy lints

@@ -6,6 +6,7 @@ use glitchlab_eng_org::config::EngConfig;
 use glitchlab_eng_org::pipeline::{AutoApproveHandler, EngineeringPipeline, InterventionHandler};
 use glitchlab_kernel::budget::BudgetTracker;
 use glitchlab_kernel::pipeline::{PipelineResult, PipelineStatus};
+use glitchlab_memory::history::HistoryBackend;
 use glitchlab_router::Router;
 use tokio::process::Command;
 
@@ -47,9 +48,10 @@ impl InterventionHandler for CliApprovalHandler {
 // ---------------------------------------------------------------------------
 
 /// Build a `Router` and `EngineeringPipeline` from the loaded config.
-pub fn setup_pipeline(
+pub async fn setup_pipeline(
     config: &EngConfig,
     auto_approve: bool,
+    repo_path: &Path,
 ) -> Result<(Arc<Router>, EngineeringPipeline)> {
     // --- Build router ---
     let budget = BudgetTracker::new(
@@ -73,6 +75,9 @@ pub fn setup_pipeline(
 
     let router = Arc::new(router);
 
+    // --- Build history backend ---
+    let history = build_history_backend(repo_path, config).await;
+
     // --- Build pipeline ---
     let handler: Arc<dyn InterventionHandler> = if auto_approve {
         Arc::new(AutoApproveHandler)
@@ -80,9 +85,15 @@ pub fn setup_pipeline(
         Arc::new(CliApprovalHandler)
     };
 
-    let pipeline = EngineeringPipeline::new(Arc::clone(&router), config.clone(), handler);
+    let pipeline = EngineeringPipeline::new(Arc::clone(&router), config.clone(), handler, history);
 
     Ok((router, pipeline))
+}
+
+/// Build the history backend from config.
+async fn build_history_backend(repo_path: &Path, config: &EngConfig) -> Arc<dyn HistoryBackend> {
+    let mem_config = config.memory.to_backend_config();
+    glitchlab_memory::build_backend(repo_path, &mem_config).await
 }
 
 // ---------------------------------------------------------------------------

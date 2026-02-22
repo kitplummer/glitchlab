@@ -99,12 +99,17 @@ impl BudgetTracker {
 }
 
 /// Serializable summary of budget state at a point in time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetSummary {
+    #[serde(default)]
     pub total_tokens: u64,
+    #[serde(default)]
     pub estimated_cost: f64,
+    #[serde(default)]
     pub call_count: u64,
+    #[serde(default)]
     pub tokens_remaining: u64,
+    #[serde(default)]
     pub dollars_remaining: f64,
 }
 

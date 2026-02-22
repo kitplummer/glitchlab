@@ -42,7 +42,7 @@ pub async fn execute(
         }
 
         // --- Setup & run pipeline ---
-        let (_router, pipeline) = common::setup_pipeline(&config, auto_approve)?;
+        let (_router, pipeline) = common::setup_pipeline(&config, auto_approve, repo).await?;
         common::run_pipeline(&pipeline, "interactive", &objective, repo).await?;
 
         // --- Continue? ---

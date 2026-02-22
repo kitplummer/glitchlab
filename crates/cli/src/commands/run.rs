@@ -72,7 +72,7 @@ pub async fn execute(args: RunArgs<'_>) -> Result<()> {
     }
 
     // --- Setup & run pipeline ---
-    let (_router, pipeline) = common::setup_pipeline(&config, args.auto_approve)?;
+    let (_router, pipeline) = common::setup_pipeline(&config, args.auto_approve, args.repo).await?;
     common::run_pipeline(&pipeline, &task_id, &obj, args.repo).await
 }
 
