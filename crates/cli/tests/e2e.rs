@@ -314,6 +314,28 @@ async fn cli_run_records_history() {
     server_handle.abort();
 }
 
+/// Test the version command outputs the correct version.
+#[tokio::test]
+async fn cli_version_command() {
+    let version_output = Command::new(glitchlab_bin())
+        .args(["version"])
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&version_output.stdout);
+    let stderr = String::from_utf8_lossy(&version_output.stderr);
+
+    assert!(
+        version_output.status.success(),
+        "version command failed: {stderr}"
+    );
+    assert!(
+        stdout.contains("glitchlab 0.1.0"),
+        "version output should contain 'glitchlab 0.1.0', got: {stdout}"
+    );
+}
+
 /// E2E failure path: tests fail → history records the failure → `glitchlab history`
 /// shows it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
