@@ -36,6 +36,10 @@ enum Commands {
         #[arg(long)]
         task_file: Option<PathBuf>,
 
+        /// Inline objective (alternative to --issue/--local-task/--task-file)
+        #[arg(long)]
+        objective: Option<String>,
+
         /// Allow modifications to protected paths
         #[arg(long)]
         allow_core: bool,
@@ -62,6 +66,10 @@ enum Commands {
         /// Allow modifications to protected paths
         #[arg(long)]
         allow_core: bool,
+
+        /// Skip human intervention gates
+        #[arg(long)]
+        auto_approve: bool,
 
         /// Override test command
         #[arg(long, short)]
@@ -138,26 +146,34 @@ async fn main() -> Result<()> {
             issue,
             local_task,
             task_file,
+            objective,
             allow_core,
             auto_approve,
             test,
             verbose,
         } => {
             commands::setup_logging(verbose);
-            commands::run::execute(
-                &repo,
+            commands::run::execute(commands::run::RunArgs {
+                repo: &repo,
                 issue,
                 local_task,
-                task_file.as_deref(),
+                task_file: task_file.as_deref(),
+                objective: objective.as_deref(),
                 allow_core,
                 auto_approve,
-                test.as_deref(),
-            )
+                test: test.as_deref(),
+            })
             .await
         }
-        Commands::Interactive { repo, verbose, .. } => {
+        Commands::Interactive {
+            repo,
+            allow_core,
+            auto_approve,
+            test,
+            verbose,
+        } => {
             commands::setup_logging(verbose);
-            commands::interactive::execute(&repo).await
+            commands::interactive::execute(&repo, allow_core, auto_approve, test.as_deref()).await
         }
         Commands::Batch { repo, verbose, .. } => {
             commands::setup_logging(verbose);
