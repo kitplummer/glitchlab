@@ -96,9 +96,9 @@ impl Router {
 
         info!(role, model = model_string, "router: calling LLM");
 
-        // Call with retry (up to 3 attempts on transient errors).
+        // Call with retry (up to 5 attempts on transient/overload errors).
         let mut last_err = None;
-        for attempt in 1..=3 {
+        for attempt in 1..=5u64 {
             match provider
                 .complete(model_id, messages, temperature, max_tokens, response_format)
                 .await
@@ -129,12 +129,12 @@ impl Router {
                         role,
                         attempt,
                         wait_ms = wait,
-                        "router: rate limited, retrying"
+                        "router: rate limited / overloaded, retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                     last_err = Some(format!("rate limited on attempt {attempt}"));
                 }
-                Err(ProviderError::Http(e)) if attempt < 3 => {
+                Err(ProviderError::Http(e)) if attempt < 5 => {
                     let wait = 1000 * attempt;
                     warn!(
                         role,
@@ -203,9 +203,9 @@ impl Router {
             "router: calling LLM with tools"
         );
 
-        // Call with retry (up to 3 attempts on transient errors).
+        // Call with retry (up to 5 attempts on transient/overload errors).
         let mut last_err = None;
-        for attempt in 1..=3 {
+        for attempt in 1..=5u64 {
             match provider
                 .complete_with_tools(
                     model_id,
@@ -244,12 +244,12 @@ impl Router {
                         role,
                         attempt,
                         wait_ms = wait,
-                        "router: rate limited, retrying"
+                        "router: rate limited / overloaded, retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                     last_err = Some(format!("rate limited on attempt {attempt}"));
                 }
-                Err(ProviderError::Http(e)) if attempt < 3 => {
+                Err(ProviderError::Http(e)) if attempt < 5 => {
                     let wait = 1000 * attempt;
                     warn!(
                         role,
