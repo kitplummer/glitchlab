@@ -1892,4 +1892,151 @@ mod tests {
         let result = read_relevant_files(dir.path(), "Fix nonexistent.rs", &indexed).await;
         assert!(result.is_empty());
     }
+
+    // --- E2E pipeline test with Rust workspace structure ---
+
+    #[tokio::test]
+    async fn pipeline_e2e_rust_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Set up a minimal Rust workspace structure.
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/mylib"]
+resolver = "2"
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(dir.path().join("crates/mylib/src")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/mylib/Cargo.toml"),
+            r#"[package]
+name = "mylib"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("crates/mylib/src/lib.rs"),
+            r#"pub fn add(a: i32, b: i32) -> i32 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_add() { assert_eq!(add(1, 2), 3); }
+}
+"#,
+        )
+        .unwrap();
+
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add workspace"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let router = mock_router_ref();
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let pipeline = EngineeringPipeline::new(router, config, handler);
+
+        let result = pipeline
+            .run(
+                "test-rust-ws",
+                "Add a subtract function to crates/mylib/src/lib.rs",
+                dir.path(),
+                &base_branch,
+            )
+            .await;
+
+        // Verify the pipeline ran through all stages.
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error,
+        );
+
+        // Verify indexer found Rust files.
+        assert!(result.stage_outputs.contains_key("plan"));
+        assert!(result.stage_outputs.contains_key("implement"));
+        assert!(result.stage_outputs.contains_key("security"));
+        assert!(result.stage_outputs.contains_key("release"));
+        assert!(result.stage_outputs.contains_key("archive"));
+
+        // Verify history was recorded.
+        let history = TaskHistory::new(dir.path());
+        let entries = history.get_recent(10).unwrap_or_default();
+        assert!(
+            !entries.is_empty(),
+            "history should have at least one entry"
+        );
+
+        // Verify events were emitted.
+        assert!(!result.events.is_empty());
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::WorkspaceCreated),
+            "expected WorkspaceCreated event"
+        );
+    }
+
+    /// Live planner test — calls a real LLM provider.
+    ///
+    /// Only runs with: `cargo test -p glitchlab-eng-org --features live`
+    /// Requires ANTHROPIC_API_KEY or another configured provider.
+    #[cfg(feature = "live")]
+    #[tokio::test]
+    async fn live_planner_produces_valid_json() {
+        use crate::agents::planner::PlannerAgent;
+        use glitchlab_kernel::agent::Agent;
+        use glitchlab_kernel::budget::BudgetTracker;
+
+        let routing = HashMap::from([(
+            "planner".to_string(),
+            std::env::var("GLITCHLAB_PLANNER_MODEL")
+                .unwrap_or_else(|_| "anthropic/claude-haiku-4-5-20251001".to_string()),
+        )]);
+        let budget = BudgetTracker::new(100_000, 1.0);
+        let router = Arc::new(glitchlab_router::Router::new(routing, budget));
+
+        let planner = PlannerAgent::new(router);
+        let ctx = AgentContext {
+            task_id: "live-test".into(),
+            objective: "Add a greet() function to src/lib.rs that returns \"hello\"".into(),
+            repo_path: "/tmp/live-test".into(),
+            working_dir: "/tmp/live-test".into(),
+            constraints: vec!["No new dependencies".into()],
+            acceptance_criteria: vec![],
+            risk_level: "low".into(),
+            file_context: HashMap::new(),
+            previous_output: serde_json::Value::Null,
+            extra: HashMap::new(),
+        };
+
+        let output = planner.execute(&ctx).await.expect("planner should succeed");
+        assert_eq!(output.metadata.agent, "planner");
+        assert!(!output.parse_error, "should produce valid JSON");
+        assert!(
+            output.data["steps"].is_array(),
+            "should have steps array: {:?}",
+            output.data
+        );
+    }
 }
