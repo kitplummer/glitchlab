@@ -143,14 +143,19 @@ impl EngConfig {
                     .map_err(|e| Error::Config(format!("failed to read config: {e}")))?;
 
                 // Parse overrides as a generic YAML value and merge.
+                // A YAML file with only comments parses to Null — skip in that case.
                 let overrides: serde_yaml::Value = serde_yaml::from_str(&contents)
                     .map_err(|e| Error::Config(format!("invalid config YAML: {e}")))?;
-                let base: serde_yaml::Value = serde_yaml::to_value(&config)
-                    .map_err(|e| Error::Config(format!("failed to serialize defaults: {e}")))?;
 
-                let merged = deep_merge(base, overrides);
-                config = serde_yaml::from_value(merged)
-                    .map_err(|e| Error::Config(format!("failed to parse merged config: {e}")))?;
+                if !overrides.is_null() {
+                    let base: serde_yaml::Value = serde_yaml::to_value(&config)
+                        .map_err(|e| Error::Config(format!("failed to serialize defaults: {e}")))?;
+
+                    let merged = deep_merge(base, overrides);
+                    config = serde_yaml::from_value(merged).map_err(|e| {
+                        Error::Config(format!("failed to parse merged config: {e}"))
+                    })?;
+                }
             }
         }
 
@@ -271,6 +276,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = EngConfig::load(Some(dir.path())).unwrap();
         assert_eq!(config.limits.max_fix_attempts, 4);
+    }
+
+    #[test]
+    fn load_with_comments_only_config_returns_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "# all commented out\n# routing:\n#   planner: test\n",
+        )
+        .unwrap();
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(config.limits.max_fix_attempts, 4);
+        assert!(config.routing.planner.contains("anthropic"));
     }
 
     #[test]
