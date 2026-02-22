@@ -9,35 +9,43 @@ use super::{ToolLoopParams, tool_use_loop};
 use crate::agents::RouterRef;
 use crate::tools::{ToolDispatcher, tool_definitions};
 
-const SYSTEM_PROMPT: &str = r#"You are Patch, the implementation engine inside GLITCHLAB.
+fn system_prompt(max_turns: u32) -> String {
+    format!(
+        r#"You are Patch, the implementation engine inside GLITCHLAB.
 
-You receive a plan and implement it by iteratively reading, editing, and testing code.
+You receive a plan and implement it by making changes and verifying them.
+
+## Budget
+
+You have a maximum of {max_turns} tool-call turns. Reserve 2 turns for final verification
+(build check and tests). Plan your edits to fit within the remaining turns.
 
 ## Available tools
 
-- `read_file` — Read a file's contents.
+- `read_file` — Read a file's contents. Only use if the file is NOT already in the
+  Relevant File Contents section below.
 - `list_files` — List files matching a glob pattern.
 - `write_file` — Create or overwrite a file.
 - `edit_file` — Replace an exact string in a file.
-- `run_command` — Run a shell command (e.g. `cargo check`, `cargo test`).
+- `run_command` — Run a shell command (e.g. build, lint, test commands).
 
 ## Workflow
 
-1. Use `read_file` and `list_files` to explore the codebase and understand existing code.
-2. Use `write_file` and `edit_file` to make changes following the plan.
-3. Use `run_command` to run `cargo check`, `cargo test`, etc. to verify your changes.
+1. Review the provided file contents in context — do NOT re-read files already shown.
+2. Use `write_file` and `edit_file` to make all changes. Batch writes before verifying.
+3. Use `run_command` to build-check and then test to verify your changes.
 4. If there are errors, read the output, fix the issues, and re-check.
 5. Iterate until the implementation is correct and tests pass.
 
 ## Final output
 
 When you are done implementing, emit a final text response with this JSON schema:
-{
+{{
   "files_changed": ["path/to/file", ...],
   "tests_added": ["path/to/test_file", ...],
   "commit_message": "<conventional commit message>",
   "summary": "<brief human-readable summary>"
-}
+}}
 
 Do NOT include file content or patches in your final JSON — your tool calls already wrote
 the files. The final JSON is metadata only.
@@ -46,7 +54,9 @@ Rules:
 - Follow the plan exactly. No feature creep.
 - Keep diffs minimal. Always add/update tests.
 - Use idiomatic patterns for the language.
-- Produce valid JSON only in the final response."#;
+- Produce valid JSON only in the final response."#
+    )
+}
 
 pub struct ImplementerAgent {
     router: RouterRef,
@@ -77,7 +87,7 @@ impl Agent for ImplementerAgent {
         let mut messages = vec![
             Message {
                 role: MessageRole::System,
-                content: MessageContent::Text(SYSTEM_PROMPT.into()),
+                content: MessageContent::Text(system_prompt(self.max_tool_turns)),
             },
             Message {
                 role: MessageRole::User,
@@ -153,6 +163,23 @@ mod tests {
         ctx.previous_output = serde_json::json!({"steps": [{"description": "add feature"}]});
         let output = agent.execute(&ctx).await.unwrap();
         assert_eq!(output.metadata.agent, "implementer");
+    }
+
+    #[test]
+    fn system_prompt_contains_turn_count() {
+        let prompt = system_prompt(15);
+        assert!(
+            prompt.contains("15 tool-call turns"),
+            "prompt should embed the turn count"
+        );
+        assert!(
+            !prompt.contains("explore the codebase"),
+            "prompt should not encourage exploration"
+        );
+        assert!(
+            prompt.contains("do NOT re-read files already shown"),
+            "prompt should discourage redundant reads"
+        );
     }
 
     #[tokio::test]

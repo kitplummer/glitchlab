@@ -274,7 +274,14 @@ async fn cli_run_records_history() {
     assert!(!contents.is_empty(), "history.jsonl should not be empty");
 
     let entry: serde_json::Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
-    assert_eq!(entry["task_id"], "inline", "task_id should be 'inline'");
+    assert!(
+        entry["task_id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("inline-"),
+        "task_id should start with 'inline-', got: {}",
+        entry["task_id"]
+    );
     assert!(
         entry["status"] == "committed" || entry["status"] == "pr_created",
         "unexpected status: {}",
@@ -371,7 +378,14 @@ async fn cli_failure_records_history() {
 
     let contents = std::fs::read_to_string(&history_file).unwrap();
     let entry: serde_json::Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
-    assert_eq!(entry["task_id"], "inline");
+    assert!(
+        entry["task_id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("inline-"),
+        "task_id should start with 'inline-', got: {}",
+        entry["task_id"]
+    );
     assert!(
         entry["status"] != "committed" && entry["status"] != "pr_created",
         "status should indicate failure, got: {}",

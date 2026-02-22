@@ -97,7 +97,8 @@ async fn resolve_task(
     }
 
     if let Some(text) = objective {
-        return Ok(("inline".into(), text.to_string()));
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        return Ok((format!("inline-{stamp}"), text.to_string()));
     }
 
     if local_task {
