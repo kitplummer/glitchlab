@@ -5,7 +5,9 @@ use glitchlab_kernel::error;
 
 use super::build_user_message;
 use super::parse::parse_json_response;
+use super::{ToolLoopParams, tool_use_loop};
 use crate::agents::RouterRef;
+use crate::tools::{ToolDispatcher, tool_definitions};
 
 const SYSTEM_PROMPT: &str = r#"You are Reroute, the debug engine inside GLITCHLAB.
 
@@ -13,7 +15,25 @@ You are invoked ONLY when tests fail or builds break.
 Produce a MINIMAL fix. Nothing more. Fix the EXACT failure.
 Do not refactor, add features, or clean up code.
 
-Output schema (valid JSON only, no markdown, no commentary):
+## Available tools
+
+- `read_file` — Read a file's contents.
+- `list_files` — List files matching a glob pattern.
+- `write_file` — Create or overwrite a file.
+- `edit_file` — Replace an exact string in a file.
+- `run_command` — Run a shell command (e.g. `cargo check`, `cargo test`).
+
+## Workflow
+
+1. Read the failing test output and error messages from context.
+2. Use `read_file` to examine the relevant source files.
+3. Use `edit_file` to apply the minimal fix.
+4. Use `run_command` to run `cargo check` or `cargo test` to verify the fix.
+5. Iterate until the fix is correct.
+
+## Final output
+
+When you are done debugging, emit a final text response with this JSON schema:
 {
   "diagnosis": "<what went wrong and why>",
   "root_cause": "<the specific root cause>",
@@ -36,15 +56,21 @@ Rules:
 - Fix ONLY what is broken. Minimal diff.
 - If you cannot diagnose the issue, set confidence to "low" and should_retry to false.
 - If a previous fix attempt was provided in context, do NOT repeat it.
-- Produce valid JSON only."#;
+- Produce valid JSON only in the final response."#;
 
 pub struct DebuggerAgent {
     router: RouterRef,
+    dispatcher: ToolDispatcher,
+    max_tool_turns: u32,
 }
 
 impl DebuggerAgent {
-    pub fn new(router: RouterRef) -> Self {
-        Self { router }
+    pub fn new(router: RouterRef, dispatcher: ToolDispatcher, max_tool_turns: u32) -> Self {
+        Self {
+            router,
+            dispatcher,
+            max_tool_turns,
+        }
     }
 }
 
@@ -58,7 +84,7 @@ impl Agent for DebuggerAgent {
     }
 
     async fn execute(&self, ctx: &AgentContext) -> error::Result<AgentOutput> {
-        let messages = vec![
+        let mut messages = vec![
             Message {
                 role: MessageRole::System,
                 content: MessageContent::Text(SYSTEM_PROMPT.into()),
@@ -69,10 +95,15 @@ impl Agent for DebuggerAgent {
             },
         ];
 
-        let response = self
-            .router
-            .complete("debugger", &messages, 0.2, 4096, None)
-            .await?;
+        let tool_defs = tool_definitions();
+        let params = ToolLoopParams {
+            tool_defs: &tool_defs,
+            dispatcher: &self.dispatcher,
+            max_turns: self.max_tool_turns,
+            temperature: 0.2,
+            max_tokens: 4096,
+        };
+        let response = tool_use_loop(&self.router, "debugger", &mut messages, &params).await?;
 
         let metadata = AgentMetadata {
             agent: "debugger".into(),
@@ -98,19 +129,29 @@ impl Agent for DebuggerAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::test_helpers::{mock_router_ref, test_agent_context};
+    use crate::agents::test_helpers::{
+        final_response, mock_router_ref, sequential_router_ref, test_agent_context,
+        test_dispatcher, tool_response,
+    };
     use glitchlab_kernel::agent::Agent;
+    use glitchlab_kernel::tool::ToolCall;
+
+    fn make_agent(router: RouterRef) -> DebuggerAgent {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.keep();
+        DebuggerAgent::new(router, test_dispatcher(&dir_path), 20)
+    }
 
     #[test]
     fn role_and_persona() {
-        let agent = DebuggerAgent::new(mock_router_ref());
+        let agent = make_agent(mock_router_ref());
         assert_eq!(agent.role(), "debugger");
         assert_eq!(agent.persona(), "Reroute");
     }
 
     #[tokio::test]
     async fn execute_returns_output() {
-        let agent = DebuggerAgent::new(mock_router_ref());
+        let agent = make_agent(mock_router_ref());
         let ctx = test_agent_context();
         let output = agent.execute(&ctx).await.unwrap();
         assert_eq!(output.metadata.agent, "debugger");
@@ -118,10 +159,37 @@ mod tests {
 
     #[tokio::test]
     async fn execute_with_previous_output() {
-        let agent = DebuggerAgent::new(mock_router_ref());
+        let agent = make_agent(mock_router_ref());
         let mut ctx = test_agent_context();
         ctx.previous_output = serde_json::json!({"test_output": "FAILED: assertion error"});
         let output = agent.execute(&ctx).await.unwrap();
         assert_eq!(output.metadata.agent, "debugger");
+    }
+
+    #[tokio::test]
+    async fn execute_with_tool_use() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bug.rs"), "fn broken() {}").unwrap();
+        let dispatcher = test_dispatcher(dir.path());
+
+        let responses = vec![
+            // Turn 1: read the buggy file
+            tool_response(vec![ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "bug.rs"}),
+            }]),
+            // Turn 2: final diagnosis
+            final_response(
+                r#"{"diagnosis": "found the bug", "root_cause": "typo", "fix": {"changes": []}, "confidence": "high", "should_retry": false, "notes": null}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let agent = DebuggerAgent::new(router, dispatcher, 20);
+
+        let ctx = test_agent_context();
+        let output = agent.execute(&ctx).await.unwrap();
+        assert_eq!(output.metadata.agent, "debugger");
+        assert_eq!(output.data["diagnosis"], "found the bug");
     }
 }

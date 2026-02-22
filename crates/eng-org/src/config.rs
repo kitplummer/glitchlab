@@ -35,6 +35,7 @@ pub struct LimitsConfig {
     pub max_dollars_per_task: f64,
     pub require_plan_review: bool,
     pub require_pr_review: bool,
+    pub max_tool_turns: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +76,7 @@ impl Default for EngConfig {
                 max_dollars_per_task: 10.0,
                 require_plan_review: true,
                 require_pr_review: true,
+                max_tool_turns: 20,
             },
             intervention: InterventionConfig {
                 pause_after_plan: true,
@@ -250,6 +252,7 @@ mod tests {
         assert!(!config.blocked_patterns.is_empty());
         assert!(config.routing.implementer.contains("anthropic"));
         assert!(config.routing.planner.contains("anthropic"));
+        assert_eq!(config.limits.max_tool_turns, 20);
     }
 
     #[test]

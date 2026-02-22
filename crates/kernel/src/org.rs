@@ -99,6 +99,10 @@ pub struct LimitsConfig {
     /// Require human review before creating PR.
     #[serde(default = "yes")]
     pub require_pr_review: bool,
+
+    /// Maximum LLM round-trips per agent tool-use session.
+    #[serde(default = "default_max_tool_turns")]
+    pub max_tool_turns: u32,
 }
 
 fn default_max_fix_attempts() -> u32 {
@@ -109,6 +113,9 @@ fn default_max_tokens_per_task() -> u64 {
 }
 fn default_max_dollars() -> f64 {
     10.0
+}
+fn default_max_tool_turns() -> u32 {
+    20
 }
 fn yes() -> bool {
     true
@@ -122,6 +129,7 @@ impl Default for LimitsConfig {
             max_dollars_per_task: default_max_dollars(),
             require_plan_review: true,
             require_pr_review: true,
+            max_tool_turns: default_max_tool_turns(),
         }
     }
 }
@@ -213,6 +221,7 @@ mod tests {
         assert!((limits.max_dollars_per_task - 10.0).abs() < f64::EPSILON);
         assert!(limits.require_plan_review);
         assert!(limits.require_pr_review);
+        assert_eq!(limits.max_tool_turns, 20);
     }
 
     #[test]

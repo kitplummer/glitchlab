@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use glitchlab_kernel::agent::{Agent, AgentContext, AgentMetadata, AgentOutput};
@@ -9,6 +10,7 @@ use glitchlab_kernel::governance::BoundaryEnforcer;
 use glitchlab_kernel::pipeline::{
     EventKind, PipelineContext, PipelineEvent, PipelineResult, PipelineStatus,
 };
+use glitchlab_kernel::tool::ToolPolicy;
 use glitchlab_memory::history::{BudgetSnapshot, EventsSummary, HistoryEntry, TaskHistory};
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -22,6 +24,7 @@ use crate::agents::release::ReleaseAgent;
 use crate::agents::security::SecurityAgent;
 use crate::config::EngConfig;
 use crate::indexer;
+use crate::tools::ToolDispatcher;
 use crate::workspace::Workspace;
 
 // ---------------------------------------------------------------------------
@@ -257,7 +260,21 @@ impl EngineeringPipeline {
                 .or_insert(content);
         }
 
-        let implementer = ImplementerAgent::new(Arc::clone(&self.router));
+        let impl_tool_policy = ToolPolicy::new(
+            self.config.allowed_tools.clone(),
+            self.config.blocked_patterns.clone(),
+        );
+        let impl_dispatcher = ToolDispatcher::new(
+            wt_path.clone(),
+            impl_tool_policy,
+            self.config.boundaries.protected_paths.clone(),
+            Duration::from_secs(30),
+        );
+        let implementer = ImplementerAgent::new(
+            Arc::clone(&self.router),
+            impl_dispatcher,
+            self.config.limits.max_tool_turns,
+        );
         let impl_output = match implementer.execute(&ctx.agent_context).await {
             Ok(o) => o,
             Err(e) => {
@@ -337,7 +354,21 @@ impl EngineeringPipeline {
                             "fix_attempt": fix_attempts,
                         });
 
-                        let debugger = DebuggerAgent::new(Arc::clone(&self.router));
+                        let dbg_tool_policy = ToolPolicy::new(
+                            self.config.allowed_tools.clone(),
+                            self.config.blocked_patterns.clone(),
+                        );
+                        let dbg_dispatcher = ToolDispatcher::new(
+                            wt_path.clone(),
+                            dbg_tool_policy,
+                            self.config.boundaries.protected_paths.clone(),
+                            Duration::from_secs(30),
+                        );
+                        let debugger = DebuggerAgent::new(
+                            Arc::clone(&self.router),
+                            dbg_dispatcher,
+                            self.config.limits.max_tool_turns,
+                        );
                         let debug_out = match debugger.execute(&ctx.agent_context).await {
                             Ok(o) => o,
                             Err(e) => {
