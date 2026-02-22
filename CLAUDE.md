@@ -16,6 +16,18 @@ GLITCHLAB is an agentic development engine being ported from Python to Rust. The
 - When writing new code, write tests in the same commit.
 - Prefer testing behavior over implementation details.
 
+## Development Setup
+
+After cloning, enable the pre-commit hook:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+This runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` before each commit. Commits that fail either check are rejected. The same checks run in CI (`.github/workflows/ci.yml`).
+
+Use the Makefile for common tasks: `make test`, `make lint`, `make fmt`, `make coverage`, `make ci`.
+
 ## Code Standards
 
 - Rust edition 2024, workspace resolver 2.
