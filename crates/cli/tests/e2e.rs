@@ -307,6 +307,52 @@ async fn cli_run_records_history() {
     server_handle.abort();
 }
 
+/// Test the version command outputs the correct version string.
+#[tokio::test]
+async fn cli_version_command() {
+    let version_output = Command::new(glitchlab_bin())
+        .args(["version"])
+        .output()
+        .await
+        .unwrap();
+
+    assert!(
+        version_output.status.success(),
+        "version command failed: {}",
+        String::from_utf8_lossy(&version_output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&version_output.stdout);
+    assert!(
+        stdout.contains("glitchlab 0.1.0"),
+        "version output should contain 'glitchlab 0.1.0', got: '{}'",
+        stdout.trim()
+    );
+}
+
+/// Test that the version command is listed in help output.
+#[tokio::test]
+async fn cli_help_shows_version_command() {
+    let help_output = Command::new(glitchlab_bin())
+        .args(["--help"])
+        .output()
+        .await
+        .unwrap();
+
+    assert!(
+        help_output.status.success(),
+        "help command failed: {}",
+        String::from_utf8_lossy(&help_output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&help_output.stdout);
+    assert!(
+        stdout.contains("version") && stdout.contains("Show version information"),
+        "help output should contain version command description, got: '{}'",
+        stdout
+    );
+}
+
 /// E2E failure path: tests fail → history records the failure → `glitchlab history`
 /// shows it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

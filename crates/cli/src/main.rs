@@ -134,6 +134,9 @@ enum Commands {
         #[arg(long)]
         stats: bool,
     },
+
+    /// Show version information
+    Version,
 }
 
 #[tokio::main]
@@ -184,5 +187,6 @@ async fn main() -> Result<()> {
         Commands::History { repo, count, stats } => {
             commands::history::execute(&repo, count, stats).await
         }
+        Commands::Version => commands::version::execute().await,
     }
 }

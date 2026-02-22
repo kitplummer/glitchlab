@@ -5,6 +5,7 @@ pub mod init;
 pub mod interactive;
 pub mod run;
 pub mod status;
+pub mod version;
 
 pub fn setup_logging(verbose: bool) {
     let filter = if verbose { "debug" } else { "info" };
