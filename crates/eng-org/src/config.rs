@@ -63,6 +63,7 @@ pub struct LimitsConfig {
     pub require_plan_review: bool,
     pub require_pr_review: bool,
     pub max_tool_turns: u32,
+    pub max_pipeline_duration_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +105,7 @@ impl Default for EngConfig {
                 require_plan_review: true,
                 require_pr_review: true,
                 max_tool_turns: 20,
+                max_pipeline_duration_secs: 3600,
             },
             intervention: InterventionConfig {
                 pause_after_plan: true,
@@ -281,6 +283,7 @@ mod tests {
         assert!(config.routing.implementer.contains("anthropic"));
         assert!(config.routing.planner.contains("anthropic"));
         assert_eq!(config.limits.max_tool_turns, 20);
+        assert_eq!(config.limits.max_pipeline_duration_secs, 3600);
     }
 
     #[test]
@@ -514,6 +517,7 @@ limits:
   require_plan_review: true
   require_pr_review: true
   max_tool_turns: 20
+  max_pipeline_duration_secs: 3600
 intervention:
   pause_after_plan: true
   pause_before_pr: true

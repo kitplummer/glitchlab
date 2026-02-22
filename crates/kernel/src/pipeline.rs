@@ -152,6 +152,8 @@ pub enum PipelineStatus {
     BudgetExceeded,
     /// Pipeline was interrupted (human intervention).
     Interrupted,
+    /// Pipeline exceeded its wall-clock timeout.
+    TimedOut,
     /// Unrecoverable error.
     Error,
 }
@@ -246,6 +248,15 @@ mod tests {
         assert_eq!(json, "\"pr_created\"");
         let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, PipelineStatus::PrCreated);
+    }
+
+    #[test]
+    fn pipeline_status_timed_out_serde() {
+        let status = PipelineStatus::TimedOut;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"timed_out\"");
+        let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PipelineStatus::TimedOut);
     }
 
     #[test]

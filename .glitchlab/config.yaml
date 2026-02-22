@@ -1,13 +1,13 @@
 # GLITCHLAB configuration overrides
 # Values here are merged on top of built-in defaults.
 
-# routing:
-#   implementer: "anthropic/claude-sonnet-4-20250514"
+boundaries:
+  protected_paths:
+    - "crates/kernel"
+    - ".github"
+    - ".githooks"
+    - "CLAUDE.md"
+    - ".glitchlab/config.yaml"
 
-# boundaries:
-#   protected_paths:
-#     - "crates/core"
-
-# limits:
-#   max_fix_attempts: 4
-#   max_dollars_per_task: 10.0
+limits:
+  max_tool_turns: 30

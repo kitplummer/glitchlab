@@ -100,11 +100,37 @@ impl EngineeringPipeline {
     ) -> PipelineResult {
         info!(task_id, "pipeline starting");
 
+        let timeout = Duration::from_secs(self.config.limits.max_pipeline_duration_secs);
+
         let mut workspace = Workspace::new(repo_path, task_id, &self.config.workspace.worktree_dir);
 
-        let result = self
-            .run_stages(task_id, objective, repo_path, base_branch, &mut workspace)
-            .await;
+        let result = match tokio::time::timeout(
+            timeout,
+            self.run_stages(task_id, objective, repo_path, base_branch, &mut workspace),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                warn!(
+                    task_id,
+                    timeout_secs = timeout.as_secs(),
+                    "pipeline timed out"
+                );
+                PipelineResult {
+                    status: PipelineStatus::TimedOut,
+                    stage_outputs: HashMap::new(),
+                    events: vec![],
+                    budget: self.router.budget_summary().await,
+                    pr_url: None,
+                    branch: None,
+                    error: Some(format!(
+                        "pipeline exceeded wall-clock timeout of {}s",
+                        timeout.as_secs()
+                    )),
+                }
+            }
+        };
 
         // Always cleanup workspace.
         if let Err(e) = workspace.cleanup().await {
@@ -913,7 +939,7 @@ async fn create_pr(
             "pr",
             "create",
             "--title",
-            &truncate(title, 70),
+            &truncate_head(title, 70),
             "--body",
             &body,
             "--base",
@@ -987,7 +1013,24 @@ fn format_plan_summary(plan: &AgentOutput) -> String {
     summary
 }
 
+/// Truncate keeping the **tail** (last `max` chars). Command output and diffs
+/// have the interesting bits (errors, summaries) at the end.
 fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let tail = &s[s.len() - max..];
+        // Try to break at a newline so we don't start mid-line.
+        if let Some(nl) = tail.find('\n') {
+            format!("[...truncated]\n{}", &tail[nl + 1..])
+        } else {
+            format!("[...truncated]\n{tail}")
+        }
+    }
+}
+
+/// Truncate keeping the **head** (first `max` chars). Used for titles / labels.
+fn truncate_head(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
@@ -1347,8 +1390,39 @@ mod tests {
     }
 
     #[test]
-    fn truncate_long_string() {
-        let result = truncate("hello world", 5);
+    fn truncate_keeps_tail() {
+        let input = "line1\nline2\nline3\nerror: something broke";
+        let result = truncate(input, 25);
+        // Should keep the tail and break at a newline boundary.
+        assert!(
+            result.starts_with("[...truncated]\n"),
+            "should start with truncation marker, got: {result}"
+        );
+        assert!(
+            result.contains("error: something broke"),
+            "should contain the tail error, got: {result}"
+        );
+        assert!(
+            !result.contains("line1"),
+            "should not contain the head, got: {result}"
+        );
+    }
+
+    #[test]
+    fn truncate_no_newline_in_tail() {
+        // When tail has no newline, just prefix with marker.
+        let result = truncate("abcdefghij", 5);
+        assert_eq!(result, "[...truncated]\nfghij");
+    }
+
+    #[test]
+    fn truncate_head_short_string() {
+        assert_eq!(truncate_head("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_head_long_string() {
+        let result = truncate_head("hello world", 5);
         assert_eq!(result, "hello...");
     }
 
@@ -2180,6 +2254,38 @@ mod tests {
             output.data["steps"].is_array(),
             "should have steps array: {:?}",
             output.data
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_timeout_produces_timed_out_status() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+
+        let router = mock_router_ref();
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        // Set an impossibly short timeout (1 nanosecond).
+        config.limits.max_pipeline_duration_secs = 0;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+
+        let result = pipeline
+            .run("timeout-task", "do stuff", dir.path(), "main")
+            .await;
+        assert_eq!(
+            result.status,
+            PipelineStatus::TimedOut,
+            "expected TimedOut, got {:?}",
+            result.status
+        );
+        assert!(
+            result.error.as_ref().unwrap().contains("timeout"),
+            "error message should mention timeout: {:?}",
+            result.error
         );
     }
 }
