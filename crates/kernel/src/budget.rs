@@ -1,0 +1,168 @@
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// UsageRecord — accumulator for token + cost usage
+// ---------------------------------------------------------------------------
+
+/// Tracks cumulative usage across multiple LLM calls within a task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub estimated_cost: f64,
+    pub call_count: u64,
+}
+
+// ---------------------------------------------------------------------------
+// BudgetTracker — hard limits on token and dollar spend
+// ---------------------------------------------------------------------------
+
+/// Enforces per-task budget limits (tokens + dollars).
+///
+/// Checked before every LLM call. Exceeding either limit raises
+/// `Error::BudgetExceeded` and halts the pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetTracker {
+    pub max_tokens: u64,
+    pub max_dollars: f64,
+    pub usage: UsageRecord,
+}
+
+impl BudgetTracker {
+    pub fn new(max_tokens: u64, max_dollars: f64) -> Self {
+        Self {
+            max_tokens,
+            max_dollars,
+            usage: UsageRecord::default(),
+        }
+    }
+
+    /// Record usage from an LLM call.
+    pub fn record(&mut self, prompt_tokens: u64, completion_tokens: u64, cost: f64) {
+        self.usage.prompt_tokens += prompt_tokens;
+        self.usage.completion_tokens += completion_tokens;
+        self.usage.total_tokens += prompt_tokens + completion_tokens;
+        self.usage.estimated_cost += cost;
+        self.usage.call_count += 1;
+    }
+
+    /// True if either token or dollar limit has been exceeded.
+    pub fn exceeded(&self) -> bool {
+        self.usage.total_tokens > self.max_tokens || self.usage.estimated_cost > self.max_dollars
+    }
+
+    /// Tokens remaining before hitting the limit.
+    pub fn tokens_remaining(&self) -> u64 {
+        self.max_tokens.saturating_sub(self.usage.total_tokens)
+    }
+
+    /// Dollars remaining before hitting the limit.
+    pub fn dollars_remaining(&self) -> f64 {
+        (self.max_dollars - self.usage.estimated_cost).max(0.0)
+    }
+
+    /// Check the budget and return an error if exceeded.
+    /// Call this before every LLM invocation.
+    pub fn check(&self) -> Result<()> {
+        if self.usage.total_tokens > self.max_tokens {
+            return Err(Error::BudgetExceeded {
+                reason: format!(
+                    "token limit exceeded: {} / {} tokens used",
+                    self.usage.total_tokens, self.max_tokens,
+                ),
+            });
+        }
+        if self.usage.estimated_cost > self.max_dollars {
+            return Err(Error::BudgetExceeded {
+                reason: format!(
+                    "dollar limit exceeded: ${:.4} / ${:.2} spent",
+                    self.usage.estimated_cost, self.max_dollars,
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Summary snapshot for history/reporting.
+    pub fn summary(&self) -> BudgetSummary {
+        BudgetSummary {
+            total_tokens: self.usage.total_tokens,
+            estimated_cost: self.usage.estimated_cost,
+            call_count: self.usage.call_count,
+            tokens_remaining: self.tokens_remaining(),
+            dollars_remaining: self.dollars_remaining(),
+        }
+    }
+}
+
+/// Serializable summary of budget state at a point in time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetSummary {
+    pub total_tokens: u64,
+    pub estimated_cost: f64,
+    pub call_count: u64,
+    pub tokens_remaining: u64,
+    pub dollars_remaining: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_budget_not_exceeded() {
+        let budget = BudgetTracker::new(150_000, 10.0);
+        assert!(!budget.exceeded());
+        assert!(budget.check().is_ok());
+        assert_eq!(budget.tokens_remaining(), 150_000);
+        assert!((budget.dollars_remaining() - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_accumulates() {
+        let mut budget = BudgetTracker::new(150_000, 10.0);
+        budget.record(1000, 500, 0.05);
+        budget.record(2000, 800, 0.10);
+
+        assert_eq!(budget.usage.prompt_tokens, 3000);
+        assert_eq!(budget.usage.completion_tokens, 1300);
+        assert_eq!(budget.usage.total_tokens, 4300);
+        assert!((budget.usage.estimated_cost - 0.15).abs() < f64::EPSILON);
+        assert_eq!(budget.usage.call_count, 2);
+    }
+
+    #[test]
+    fn token_limit_exceeded() {
+        let mut budget = BudgetTracker::new(1000, 10.0);
+        budget.record(600, 500, 0.01);
+        assert!(budget.exceeded());
+        assert!(budget.check().is_err());
+    }
+
+    #[test]
+    fn dollar_limit_exceeded() {
+        let mut budget = BudgetTracker::new(150_000, 1.0);
+        budget.record(100, 50, 1.50);
+        assert!(budget.exceeded());
+        let err = budget.check().unwrap_err();
+        assert!(err.to_string().contains("dollar limit exceeded"));
+    }
+
+    #[test]
+    fn summary_snapshot() {
+        let mut budget = BudgetTracker::new(10_000, 5.0);
+        budget.record(2000, 1000, 1.25);
+        let summary = budget.summary();
+        assert_eq!(summary.total_tokens, 3000);
+        assert_eq!(summary.tokens_remaining, 7000);
+        assert!((summary.dollars_remaining - 3.75).abs() < f64::EPSILON);
+        assert_eq!(summary.call_count, 1);
+    }
+}

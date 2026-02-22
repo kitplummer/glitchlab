@@ -1,0 +1,24 @@
+[package]
+name = "glitchlab-eng-org"
+description = "Engineering org — the GLITCHLAB agent pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glitchlab-kernel.workspace = true
+glitchlab-memory.workspace = true
+glitchlab-router.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
