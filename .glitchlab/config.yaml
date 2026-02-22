@@ -11,3 +11,4 @@ boundaries:
 
 limits:
   max_tool_turns: 30
+  max_tokens_per_task: 500000

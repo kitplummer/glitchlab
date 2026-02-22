@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use glitchlab_kernel::agent::{Message, MessageRole};
+use glitchlab_kernel::agent::{ContentBlock, Message, MessageContent, MessageRole};
 use glitchlab_kernel::tool::ToolDefinition;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,10 @@ impl AnthropicProvider {
 
     /// Convert kernel `Message`s into Anthropic format, separating the
     /// system prompt from conversation messages.
+    ///
+    /// Text-only messages use a plain string `content`.  Messages with
+    /// tool-use or tool-result blocks are serialized as the structured
+    /// `content: [...]` array that the Anthropic API expects.
     fn build_messages(messages: &[Message]) -> (String, Vec<AnthropicMessage>) {
         let system: String = messages
             .iter()
@@ -102,13 +106,45 @@ impl AnthropicProvider {
         let conversation: Vec<_> = messages
             .iter()
             .filter(|m| m.role != MessageRole::System)
-            .map(|m| AnthropicMessage {
-                role: match m.role {
+            .map(|m| {
+                let role = match m.role {
                     MessageRole::User | MessageRole::Tool => "user".into(),
                     MessageRole::Assistant => "assistant".into(),
                     MessageRole::System => unreachable!(),
-                },
-                content: m.content.text(),
+                };
+
+                let content = match &m.content {
+                    MessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                    MessageContent::Blocks(blocks) => {
+                        let arr: Vec<serde_json::Value> = blocks
+                            .iter()
+                            .map(|b| match b {
+                                ContentBlock::Text { text } => {
+                                    serde_json::json!({"type": "text", "text": text})
+                                }
+                                ContentBlock::ToolUse(tc) => {
+                                    serde_json::json!({
+                                        "type": "tool_use",
+                                        "id": tc.id,
+                                        "name": tc.name,
+                                        "input": tc.input,
+                                    })
+                                }
+                                ContentBlock::ToolResult(tr) => {
+                                    serde_json::json!({
+                                        "type": "tool_result",
+                                        "tool_use_id": tr.tool_call_id,
+                                        "content": tr.content,
+                                        "is_error": tr.is_error,
+                                    })
+                                }
+                            })
+                            .collect();
+                        serde_json::Value::Array(arr)
+                    }
+                };
+
+                AnthropicMessage { role, content }
             })
             .collect();
 
@@ -276,19 +312,21 @@ struct AnthropicToolDef<'a> {
 #[derive(Serialize)]
 struct AnthropicMessage {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
 
 #[derive(Deserialize)]
 struct AnthropicResponse {
-    content: Vec<ContentBlock>,
+    content: Vec<ResponseBlock>,
     usage: Usage,
     #[serde(default)]
     stop_reason: Option<String>,
 }
 
+/// A content block in an Anthropic API *response* (deserialized from JSON).
+/// Separate from `glitchlab_kernel::agent::ContentBlock` which is the kernel type.
 #[derive(Deserialize)]
-struct ContentBlock {
+struct ResponseBlock {
     r#type: String,
     text: Option<String>,
     id: Option<String>,
