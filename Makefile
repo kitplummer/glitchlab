@@ -1,4 +1,4 @@
-.PHONY: build check test test-functional coverage lint fmt clean
+.PHONY: build check test test-functional coverage lint fmt clean dogfood
 
 # Build all crates
 build:
@@ -45,6 +45,13 @@ fmt-check:
 # Clean build artifacts
 clean:
 	cargo clean
+
+# Self-dogfooding run (requires ANTHROPIC_API_KEY in env)
+# Usage: make dogfood
+# Usage: make dogfood OBJ="your custom objective here"
+OBJ ?= Add a 'version' subcommand to the CLI that prints the crate version. The command should be 'glitchlab version' and print 'glitchlab 0.1.0'. Add it to the clap CLI in main.rs and create crates/cli/src/commands/version.rs.
+dogfood: build
+	RUST_LOG=info cargo run -p glitchlab-cli --release -- run --repo $(CURDIR) --objective "$(OBJ)"
 
 # Full CI check: fmt + lint + test + coverage
 ci: fmt-check lint test coverage
