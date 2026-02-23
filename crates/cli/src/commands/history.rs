@@ -1,10 +1,12 @@
 use std::path::Path;
 
 use anyhow::Result;
-use glitchlab_memory::history::{HistoryBackend, HistoryQuery, JsonlHistory};
+use glitchlab_memory::history::HistoryQuery;
+use glitchlab_memory::{MemoryBackendConfig, build_backend};
 
 pub async fn execute(repo: &Path, count: usize, stats: bool) -> Result<()> {
-    let history = JsonlHistory::new(repo);
+    let config = MemoryBackendConfig::default();
+    let history = build_backend(repo, &config).await;
 
     if stats {
         let s = history.stats().await.map_err(|e| anyhow::anyhow!("{e}"))?;
