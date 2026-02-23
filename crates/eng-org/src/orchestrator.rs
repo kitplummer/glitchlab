@@ -823,7 +823,7 @@ mod tests {
             pr_url: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
-        let mut budget = CumulativeBudget::new(0.50); // less than per-task $2.00
+        let mut budget = CumulativeBudget::new(0.10); // less than per-task $0.50
         let params = OrchestratorParams {
             repo_path: dir.path().to_path_buf(),
             base_branch: "main".into(),

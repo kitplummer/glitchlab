@@ -109,9 +109,17 @@ impl Workspace {
 
     /// Push the branch to origin.
     pub async fn push(&self) -> Result<()> {
-        self.git_wt(&["push", "-u", "origin", &self.branch_name])
-            .await
-            .map_err(|e| Error::Workspace(format!("failed to push: {e}")))
+        // Force-with-lease handles stale remote branches from previous runs
+        // while still protecting against overwriting someone else's work.
+        self.git_wt(&[
+            "push",
+            "--force-with-lease",
+            "-u",
+            "origin",
+            &self.branch_name,
+        ])
+        .await
+        .map_err(|e| Error::Workspace(format!("failed to push: {e}")))
     }
 
     /// Get diff --stat against a base branch.

@@ -184,8 +184,8 @@ pub async fn execute(args: BatchArgs<'_>) -> Result<()> {
     );
 
     if result.tasks_failed > 0 {
-        bail!(
-            "orchestrator completed with {} failure(s)",
+        eprintln!(
+            "note: {} task(s) failed (see details above)",
             result.tasks_failed
         );
     }

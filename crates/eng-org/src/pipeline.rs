@@ -312,15 +312,9 @@ impl EngineeringPipeline {
         ctx.current_stage = Some("implement".into());
         ctx.agent_context.previous_output = plan_output.data.clone();
 
-        // Load files the planner identified into file_context so the
-        // implementer can see actual source code, not just filenames.
-        let planner_files = read_relevant_files(repo_path, "", &files_affected).await;
-        for (path, content) in planner_files {
-            ctx.agent_context
-                .file_context
-                .entry(path)
-                .or_insert(content);
-        }
+        // Don't pre-load file contents — the implementer has read_file with
+        // line ranges and should fetch only what it needs. Pre-loading burns
+        // tokens on every turn since the initial user message is never pruned.
 
         let impl_tool_policy = ToolPolicy::new(
             self.config.allowed_tools.clone(),

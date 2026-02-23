@@ -18,8 +18,9 @@ You receive a plan and implement it by making changes and verifying them.
 
 ## Budget
 
-You have a maximum of {max_turns} tool-call turns. Each turn may include MULTIPLE
-tool calls — use this to stay within budget. Reserve 2 turns for final verification.
+You have a STRICT maximum of {max_turns} tool-call turns and ~100K tokens.
+Each turn may include MULTIPLE tool calls — batch aggressively to stay within budget.
+Reserve 2 turns for final verification. You WILL be terminated if you exceed budget.
 
 ## Available tools
 
@@ -131,7 +132,7 @@ impl Agent for ImplementerAgent {
             max_turns: self.max_tool_turns,
             temperature: 0.2,
             max_tokens: 16384,
-            context_token_budget: 40_000,
+            context_token_budget: 12_000,
             max_stuck_turns: self.max_stuck_turns,
         };
         let outcome = tool_use_loop(&self.router, "implementer", &mut messages, &params).await?;

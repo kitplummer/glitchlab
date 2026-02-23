@@ -1,80 +1,33 @@
 tasks:
-- id: status-memory-info
+- id: display-model-tier
   objective: |
-    Add memory backend information to the `glitchlab status` CLI output.
-    In `crates/cli/src/commands/status.rs`, after printing the repo index summary,
-    call `build_backend()` and print which backends are available (e.g. "Memory: dolt, jsonl"
-    or "Memory: jsonl (dolt unavailable)"). Use the `backend_name()` and `is_available()`
-    trait methods. Add a unit test that verifies the output format string.
-  priority: 40
-  status: completed
-  depends_on: []
-  pr_url: https://github.com/kitplummer/glitchlab/pull/12
-- id: history-dolt-aware
-  objective: |
-    Update the `glitchlab history` command to use the composite memory backend
-    instead of hardcoded JSONL. In `crates/cli/src/commands/history.rs`, replace
-    direct `JsonlHistory::new()` calls with `build_backend()` from `glitchlab_memory`.
-    This makes `glitchlab history` transparently query Dolt when available and
-    fall back to JSONL otherwise. Add a test that verifies the command works
-    with the default (JSONL-only) backend.
-  priority: 20
-  status: completed
-  depends_on:
-  - status-memory-info
-  pr_url: https://github.com/kitplummer/glitchlab/pull/13
-- id: indexer-compose-yaml
-  objective: |
-    The repo indexer in `crates/eng-org/src/indexer.rs` already has `docker-compose.yml`
-    in KEY_FILES but not `compose.yaml` (the modern Docker Compose filename). Add
-    `"compose.yaml"` to the KEY_FILES constant. Add a test that creates a temp repo
-    with a `compose.yaml` file and verifies `build_index()` includes it in `key_files`.
+    Add a `Display` trait implementation for the `ModelTier` enum in
+    `crates/router/src/chooser.rs`. The output should be the variant name
+    as a lowercase string: "economy", "standard", "premium". This matches
+    the `from_str_loose` parsing already present. Add a unit test in the
+    existing `#[cfg(test)] mod tests` block that verifies all three variants
+    produce the expected string via `.to_string()`.
   priority: 10
   status: completed
   depends_on: []
-  pr_url: https://github.com/kitplummer/glitchlab/pull/11
-- id: router-request-id
+- id: display-task-status
   objective: |
-    Add a `request_id: String` field (UUID v4) to `RouterResponse` in
-    `crates/router/src/lib.rs`. Generate the UUID in the `route()` method before
-    dispatching to the provider. Include the request_id in the tracing span so
-    all log lines for a single LLM call can be correlated. Add `uuid` as a
-    workspace dependency. Test that each response has a unique, non-empty request_id.
-  priority: 50
+    Add a `Display` trait implementation for the `TaskStatus` enum in
+    `crates/eng-org/src/taskqueue.rs`. Use snake_case output matching the
+    serde rename: "pending", "in_progress", "completed", "failed", "skipped".
+    Add a unit test in the existing test module that verifies all five
+    variants produce the correct string via `.to_string()`.
+  priority: 20
   status: completed
   depends_on: []
-  pr_url: https://github.com/kitplummer/glitchlab/pull/17
-- id: batch-dry-run
+- id: display-cease-reason
   objective: |
-    Add a `--dry-run` flag to the `glitchlab batch` CLI command. When set, the
-    orchestrator loads the task queue and prints each task's ID, objective summary
-    (first 80 chars), and estimated budget share — but does not execute any tasks
-    or make LLM calls. Implement in `crates/cli/src/commands/batch.rs`. Add a
-    clap arg `--dry-run` (bool flag). Test with a mock task file.
-  priority: 50
-  status: completed
+    Add a `Display` trait implementation for the `CeaseReason` enum in
+    `crates/eng-org/src/orchestrator.rs`. Use human-readable output:
+    "all tasks done", "budget exhausted", "quality gate failed". Add a
+    unit test that verifies all three variants produce the correct string.
+    The enum is defined around line 234. Use `read_file` with `start_line`
+    and `end_line` to read only the relevant section (~lines 220-250).
+  priority: 30
+  status: pending
   depends_on: []
-  pr_url: https://github.com/kitplummer/glitchlab/pull/14
-- id: memory-error-thiserror
-  objective: |
-    The memory crate's `crates/memory/src/error.rs` should use `thiserror` derive
-    macros for the `MemoryError` enum, consistent with the project convention
-    (CLAUDE.md: "Use thiserror for library error types"). Verify the current
-    implementation uses thiserror. If it already does, mark this task as complete.
-    If it uses manual `impl Display` / `impl Error`, migrate to `#[derive(thiserror::Error)]`.
-  priority: 60
-  status: completed
-  depends_on: []
-  pr_url: https://github.com/kitplummer/glitchlab/pull/15
-- id: orchestrator-duration-tracking
-  objective: |
-    Add wall-clock duration tracking to `OrchestratorResult` in
-    `crates/eng-org/src/orchestrator.rs`. Add a `duration: std::time::Duration`
-    field. Capture `Instant::now()` at the start of `Orchestrator::run()` and
-    set `duration = start.elapsed()` before returning. Include duration in the
-    tracing info log. Add a test that verifies duration is non-zero after a
-    (mocked) orchestrator run.
-  priority: 70
-  status: completed
-  depends_on: []
-  pr_url: https://github.com/kitplummer/glitchlab/pull/16

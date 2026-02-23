@@ -33,18 +33,29 @@ Output schema:
   "public_api_changed": <bool>
 }
 
+## Token budget constraint
+
+The implementer has a STRICT budget of ~100K tokens per task (~15 tool turns).
+A single file read costs 1-3K tokens. A test + build cycle costs 3-5K tokens.
+That means each sub-task can realistically read 2-3 files and make 2-3 edits.
+
 ## Task decomposition
 
-If the task is `large` complexity (would touch 4+ files, or modify a struct/type
-used across many files), you MUST decompose it. Set `estimated_complexity` to
-"large" and add a `decomposition` array of smaller sub-tasks:
+You MUST decompose the task when ANY of these conditions are true:
+- It would touch 3+ files
+- It would require 4+ steps
+- Any target file is likely >300 lines (large modules, orchestrators, routers)
+- It modifies a struct/type used across multiple modules
+- estimated_complexity is "medium" or "large"
+
+Set `estimated_complexity` to "medium" or "large" and add a `decomposition` array:
 
 {
-  "estimated_complexity": "large",
+  "estimated_complexity": "medium",
   "decomposition": [
     {
       "id": "<parent-id>-part1",
-      "objective": "<focused objective touching 1-2 files>",
+      "objective": "<focused objective — 1 file, 1-2 edits>",
       "depends_on": []
     },
     {
@@ -56,15 +67,20 @@ used across many files), you MUST decompose it. Set `estimated_complexity` to
   ... (other fields still required)
 }
 
-Each sub-task should be completable by modifying at most 2-3 files. When
-decomposing, the `steps` array should be empty (the sub-tasks replace it).
+Each sub-task MUST:
+- Touch at most 1-2 files
+- Require at most 2-3 edits
+- Be completable within ~10 tool turns
+- Include specific file paths and line-range hints (e.g. "lines 200-250")
+
+When decomposing, the `steps` array should be empty (the sub-tasks replace it).
 
 Rules:
 - Keep steps minimal and atomic.
 - List ALL files that will be touched.
 - If the task is ambiguous, choose the simplest interpretation.
 - If the task requires changes to protected paths, set requires_core_change to true.
-- Decompose LARGE tasks — do not attempt to plan a 10-step, 6-file change as a single task.
+- When in doubt, DECOMPOSE. Small sub-tasks are always better than one big task that exceeds budget.
 - CRITICAL: Output ONLY the raw JSON object. No text before or after it.
   No markdown code fences. No explanations. Just the JSON."#;
 
