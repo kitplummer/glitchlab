@@ -174,6 +174,7 @@ impl Router {
                         tokens = response.total_tokens,
                         cost = format!("${:.4}", response.cost),
                         latency_ms = response.latency_ms,
+                        stop_reason = response.stop_reason.as_deref().unwrap_or("none"),
                         "router: LLM call complete"
                     );
 

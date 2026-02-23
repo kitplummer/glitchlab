@@ -4,6 +4,7 @@ use glitchlab_kernel::agent::{
 use glitchlab_kernel::error;
 
 use super::build_user_message;
+use super::json_response_format;
 use super::parse::parse_json_response;
 use crate::agents::RouterRef;
 
@@ -71,9 +72,10 @@ impl Agent for PlannerAgent {
             },
         ];
 
+        let json_fmt = json_response_format();
         let response = self
             .router
-            .complete("planner", &messages, 0.2, 4096, None)
+            .complete("planner", &messages, 0.2, 4096, Some(&json_fmt))
             .await?;
 
         let metadata = AgentMetadata {

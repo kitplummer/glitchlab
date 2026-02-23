@@ -20,6 +20,13 @@ use crate::tools::ToolDispatcher;
 /// Shared reference to the router, used by all agents.
 pub type RouterRef = Arc<glitchlab_router::Router>;
 
+/// Response format hint for JSON-only agents.
+/// Providers that support structured output (OpenAI, Gemini) use this to
+/// enable JSON mode, preventing markdown fences around the response.
+pub(crate) fn json_response_format() -> serde_json::Value {
+    serde_json::json!({"type": "json_object"})
+}
+
 /// Parameters for the tool-use execution loop.
 pub(crate) struct ToolLoopParams<'a> {
     pub tool_defs: &'a [ToolDefinition],

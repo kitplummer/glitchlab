@@ -271,10 +271,16 @@ impl Provider for GeminiProvider {
         messages: &[Message],
         temperature: f32,
         max_tokens: u32,
-        _response_format: Option<&serde_json::Value>,
+        response_format: Option<&serde_json::Value>,
     ) -> ProviderFuture<'_> {
         let model = model.to_string();
         let messages = messages.to_vec();
+        let response_mime_type = response_format.and_then(|fmt| {
+            fmt.get("type")
+                .and_then(|t| t.as_str())
+                .filter(|t| *t == "json_object")
+                .map(|_| "application/json".to_string())
+        });
 
         Box::pin(async move {
             let (system_instruction, contents) = Self::build_messages(&messages);
@@ -286,6 +292,7 @@ impl Provider for GeminiProvider {
                 generation_config: GeminiGenerationConfig {
                     temperature,
                     max_output_tokens: max_tokens,
+                    response_mime_type,
                 },
             };
 
@@ -330,6 +337,7 @@ impl Provider for GeminiProvider {
                 generation_config: GeminiGenerationConfig {
                     temperature,
                     max_output_tokens: max_tokens,
+                    response_mime_type: None,
                 },
             };
 
@@ -418,6 +426,8 @@ struct GeminiGenerationConfig {
     temperature: f32,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
+    #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
+    response_mime_type: Option<String>,
 }
 
 #[derive(Serialize)]

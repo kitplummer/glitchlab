@@ -4,6 +4,7 @@ use glitchlab_kernel::agent::{
 use glitchlab_kernel::error;
 
 use super::build_user_message;
+use super::json_response_format;
 use super::parse::parse_json_response;
 use crate::agents::RouterRef;
 
@@ -63,9 +64,10 @@ impl Agent for ReleaseAgent {
             },
         ];
 
+        let json_fmt = json_response_format();
         let response = self
             .router
-            .complete("release", &messages, 0.2, 2048, None)
+            .complete("release", &messages, 0.2, 2048, Some(&json_fmt))
             .await?;
 
         let metadata = AgentMetadata {
