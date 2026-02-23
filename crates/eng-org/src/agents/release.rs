@@ -19,7 +19,8 @@ Output schema (valid JSON only, no markdown, no commentary):
   "changelog_entry": "<markdown changelog entry>",
   "breaking_changes": [],
   "migration_notes": "<any migration needed, or null>",
-  "risk_summary": "<brief risk assessment for release>"
+  "risk_summary": "<brief risk assessment for release>",
+  "tests_verified": <bool>
 }
 
 Bump rules:
@@ -27,6 +28,11 @@ Bump rules:
 - minor: new features, non-breaking additions
 - major: breaking changes to public API
 - none: docs only, comments, formatting
+
+Test verification:
+- Check if tests_added is non-empty in the implementation output.
+- If no tests were added for a non-trivial change, flag this in risk_summary.
+- Set tests_verified to true if the implementation includes tests, false otherwise.
 
 Rules:
 - Be conservative — prefer patch over minor, minor over major.
@@ -84,7 +90,8 @@ impl Agent for ReleaseAgent {
             "changelog_entry": "",
             "breaking_changes": [],
             "migration_notes": null,
-            "risk_summary": "unknown"
+            "risk_summary": "unknown",
+            "tests_verified": false
         });
 
         Ok(parse_json_response(&response.content, metadata, fallback))
@@ -119,5 +126,26 @@ mod tests {
         ctx.previous_output = serde_json::json!({"diff": "+new line", "plan": {}});
         let output = agent.execute(&ctx).await.unwrap();
         assert_eq!(output.metadata.agent, "release");
+    }
+
+    #[test]
+    fn system_prompt_mentions_tests_verified() {
+        assert!(SYSTEM_PROMPT.contains("tests_verified"));
+        assert!(SYSTEM_PROMPT.contains("tests_added"));
+    }
+
+    #[test]
+    fn release_fallback_has_tests_verified() {
+        // Verify the fallback JSON includes tests_verified: false.
+        let fallback = serde_json::json!({
+            "version_bump": "none",
+            "reasoning": "Failed to parse release output",
+            "changelog_entry": "",
+            "breaking_changes": [],
+            "migration_notes": null,
+            "risk_summary": "unknown",
+            "tests_verified": false
+        });
+        assert_eq!(fallback["tests_verified"], false);
     }
 }

@@ -7,11 +7,12 @@ pub mod security;
 
 mod parse;
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use glitchlab_kernel::agent::{AgentContext, ContentBlock, Message, MessageContent, MessageRole};
 use glitchlab_kernel::error;
-use glitchlab_kernel::tool::ToolDefinition;
+use glitchlab_kernel::tool::{ToolCallResult, ToolDefinition};
 use glitchlab_router::RouterResponse;
 use tracing::warn;
 
@@ -27,6 +28,81 @@ pub(crate) fn json_response_format() -> serde_json::Value {
     serde_json::json!({"type": "json_object"})
 }
 
+/// Why the tool-use loop considers the agent stuck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StuckReason {
+    /// The same tool results keep repeating (hash-based).
+    RepeatedResults,
+    /// Multiple consecutive turns produced errors.
+    ConsecutiveErrors,
+}
+
+/// Outcome of a tool-use loop.
+#[derive(Debug)]
+pub(crate) enum ToolLoopOutcome {
+    /// The LLM stopped requesting tools normally.
+    Completed(RouterResponse),
+    /// The loop was terminated because the agent appeared stuck.
+    Stuck {
+        reason: StuckReason,
+        last_response: RouterResponse,
+    },
+}
+
+/// Detects when an agent is stuck in a loop by tracking result hashes
+/// and consecutive error streaks.
+pub(crate) struct StuckDetector {
+    max_stuck_turns: u32,
+    result_hashes: Vec<u64>,
+    consecutive_errors: u32,
+}
+
+impl StuckDetector {
+    pub(crate) fn new(max_stuck_turns: u32) -> Self {
+        Self {
+            max_stuck_turns,
+            result_hashes: Vec::new(),
+            consecutive_errors: 0,
+        }
+    }
+
+    /// Record a turn's tool results and check for stuck patterns.
+    ///
+    /// Returns `Some(reason)` if the agent appears stuck, `None` otherwise.
+    pub(crate) fn record_turn(&mut self, results: &[ToolCallResult]) -> Option<StuckReason> {
+        // Hash all results for this turn.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for r in results {
+            r.content.hash(&mut hasher);
+            r.is_error.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+
+        // Check if this hash matches any of the last max_stuck_turns hashes.
+        let window_start = self
+            .result_hashes
+            .len()
+            .saturating_sub(self.max_stuck_turns as usize);
+        if self.result_hashes[window_start..].contains(&hash) {
+            self.result_hashes.push(hash);
+            return Some(StuckReason::RepeatedResults);
+        }
+        self.result_hashes.push(hash);
+
+        // Check if ALL results in this turn are errors.
+        if !results.is_empty() && results.iter().all(|r| r.is_error) {
+            self.consecutive_errors += 1;
+            if self.consecutive_errors >= self.max_stuck_turns {
+                return Some(StuckReason::ConsecutiveErrors);
+            }
+        } else {
+            self.consecutive_errors = 0;
+        }
+
+        None
+    }
+}
+
 /// Parameters for the tool-use execution loop.
 pub(crate) struct ToolLoopParams<'a> {
     pub tool_defs: &'a [ToolDefinition],
@@ -38,6 +114,8 @@ pub(crate) struct ToolLoopParams<'a> {
     /// old `ToolResult` content is replaced with one-line summaries to
     /// stay within budget. Set to `usize::MAX` to disable pruning.
     pub context_token_budget: usize,
+    /// Maximum recent turns to check for stuck detection.
+    pub max_stuck_turns: u32,
 }
 
 /// Estimate the total token count of a message list using the ~4 chars/token
@@ -108,8 +186,9 @@ pub(crate) async fn tool_use_loop(
     role: &str,
     messages: &mut Vec<Message>,
     params: &ToolLoopParams<'_>,
-) -> error::Result<RouterResponse> {
+) -> error::Result<ToolLoopOutcome> {
     let mut turns = 0u32;
+    let mut detector = StuckDetector::new(params.max_stuck_turns);
 
     loop {
         prune_messages(messages, params.context_token_budget);
@@ -127,7 +206,7 @@ pub(crate) async fn tool_use_loop(
 
         // If no tool calls, the LLM is done — return the final response.
         if response.tool_calls.is_empty() {
-            return Ok(response);
+            return Ok(ToolLoopOutcome::Completed(response));
         }
 
         // Build the assistant message with text + tool-use blocks.
@@ -145,12 +224,28 @@ pub(crate) async fn tool_use_loop(
             content: MessageContent::Blocks(blocks),
         });
 
-        // Execute each tool call and append results as user messages.
+        // Execute each tool call and collect results.
+        let mut results = Vec::with_capacity(response.tool_calls.len());
         for call in &response.tool_calls {
-            let result = params.dispatcher.dispatch(call).await;
+            results.push(params.dispatcher.dispatch(call).await);
+        }
+
+        // Check for stuck agent before appending results.
+        let stuck = detector.record_turn(&results);
+
+        // Append results as user messages.
+        for result in results {
             messages.push(Message {
                 role: MessageRole::User,
                 content: MessageContent::Blocks(vec![ContentBlock::ToolResult(result)]),
+            });
+        }
+
+        if let Some(reason) = stuck {
+            warn!(role, ?reason, "tool-use loop detected stuck agent");
+            return Ok(ToolLoopOutcome::Stuck {
+                reason,
+                last_response: response,
             });
         }
 
@@ -162,7 +257,7 @@ pub(crate) async fn tool_use_loop(
                 max_turns = params.max_turns,
                 "tool-use loop hit max turns, returning last response"
             );
-            return Ok(response);
+            return Ok(ToolLoopOutcome::Completed(response));
         }
     }
 }
@@ -537,10 +632,14 @@ mod tests {
             temperature: 0.2,
             max_tokens: 4096,
             context_token_budget: usize::MAX,
+            max_stuck_turns: 3,
         };
-        let resp = tool_use_loop(&router, "implementer", &mut messages, &params)
+        let outcome = tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
             .unwrap();
+        let ToolLoopOutcome::Completed(resp) = outcome else {
+            panic!("expected Completed");
+        };
 
         assert!(resp.tool_calls.is_empty());
         assert!(resp.content.contains("done"));
@@ -578,10 +677,14 @@ mod tests {
             temperature: 0.2,
             max_tokens: 4096,
             context_token_budget: usize::MAX,
+            max_stuck_turns: 3,
         };
-        let resp = tool_use_loop(&router, "implementer", &mut messages, &params)
+        let outcome = tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
             .unwrap();
+        let ToolLoopOutcome::Completed(resp) = outcome else {
+            panic!("expected Completed");
+        };
 
         assert!(resp.tool_calls.is_empty());
         // Messages should have grown: user + assistant(tool_use) + user(tool_result)
@@ -611,16 +714,18 @@ mod tests {
     #[tokio::test]
     async fn tool_use_loop_max_turns_enforced() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("f.txt"), "data").unwrap();
         let dispatcher = test_dispatcher(dir.path());
 
-        // Every response returns a tool call — the loop should stop at max_turns.
+        // Each turn reads a different file so stuck detection doesn't fire.
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), format!("data-{i}")).unwrap();
+        }
         let responses: Vec<RouterResponse> = (0..5)
             .map(|i| {
                 tool_response(vec![tool_call(
                     &format!("call_{i}"),
                     "read_file",
-                    serde_json::json!({"path": "f.txt"}),
+                    serde_json::json!({"path": format!("f{i}.txt")}),
                 )])
             })
             .collect();
@@ -638,10 +743,14 @@ mod tests {
             temperature: 0.2,
             max_tokens: 4096,
             context_token_budget: usize::MAX,
+            max_stuck_turns: 10, // High enough to not trigger
         };
-        let resp = tool_use_loop(&router, "implementer", &mut messages, &params)
+        let outcome = tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
             .unwrap();
+        let ToolLoopOutcome::Completed(resp) = outcome else {
+            panic!("expected Completed, got Stuck");
+        };
 
         // Should have stopped after 3 turns, returning a response with tool_calls.
         assert!(!resp.tool_calls.is_empty());
@@ -679,10 +788,14 @@ mod tests {
             temperature: 0.2,
             max_tokens: 4096,
             context_token_budget: usize::MAX,
+            max_stuck_turns: 3,
         };
-        let resp = tool_use_loop(&router, "implementer", &mut messages, &params)
+        let outcome = tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
             .unwrap();
+        let ToolLoopOutcome::Completed(resp) = outcome else {
+            panic!("expected Completed");
+        };
 
         assert!(resp.tool_calls.is_empty());
         // 1 user + 1 assistant(2 tool_uses) + 2 tool_results = 4 messages
@@ -722,6 +835,7 @@ mod tests {
             temperature: 0.2,
             max_tokens: 4096,
             context_token_budget: usize::MAX,
+            max_stuck_turns: 3,
         };
         tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
@@ -927,5 +1041,117 @@ mod tests {
                 "error status should be preserved"
             );
         }
+    }
+
+    // --- StuckDetector tests ---
+
+    use glitchlab_kernel::tool::ToolCallResult;
+
+    fn tcr(content: &str, is_error: bool) -> ToolCallResult {
+        ToolCallResult {
+            tool_call_id: "t1".into(),
+            content: content.into(),
+            is_error,
+        }
+    }
+
+    #[test]
+    fn stuck_detector_no_stuck_on_varied_results() {
+        let mut detector = StuckDetector::new(3);
+        assert_eq!(detector.record_turn(&[tcr("aaa", false)]), None);
+        assert_eq!(detector.record_turn(&[tcr("bbb", false)]), None);
+        assert_eq!(detector.record_turn(&[tcr("ccc", false)]), None);
+    }
+
+    #[test]
+    fn stuck_detector_repeated_results() {
+        let mut detector = StuckDetector::new(3);
+        assert_eq!(detector.record_turn(&[tcr("same", false)]), None);
+        assert_eq!(
+            detector.record_turn(&[tcr("same", false)]),
+            Some(StuckReason::RepeatedResults)
+        );
+    }
+
+    #[test]
+    fn stuck_detector_consecutive_errors() {
+        let mut detector = StuckDetector::new(3);
+        // Each turn has different content to avoid triggering RepeatedResults.
+        assert_eq!(detector.record_turn(&[tcr("err1", true)]), None);
+        assert_eq!(detector.record_turn(&[tcr("err2", true)]), None);
+        assert_eq!(
+            detector.record_turn(&[tcr("err3", true)]),
+            Some(StuckReason::ConsecutiveErrors)
+        );
+    }
+
+    #[test]
+    fn stuck_detector_error_streak_resets() {
+        let mut detector = StuckDetector::new(3);
+        assert_eq!(detector.record_turn(&[tcr("err1", true)]), None);
+        assert_eq!(detector.record_turn(&[tcr("ok1", false)]), None); // resets
+        assert_eq!(detector.record_turn(&[tcr("err2", true)]), None);
+        assert_eq!(detector.record_turn(&[tcr("err3", true)]), None);
+        // Only 2 consecutive errors, not 3 — no trigger.
+    }
+
+    #[test]
+    fn stuck_detector_mixed_results_not_stuck() {
+        let mut detector = StuckDetector::new(3);
+        // Turns with some errors and some successes — should NOT trigger consecutive errors.
+        let mixed1 = vec![tcr("err", true), tcr("ok", false)];
+        let mixed2 = vec![tcr("err2", true), tcr("ok2", false)];
+        let mixed3 = vec![tcr("err3", true), tcr("ok3", false)];
+        assert_eq!(detector.record_turn(&mixed1), None);
+        assert_eq!(detector.record_turn(&mixed2), None);
+        assert_eq!(detector.record_turn(&mixed3), None);
+    }
+
+    #[tokio::test]
+    async fn tool_use_loop_returns_stuck_on_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "same data").unwrap();
+        let dispatcher = test_dispatcher(dir.path());
+
+        // 5 identical tool calls reading the same file.
+        let responses: Vec<RouterResponse> = (0..5)
+            .map(|i| {
+                tool_response(vec![tool_call(
+                    &format!("call_{i}"),
+                    "read_file",
+                    serde_json::json!({"path": "f.txt"}),
+                )])
+            })
+            .collect();
+        let router = sequential_router_ref(responses);
+        let tool_defs = crate::tools::tool_definitions();
+        let mut messages = vec![Message {
+            role: MessageRole::User,
+            content: MessageContent::Text("read f.txt".into()),
+        }];
+
+        let params = ToolLoopParams {
+            tool_defs: &tool_defs,
+            dispatcher: &dispatcher,
+            max_turns: 20,
+            temperature: 0.2,
+            max_tokens: 4096,
+            context_token_budget: usize::MAX,
+            max_stuck_turns: 3,
+        };
+        let outcome = tool_use_loop(&router, "implementer", &mut messages, &params)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                ToolLoopOutcome::Stuck {
+                    reason: StuckReason::RepeatedResults,
+                    ..
+                }
+            ),
+            "expected Stuck(RepeatedResults), got {outcome:?}"
+        );
     }
 }

@@ -2,10 +2,11 @@ use glitchlab_kernel::agent::{
     Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageContent, MessageRole,
 };
 use glitchlab_kernel::error;
+use tracing::warn;
 
 use super::build_user_message;
 use super::parse::parse_json_response;
-use super::{ToolLoopParams, tool_use_loop};
+use super::{StuckReason, ToolLoopOutcome, ToolLoopParams, tool_use_loop};
 use crate::agents::RouterRef;
 use crate::tools::{ToolDispatcher, tool_definitions};
 
@@ -39,14 +40,16 @@ You MUST call multiple tools in a single response whenever possible. Examples:
 Each response counts as 1 turn regardless of how many tool calls it contains.
 Making 1 call per turn wastes your budget. Batch aggressively.
 
-## Workflow
+## Workflow (STRICT ORDER)
 
-1. Review the provided file contents in context — do NOT re-read files already shown.
-2. Make ALL changes in as few turns as possible. Multiple `write_file`/`edit_file`
-   calls in a single response is the correct approach.
-3. After writing all changes, run `cargo check` (or equivalent) AND `cargo test`
-   together in one turn.
-4. If there are errors, fix all issues in one turn, then re-verify.
+1. **Write tests first.** Create or update test files that cover the planned changes.
+   Run them with `cargo test` (or equivalent) — they MUST fail (red).
+2. **Implement.** Write the minimum code to make the tests pass. Batch file edits;
+   do NOT re-read files already shown in the Relevant File Contents section.
+3. **Verify.** Run `cargo test` — all tests MUST pass (green).
+4. **Lint.** Run `cargo clippy -- -D warnings` and `cargo fmt --check`. Fix any issues.
+
+Do NOT skip step 1. Do NOT write implementation before tests.
 
 ## Final output
 
@@ -55,6 +58,7 @@ this JSON:
 {{
   "files_changed": ["path/to/file", ...],
   "tests_added": ["path/to/test_file", ...],
+  "tests_passing": <bool>,
   "commit_message": "<conventional commit message>",
   "summary": "<brief human-readable summary>"
 }}
@@ -74,14 +78,21 @@ pub struct ImplementerAgent {
     router: RouterRef,
     dispatcher: ToolDispatcher,
     max_tool_turns: u32,
+    max_stuck_turns: u32,
 }
 
 impl ImplementerAgent {
-    pub fn new(router: RouterRef, dispatcher: ToolDispatcher, max_tool_turns: u32) -> Self {
+    pub fn new(
+        router: RouterRef,
+        dispatcher: ToolDispatcher,
+        max_tool_turns: u32,
+        max_stuck_turns: u32,
+    ) -> Self {
         Self {
             router,
             dispatcher,
             max_tool_turns,
+            max_stuck_turns,
         }
     }
 }
@@ -115,8 +126,20 @@ impl Agent for ImplementerAgent {
             temperature: 0.2,
             max_tokens: 16384,
             context_token_budget: 100_000,
+            max_stuck_turns: self.max_stuck_turns,
         };
-        let response = tool_use_loop(&self.router, "implementer", &mut messages, &params).await?;
+        let outcome = tool_use_loop(&self.router, "implementer", &mut messages, &params).await?;
+
+        let (response, stuck_reason) = match outcome {
+            ToolLoopOutcome::Completed(r) => (r, None),
+            ToolLoopOutcome::Stuck {
+                last_response,
+                reason,
+            } => {
+                warn!(?reason, "implementer agent stuck");
+                (last_response, Some(reason))
+            }
+        };
 
         let metadata = AgentMetadata {
             agent: "implementer".into(),
@@ -126,9 +149,30 @@ impl Agent for ImplementerAgent {
             latency_ms: response.latency_ms,
         };
 
+        if let Some(reason) = stuck_reason {
+            let reason_str = match reason {
+                StuckReason::RepeatedResults => "repeated_results",
+                StuckReason::ConsecutiveErrors => "consecutive_errors",
+            };
+            return Ok(AgentOutput {
+                data: serde_json::json!({
+                    "files_changed": [],
+                    "tests_added": [],
+                    "tests_passing": false,
+                    "commit_message": "chore: no changes produced",
+                    "summary": "Implementer agent stuck",
+                    "stuck": true,
+                    "stuck_reason": reason_str,
+                }),
+                metadata,
+                parse_error: true,
+            });
+        }
+
         let fallback = serde_json::json!({
             "files_changed": [],
             "tests_added": [],
+            "tests_passing": false,
             "commit_message": "chore: no changes produced",
             "summary": "Failed to parse implementer output"
         });
@@ -151,7 +195,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Leak the tempdir so it lives for the test duration.
         let dir_path = dir.keep();
-        ImplementerAgent::new(router, test_dispatcher(&dir_path), 20)
+        ImplementerAgent::new(router, test_dispatcher(&dir_path), 20, 3)
     }
 
     #[test]
@@ -203,6 +247,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn system_prompt_contains_tdd_workflow() {
+        let prompt = system_prompt(10);
+        assert!(
+            prompt.contains("Write tests first"),
+            "prompt should enforce test-first ordering"
+        );
+        assert!(
+            prompt.contains("STRICT ORDER"),
+            "prompt should label workflow as strict"
+        );
+        assert!(
+            prompt.contains("Do NOT skip step 1"),
+            "prompt should forbid skipping tests"
+        );
+    }
+
+    #[test]
+    fn system_prompt_contains_red_green() {
+        let prompt = system_prompt(10);
+        assert!(
+            prompt.contains("MUST fail"),
+            "prompt should require red phase"
+        );
+        assert!(
+            prompt.contains("MUST pass"),
+            "prompt should require green phase"
+        );
+        assert!(
+            prompt.contains("tests_passing"),
+            "prompt schema should include tests_passing"
+        );
+    }
+
     #[tokio::test]
     async fn execute_with_tool_use() {
         let dir = tempfile::tempdir().unwrap();
@@ -222,11 +300,38 @@ mod tests {
             ),
         ];
         let router = sequential_router_ref(responses);
-        let agent = ImplementerAgent::new(router, dispatcher, 20);
+        let agent = ImplementerAgent::new(router, dispatcher, 20, 3);
 
         let ctx = test_agent_context();
         let output = agent.execute(&ctx).await.unwrap();
         assert_eq!(output.metadata.agent, "implementer");
         assert_eq!(output.data["summary"], "implemented");
+    }
+
+    #[tokio::test]
+    async fn execute_stuck_returns_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "same content").unwrap();
+        let dispatcher = test_dispatcher(dir.path());
+
+        // 5 identical tool calls reading the same file — triggers stuck detection.
+        let responses: Vec<glitchlab_router::RouterResponse> = (0..5)
+            .map(|i| {
+                tool_response(vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "f.txt"}),
+                }])
+            })
+            .collect();
+        let router = sequential_router_ref(responses);
+        let agent = ImplementerAgent::new(router, dispatcher, 20, 3);
+
+        let ctx = test_agent_context();
+        let output = agent.execute(&ctx).await.unwrap();
+        assert!(output.parse_error, "stuck should set parse_error");
+        assert_eq!(output.data["stuck"], true);
+        assert_eq!(output.data["stuck_reason"], "repeated_results");
+        assert_eq!(output.data["should_retry"], serde_json::Value::Null);
     }
 }

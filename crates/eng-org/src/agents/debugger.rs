@@ -2,10 +2,11 @@ use glitchlab_kernel::agent::{
     Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageContent, MessageRole,
 };
 use glitchlab_kernel::error;
+use tracing::warn;
 
 use super::build_user_message;
 use super::parse::parse_json_response;
-use super::{ToolLoopParams, tool_use_loop};
+use super::{StuckReason, ToolLoopOutcome, ToolLoopParams, tool_use_loop};
 use crate::agents::RouterRef;
 use crate::tools::{ToolDispatcher, tool_definitions};
 
@@ -62,14 +63,21 @@ pub struct DebuggerAgent {
     router: RouterRef,
     dispatcher: ToolDispatcher,
     max_tool_turns: u32,
+    max_stuck_turns: u32,
 }
 
 impl DebuggerAgent {
-    pub fn new(router: RouterRef, dispatcher: ToolDispatcher, max_tool_turns: u32) -> Self {
+    pub fn new(
+        router: RouterRef,
+        dispatcher: ToolDispatcher,
+        max_tool_turns: u32,
+        max_stuck_turns: u32,
+    ) -> Self {
         Self {
             router,
             dispatcher,
             max_tool_turns,
+            max_stuck_turns,
         }
     }
 }
@@ -103,8 +111,20 @@ impl Agent for DebuggerAgent {
             temperature: 0.2,
             max_tokens: 4096,
             context_token_budget: 60_000,
+            max_stuck_turns: self.max_stuck_turns,
         };
-        let response = tool_use_loop(&self.router, "debugger", &mut messages, &params).await?;
+        let outcome = tool_use_loop(&self.router, "debugger", &mut messages, &params).await?;
+
+        let (response, stuck_reason) = match outcome {
+            ToolLoopOutcome::Completed(r) => (r, None),
+            ToolLoopOutcome::Stuck {
+                last_response,
+                reason,
+            } => {
+                warn!(?reason, "debugger agent stuck");
+                (last_response, Some(reason))
+            }
+        };
 
         let metadata = AgentMetadata {
             agent: "debugger".into(),
@@ -113,6 +133,26 @@ impl Agent for DebuggerAgent {
             cost: response.cost,
             latency_ms: response.latency_ms,
         };
+
+        if let Some(reason) = stuck_reason {
+            let reason_str = match reason {
+                StuckReason::RepeatedResults => "repeated_results",
+                StuckReason::ConsecutiveErrors => "consecutive_errors",
+            };
+            return Ok(AgentOutput {
+                data: serde_json::json!({
+                    "diagnosis": "Debugger agent stuck",
+                    "root_cause": reason_str,
+                    "files_changed": [],
+                    "confidence": "low",
+                    "should_retry": false,
+                    "notes": null,
+                    "stuck": true,
+                }),
+                metadata,
+                parse_error: true,
+            });
+        }
 
         let fallback = serde_json::json!({
             "diagnosis": "Failed to parse debugger output",
@@ -140,7 +180,7 @@ mod tests {
     fn make_agent(router: RouterRef) -> DebuggerAgent {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
-        DebuggerAgent::new(router, test_dispatcher(&dir_path), 20)
+        DebuggerAgent::new(router, test_dispatcher(&dir_path), 20, 3)
     }
 
     #[test]
@@ -186,11 +226,38 @@ mod tests {
             ),
         ];
         let router = sequential_router_ref(responses);
-        let agent = DebuggerAgent::new(router, dispatcher, 20);
+        let agent = DebuggerAgent::new(router, dispatcher, 20, 3);
 
         let ctx = test_agent_context();
         let output = agent.execute(&ctx).await.unwrap();
         assert_eq!(output.metadata.agent, "debugger");
         assert_eq!(output.data["diagnosis"], "found the bug");
+    }
+
+    #[tokio::test]
+    async fn execute_stuck_returns_should_retry_false() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "same content").unwrap();
+        let dispatcher = test_dispatcher(dir.path());
+
+        // 5 identical tool calls reading the same file — triggers stuck detection.
+        let responses: Vec<glitchlab_router::RouterResponse> = (0..5)
+            .map(|i| {
+                tool_response(vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "f.txt"}),
+                }])
+            })
+            .collect();
+        let router = sequential_router_ref(responses);
+        let agent = DebuggerAgent::new(router, dispatcher, 20, 3);
+
+        let ctx = test_agent_context();
+        let output = agent.execute(&ctx).await.unwrap();
+        assert!(output.parse_error, "stuck should set parse_error");
+        assert_eq!(output.data["stuck"], true);
+        assert_eq!(output.data["should_retry"], false);
+        assert_eq!(output.data["root_cause"], "repeated_results");
     }
 }

@@ -306,6 +306,7 @@ impl EngineeringPipeline {
             Arc::clone(&self.router),
             impl_dispatcher,
             self.config.limits.max_tool_turns,
+            self.config.limits.max_stuck_turns,
         );
         let impl_output = match implementer.execute(&ctx.agent_context).await {
             Ok(o) => o,
@@ -388,6 +389,7 @@ impl EngineeringPipeline {
                             Arc::clone(&self.router),
                             dbg_dispatcher,
                             self.config.limits.max_tool_turns,
+                            self.config.limits.max_stuck_turns,
                         );
                         let debug_out = match debugger.execute(&ctx.agent_context).await {
                             Ok(o) => o,

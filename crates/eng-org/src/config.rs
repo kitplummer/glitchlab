@@ -76,6 +76,10 @@ fn default_cost_quality_threshold() -> f64 {
     0.5
 }
 
+fn default_max_stuck_turns() -> u32 {
+    3
+}
+
 /// Configuration for a model in the cost-aware pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfileConfig {
@@ -111,6 +115,11 @@ pub struct LimitsConfig {
     pub require_pr_review: bool,
     pub max_tool_turns: u32,
     pub max_pipeline_duration_secs: u64,
+    /// Maximum recent turns to check for stuck detection. When tool results
+    /// repeat within this window, or all-error turns reach this count, the
+    /// tool-use loop terminates early.
+    #[serde(default = "default_max_stuck_turns")]
+    pub max_stuck_turns: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +182,7 @@ impl Default for EngConfig {
                 require_pr_review: true,
                 max_tool_turns: 30,
                 max_pipeline_duration_secs: 600,
+                max_stuck_turns: 3,
             },
             intervention: InterventionConfig {
                 pause_after_plan: true,
@@ -1158,6 +1168,26 @@ base_url: http://localhost:8080
         // No secrets.yaml — should be fine.
         let config = EngConfig::load(Some(dir.path())).unwrap();
         assert_eq!(config.limits.max_fix_attempts, 3);
+    }
+
+    #[test]
+    fn max_stuck_turns_default() {
+        let config = EngConfig::default();
+        assert_eq!(config.limits.max_stuck_turns, 3);
+    }
+
+    #[test]
+    fn max_stuck_turns_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "limits:\n  max_stuck_turns: 5\n",
+        )
+        .unwrap();
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(config.limits.max_stuck_turns, 5);
     }
 
     #[test]
