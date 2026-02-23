@@ -189,6 +189,7 @@ impl AnthropicProvider {
         let cost = estimate_anthropic_cost(model, prompt_tokens, completion_tokens);
 
         Ok(RouterResponse {
+            request_id: String::new(), // Set by router
             content,
             model: format!("anthropic/{model}"),
             prompt_tokens,

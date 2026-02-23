@@ -262,6 +262,7 @@ impl GeminiProvider {
         });
 
         Ok(RouterResponse {
+            request_id: String::new(), // Set by router
             content,
             model: format!("gemini/{model}"),
             prompt_tokens,

@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 /// Response from an LLM completion call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterResponse {
+    /// Unique request identifier (UUID v4).
+    pub request_id: String,
+
     /// Raw text content from the LLM.
     pub content: String,
 
