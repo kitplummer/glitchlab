@@ -33,11 +33,38 @@ Output schema:
   "public_api_changed": <bool>
 }
 
+## Task decomposition
+
+If the task is `large` complexity (would touch 4+ files, or modify a struct/type
+used across many files), you MUST decompose it. Set `estimated_complexity` to
+"large" and add a `decomposition` array of smaller sub-tasks:
+
+{
+  "estimated_complexity": "large",
+  "decomposition": [
+    {
+      "id": "<parent-id>-part1",
+      "objective": "<focused objective touching 1-2 files>",
+      "depends_on": []
+    },
+    {
+      "id": "<parent-id>-part2",
+      "objective": "<next piece, may depend on part1>",
+      "depends_on": ["<parent-id>-part1"]
+    }
+  ],
+  ... (other fields still required)
+}
+
+Each sub-task should be completable by modifying at most 2-3 files. When
+decomposing, the `steps` array should be empty (the sub-tasks replace it).
+
 Rules:
 - Keep steps minimal and atomic.
 - List ALL files that will be touched.
 - If the task is ambiguous, choose the simplest interpretation.
 - If the task requires changes to protected paths, set requires_core_change to true.
+- Decompose LARGE tasks — do not attempt to plan a 10-step, 6-file change as a single task.
 - CRITICAL: Output ONLY the raw JSON object. No text before or after it.
   No markdown code fences. No explanations. Just the JSON."#;
 

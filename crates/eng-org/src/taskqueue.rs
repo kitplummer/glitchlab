@@ -159,6 +159,15 @@ impl TaskQueue {
         s
     }
 
+    /// Inject new tasks into the queue (e.g. from decomposition).
+    /// Tasks are appended and will be picked based on their priority.
+    pub fn inject_tasks(&mut self, tasks: Vec<Task>) {
+        let count = tasks.len();
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        info!(?ids, count, "injecting sub-tasks into queue");
+        self.tasks.extend(tasks);
+    }
+
     /// All tasks (read-only).
     pub fn tasks(&self) -> &[Task] {
         &self.tasks
@@ -477,5 +486,26 @@ mod tests {
         // Only "b" is actionable.
         let next = queue.pick_next().unwrap();
         assert_eq!(next.id, "b");
+    }
+
+    #[test]
+    fn inject_tasks_adds_to_queue() {
+        let mut queue = TaskQueue::from_tasks(sample_tasks());
+        assert_eq!(queue.tasks().len(), 3);
+
+        let new_tasks = vec![Task {
+            id: "injected-1".into(),
+            objective: "Injected task".into(),
+            priority: 0, // highest priority
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            error: None,
+            pr_url: None,
+        }];
+        queue.inject_tasks(new_tasks);
+        assert_eq!(queue.tasks().len(), 4);
+        // Injected task has priority 0, so it should be picked first.
+        let next = queue.pick_next().unwrap();
+        assert_eq!(next.id, "injected-1");
     }
 }

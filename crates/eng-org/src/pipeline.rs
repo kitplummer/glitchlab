@@ -229,6 +229,27 @@ impl EngineeringPipeline {
         self.emit(&mut ctx, EventKind::PlanCreated, plan_output.data.clone());
         ctx.stage_outputs.insert("plan".into(), plan_output.clone());
 
+        // --- Stage 3b: Check for decomposition ---
+        if plan_output
+            .data
+            .get("decomposition")
+            .is_some_and(|d| d.is_array())
+        {
+            info!(
+                task_id,
+                "planner decomposed task into sub-tasks, returning early"
+            );
+            return PipelineResult {
+                status: PipelineStatus::Decomposed,
+                stage_outputs: ctx.stage_outputs,
+                events: ctx.events,
+                budget: self.router.budget_summary().await,
+                pr_url: None,
+                branch: None,
+                error: None,
+            };
+        }
+
         // Strip repo context from objective — the planner already consumed it;
         // downstream agents (implementer, debugger, etc.) don't need the full
         // repo index occupying their context windows.

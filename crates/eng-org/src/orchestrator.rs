@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -5,6 +6,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use glitchlab_kernel::agent::AgentOutput;
 use glitchlab_kernel::budget::BudgetTracker;
 use glitchlab_kernel::error::{Error, Result};
 use glitchlab_kernel::pipeline::PipelineStatus;
@@ -394,6 +396,7 @@ impl Orchestrator {
             result.total_cost += cost;
             result.total_tokens += tokens;
 
+            let decomposed = pipeline_result.status == PipelineStatus::Decomposed;
             let succeeded = matches!(
                 pipeline_result.status,
                 PipelineStatus::PrCreated | PipelineStatus::Committed
@@ -408,6 +411,28 @@ impl Orchestrator {
                 error: pipeline_result.error.clone(),
             };
             result.run_results.push(run_result);
+
+            // --- Handle decomposition ---
+            if decomposed {
+                if let Some(sub_tasks) =
+                    Self::extract_sub_tasks(&task_id, &pipeline_result.stage_outputs)
+                {
+                    let count = sub_tasks.len();
+                    info!(task_id = %task_id, count, "decomposed into sub-tasks");
+                    queue.inject_tasks(sub_tasks);
+                    queue.update_status(&task_id, TaskStatus::Completed);
+                } else {
+                    warn!(
+                        task_id = %task_id,
+                        "decomposition flagged but no sub-tasks found"
+                    );
+                    result.tasks_failed += 1;
+                    queue.update_status(&task_id, TaskStatus::Failed);
+                    queue.set_error(&task_id, "decomposition produced no sub-tasks".into());
+                }
+                let _ = queue.save();
+                continue;
+            }
 
             // --- Update task status ---
             if succeeded {
@@ -499,6 +524,63 @@ impl Orchestrator {
         Ok(pipeline
             .run(task_id, objective, &params.repo_path, &params.base_branch)
             .await)
+    }
+
+    /// Extract sub-tasks from a decomposed pipeline result.
+    fn extract_sub_tasks(
+        parent_id: &str,
+        stage_outputs: &HashMap<String, AgentOutput>,
+    ) -> Option<Vec<crate::taskqueue::Task>> {
+        let plan = stage_outputs.get("plan")?;
+        let decomposition = plan.data.get("decomposition")?.as_array()?;
+        if decomposition.is_empty() {
+            return None;
+        }
+
+        let mut tasks = Vec::new();
+        for (i, item) in decomposition.iter().enumerate() {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let id = if id.is_empty() {
+                format!("{parent_id}-part{}", i + 1)
+            } else {
+                id
+            };
+
+            let objective = item
+                .get("objective")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if objective.is_empty() {
+                continue;
+            }
+
+            let depends_on: Vec<String> = item
+                .get("depends_on")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            tasks.push(crate::taskqueue::Task {
+                id,
+                objective,
+                priority: 50, // default priority for sub-tasks
+                status: crate::taskqueue::TaskStatus::Pending,
+                depends_on,
+                error: None,
+                pr_url: None,
+            });
+        }
+
+        if tasks.is_empty() { None } else { Some(tasks) }
     }
 }
 
@@ -1060,5 +1142,92 @@ mod tests {
         let result = run_quality_gate("bash -c 'echo err >&2; exit 1'", dir.path()).await;
         assert!(!result.passed);
         assert!(result.details.contains("err"));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_sub_tasks tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_sub_tasks_from_plan() {
+        use glitchlab_kernel::agent::AgentMetadata;
+
+        let plan_data = serde_json::json!({
+            "estimated_complexity": "large",
+            "decomposition": [
+                {
+                    "id": "parent-part1",
+                    "objective": "Add uuid to Cargo.toml",
+                    "depends_on": []
+                },
+                {
+                    "id": "parent-part2",
+                    "objective": "Add request_id field",
+                    "depends_on": ["parent-part1"]
+                }
+            ],
+            "steps": [],
+            "files_likely_affected": [],
+            "requires_core_change": false,
+            "risk_level": "medium",
+            "risk_notes": "multi-file",
+            "test_strategy": [],
+            "dependencies_affected": true,
+            "public_api_changed": true
+        });
+
+        let plan_output = AgentOutput {
+            data: plan_data,
+            metadata: AgentMetadata {
+                agent: "planner".into(),
+                model: "test".into(),
+                tokens: 100,
+                cost: 0.01,
+                latency_ms: 50,
+            },
+            parse_error: false,
+        };
+
+        let mut stage_outputs = HashMap::new();
+        stage_outputs.insert("plan".into(), plan_output);
+
+        let sub_tasks = Orchestrator::extract_sub_tasks("parent", &stage_outputs).unwrap();
+        assert_eq!(sub_tasks.len(), 2);
+        assert_eq!(sub_tasks[0].id, "parent-part1");
+        assert_eq!(sub_tasks[0].objective, "Add uuid to Cargo.toml");
+        assert!(sub_tasks[0].depends_on.is_empty());
+        assert_eq!(sub_tasks[1].id, "parent-part2");
+        assert_eq!(sub_tasks[1].depends_on, vec!["parent-part1"]);
+    }
+
+    #[test]
+    fn extract_sub_tasks_none_when_no_decomposition() {
+        let stage_outputs = HashMap::new();
+        assert!(Orchestrator::extract_sub_tasks("x", &stage_outputs).is_none());
+    }
+
+    #[test]
+    fn extract_sub_tasks_none_when_empty_decomposition() {
+        use glitchlab_kernel::agent::AgentMetadata;
+
+        let plan_output = AgentOutput {
+            data: serde_json::json!({
+                "decomposition": [],
+                "steps": []
+            }),
+            metadata: AgentMetadata {
+                agent: "planner".into(),
+                model: "test".into(),
+                tokens: 100,
+                cost: 0.01,
+                latency_ms: 50,
+            },
+            parse_error: false,
+        };
+
+        let mut stage_outputs = HashMap::new();
+        stage_outputs.insert("plan".into(), plan_output);
+
+        assert!(Orchestrator::extract_sub_tasks("x", &stage_outputs).is_none());
     }
 }

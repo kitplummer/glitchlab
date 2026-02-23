@@ -154,6 +154,8 @@ pub enum PipelineStatus {
     Interrupted,
     /// Pipeline exceeded its wall-clock timeout.
     TimedOut,
+    /// Task was decomposed into sub-tasks (not a failure).
+    Decomposed,
     /// Unrecoverable error.
     Error,
 }
