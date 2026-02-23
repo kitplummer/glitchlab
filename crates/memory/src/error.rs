@@ -1,55 +1,24 @@
-use std::fmt;
-
 /// Memory-crate errors.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum MemoryError {
     /// Filesystem I/O failure.
-    Io(std::io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// JSON serialization/deserialization failure.
-    Serde(serde_json::Error),
+    #[error("serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
     /// Data integrity issue (e.g. unrecoverable corrupt JSONL).
+    #[error("corrupt data: {0}")]
     Corrupt(String),
     /// Dolt backend error.
+    #[error("Dolt error: {0}")]
     Dolt(String),
     /// Beads backend error.
+    #[error("Beads error: {0}")]
     Beads(String),
     /// Backend not available (e.g. Dolt not configured, bd not on PATH).
+    #[error("backend unavailable: {0}")]
     Unavailable(String),
-}
-
-impl fmt::Display for MemoryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "I/O error: {e}"),
-            Self::Serde(e) => write!(f, "serialization error: {e}"),
-            Self::Corrupt(msg) => write!(f, "corrupt data: {msg}"),
-            Self::Dolt(msg) => write!(f, "Dolt error: {msg}"),
-            Self::Beads(msg) => write!(f, "Beads error: {msg}"),
-            Self::Unavailable(msg) => write!(f, "backend unavailable: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for MemoryError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            Self::Serde(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for MemoryError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<serde_json::Error> for MemoryError {
-    fn from(err: serde_json::Error) -> Self {
-        Self::Serde(err)
-    }
 }
 
 /// Convenience alias.
