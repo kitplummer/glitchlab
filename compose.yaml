@@ -12,8 +12,12 @@ services:
         mkdir -p /var/lib/dolt/glitchlab &&
         cd /var/lib/dolt/glitchlab &&
         [ -d .dolt ] || dolt init --name glitchlab --email glitchlab@localhost &&
-        cd /var/lib/dolt &&
-        exec dolt sql-server --host 0.0.0.0 --port 3306
+        printf 'log_level: info\nlistener:\n  host: 0.0.0.0\n  port: 3306\ndata_dir: /var/lib/dolt\n' > /var/lib/dolt/server.yaml &&
+        dolt sql-server --config /var/lib/dolt/server.yaml &
+        SERVER_PID=$$! &&
+        sleep 2 &&
+        dolt sql -q "CREATE USER IF NOT EXISTS 'glitchlab'@'%' IDENTIFIED BY 'glitchlab'; GRANT ALL PRIVILEGES ON *.* TO 'glitchlab'@'%';" 2>/dev/null;
+        wait $$SERVER_PID
     restart: unless-stopped
 
 volumes:

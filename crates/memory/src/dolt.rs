@@ -411,6 +411,42 @@ mod tests {
         );
     }
 
+    /// Integration test: requires a running Dolt instance at localhost:3306.
+    /// Run with: cargo test -p glitchlab-memory dolt_live_connection -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn dolt_live_connection() {
+        let dh = DoltHistory::new("mysql://glitchlab:glitchlab@localhost:3306/glitchlab")
+            .await
+            .expect("Dolt connection failed");
+        dh.ensure_schema().await.expect("schema creation failed");
+        assert!(dh.is_available().await, "Dolt should be available");
+
+        // Record + query round-trip.
+        let entry = HistoryEntry {
+            timestamp: Utc::now(),
+            task_id: "dolt-live-test".into(),
+            status: "pr_created".into(),
+            pr_url: None,
+            branch: None,
+            error: None,
+            budget: BudgetSummary::default(),
+            events_summary: EventsSummary::default(),
+            stage_outputs: None,
+            events: None,
+        };
+        dh.record(&entry).await.expect("record failed");
+
+        let query = HistoryQuery {
+            task_id: Some("dolt-live-test".into()),
+            limit: 1,
+            ..Default::default()
+        };
+        let entries = dh.query(&query).await.expect("query failed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].task_id, "dolt-live-test");
+    }
+
     #[test]
     fn history_entry_serde_with_stage_outputs() {
         let mut entry = crate::history::HistoryEntry {

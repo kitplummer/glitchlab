@@ -229,6 +229,15 @@ impl EngineeringPipeline {
         self.emit(&mut ctx, EventKind::PlanCreated, plan_output.data.clone());
         ctx.stage_outputs.insert("plan".into(), plan_output.clone());
 
+        // Strip repo context from objective — the planner already consumed it;
+        // downstream agents (implementer, debugger, etc.) don't need the full
+        // repo index occupying their context windows.
+        ctx.agent_context.objective = format!("## Task\n\n{objective}");
+
+        // Clear pre-loaded file context — the implementer will load only the
+        // files the planner identified, avoiding duplicate/stale context.
+        ctx.agent_context.file_context.clear();
+
         // --- Stage 4: Boundary check ---
         ctx.current_stage = Some("boundary_check".into());
         let files_affected: Vec<String> = plan_output.data["files_likely_affected"]
