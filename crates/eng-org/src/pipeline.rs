@@ -309,7 +309,7 @@ impl EngineeringPipeline {
             wt_path.clone(),
             impl_tool_policy,
             self.config.boundaries.protected_paths.clone(),
-            Duration::from_secs(30),
+            Duration::from_secs(120),
         );
         let implementer = ImplementerAgent::new(
             Arc::clone(&self.router),
@@ -332,6 +332,22 @@ impl EngineeringPipeline {
         );
         ctx.stage_outputs
             .insert("implement".into(), impl_output.clone());
+
+        // Bail early if the implementer got stuck or produced no useful output.
+        if impl_output.parse_error
+            || impl_output.data.get("stuck").and_then(|v| v.as_bool()) == Some(true)
+        {
+            let reason = impl_output.data["stuck_reason"]
+                .as_str()
+                .unwrap_or("parse_error");
+            return self
+                .fail(
+                    ctx,
+                    PipelineStatus::ImplementationFailed,
+                    format!("implementer failed: {reason}"),
+                )
+                .await;
+        }
 
         // --- Stage 7: Test / debug loop ---
         ctx.current_stage = Some("test".into());
@@ -392,7 +408,7 @@ impl EngineeringPipeline {
                             wt_path.clone(),
                             dbg_tool_policy,
                             self.config.boundaries.protected_paths.clone(),
-                            Duration::from_secs(30),
+                            Duration::from_secs(120),
                         );
                         let debugger = DebuggerAgent::new(
                             Arc::clone(&self.router),

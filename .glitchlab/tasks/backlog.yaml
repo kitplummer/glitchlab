@@ -6,10 +6,9 @@ tasks:
     call `build_backend()` and print which backends are available (e.g. "Memory: dolt, jsonl"
     or "Memory: jsonl (dolt unavailable)"). Use the `backend_name()` and `is_available()`
     trait methods. Add a unit test that verifies the output format string.
-  priority: 10
-  status: failed
+  priority: 40
+  status: pending
   depends_on: []
-  error: no changes produced — implementer output resulted in an empty commit
 - id: history-dolt-aware
   objective: |
     Update the `glitchlab history` command to use the composite memory backend
@@ -28,10 +27,10 @@ tasks:
     in KEY_FILES but not `compose.yaml` (the modern Docker Compose filename). Add
     `"compose.yaml"` to the KEY_FILES constant. Add a test that creates a temp repo
     with a `compose.yaml` file and verifies `build_index()` includes it in `key_files`.
-  priority: 30
+  priority: 10
   status: failed
   depends_on: []
-  error: 'budget exceeded: token limit exceeded: 304338 / 300000 tokens used'
+  error: debugger recommends not retrying
 - id: router-request-id
   objective: |
     Add a `request_id: String` field (UUID v4) to `RouterResponse` in
@@ -39,10 +38,9 @@ tasks:
     dispatching to the provider. Include the request_id in the tracing span so
     all log lines for a single LLM call can be correlated. Add `uuid` as a
     workspace dependency. Test that each response has a unique, non-empty request_id.
-  priority: 40
-  status: failed
+  priority: 50
+  status: pending
   depends_on: []
-  error: 'debugger failed: budget exceeded: token limit exceeded: 315992 / 300000 tokens used'
 - id: batch-dry-run
   objective: |
     Add a `--dry-run` flag to the `glitchlab batch` CLI command. When set, the
@@ -51,9 +49,8 @@ tasks:
     or make LLM calls. Implement in `crates/cli/src/commands/batch.rs`. Add a
     clap arg `--dry-run` (bool flag). Test with a mock task file.
   priority: 50
-  status: failed
+  status: pending
   depends_on: []
-  error: debugger recommends not retrying
 - id: memory-error-thiserror
   objective: |
     The memory crate's `crates/memory/src/error.rs` should use `thiserror` derive
@@ -62,9 +59,8 @@ tasks:
     implementation uses thiserror. If it already does, mark this task as complete.
     If it uses manual `impl Display` / `impl Error`, migrate to `#[derive(thiserror::Error)]`.
   priority: 60
-  status: failed
+  status: pending
   depends_on: []
-  error: debugger recommends not retrying
 - id: orchestrator-duration-tracking
   objective: |
     Add wall-clock duration tracking to `OrchestratorResult` in
