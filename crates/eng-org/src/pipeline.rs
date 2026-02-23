@@ -863,7 +863,40 @@ async fn create_pr(
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // If a PR already exists for this branch, look it up via `gh pr view`.
+        if stderr.contains("already exists")
+            && let Ok(url) = view_existing_pr(worktree, branch).await
+        {
+            info!(branch, url, "PR already exists, reusing");
+            return Ok(url);
+        }
+
         Err(format!("gh pr create failed: {stderr}"))
+    }
+}
+
+/// Look up an existing PR for the given branch via `gh pr view`.
+async fn view_existing_pr(worktree: &Path, branch: &str) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args(["pr", "view", branch, "--json", "url", "-q", ".url"])
+        .current_dir(worktree)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("gh pr view: {e}"))?;
+
+    if output.status.success() {
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if url.is_empty() {
+            Err("gh pr view returned empty URL".to_string())
+        } else {
+            Ok(url)
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("gh pr view failed: {stderr}"))
     }
 }
 
@@ -1753,6 +1786,14 @@ mod tests {
             &security,
         )
         .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn view_existing_pr_no_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        // gh pr view will fail — no git repo, no remote.
+        let result = view_existing_pr(dir.path(), "test-branch").await;
         assert!(result.is_err());
     }
 
