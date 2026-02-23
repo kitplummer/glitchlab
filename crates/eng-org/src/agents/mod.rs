@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use glitchlab_kernel::agent::{AgentContext, ContentBlock, Message, MessageContent, MessageRole};
 use glitchlab_kernel::error;
-use glitchlab_kernel::tool::{ToolCallResult, ToolDefinition};
+use glitchlab_kernel::tool::{ToolCall, ToolCallResult, ToolDefinition};
 use glitchlab_router::RouterResponse;
 use tracing::warn;
 
@@ -54,6 +54,7 @@ pub(crate) enum ToolLoopOutcome {
 pub(crate) struct StuckDetector {
     max_stuck_turns: u32,
     result_hashes: Vec<u64>,
+    consecutive_same: u32,
     consecutive_errors: u32,
 }
 
@@ -62,32 +63,48 @@ impl StuckDetector {
         Self {
             max_stuck_turns,
             result_hashes: Vec::new(),
+            consecutive_same: 0,
             consecutive_errors: 0,
         }
     }
 
-    /// Record a turn's tool results and check for stuck patterns.
+    /// Record a turn's tool calls + results and check for stuck patterns.
+    ///
+    /// Hashes both the calls (name + input) and the results (content + is_error)
+    /// so that different edits to the same file (which produce identical "edited
+    /// {path}" results) are correctly seen as distinct turns.
     ///
     /// Returns `Some(reason)` if the agent appears stuck, `None` otherwise.
-    pub(crate) fn record_turn(&mut self, results: &[ToolCallResult]) -> Option<StuckReason> {
-        // Hash all results for this turn.
+    pub(crate) fn record_turn(
+        &mut self,
+        calls: &[ToolCall],
+        results: &[ToolCallResult],
+    ) -> Option<StuckReason> {
+        // Hash both calls and results for this turn.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for c in calls {
+            c.name.hash(&mut hasher);
+            c.input.to_string().hash(&mut hasher);
+        }
         for r in results {
             r.content.hash(&mut hasher);
             r.is_error.hash(&mut hasher);
         }
         let hash = hasher.finish();
 
-        // Check if this hash matches any of the last max_stuck_turns hashes.
-        let window_start = self
-            .result_hashes
-            .len()
-            .saturating_sub(self.max_stuck_turns as usize);
-        if self.result_hashes[window_start..].contains(&hash) {
-            self.result_hashes.push(hash);
-            return Some(StuckReason::RepeatedResults);
+        // Track consecutive identical results. Two identical turns back-to-back
+        // means the agent sent the same calls, got the same results, and is
+        // about to loop — bail immediately.
+        if self.result_hashes.last() == Some(&hash) {
+            self.consecutive_same += 1;
+        } else {
+            self.consecutive_same = 1;
         }
         self.result_hashes.push(hash);
+
+        if self.consecutive_same >= 2 {
+            return Some(StuckReason::RepeatedResults);
+        }
 
         // Check if ALL results in this turn are errors.
         if !results.is_empty() && results.iter().all(|r| r.is_error) {
@@ -231,7 +248,7 @@ pub(crate) async fn tool_use_loop(
         }
 
         // Check for stuck agent before appending results.
-        let stuck = detector.record_turn(&results);
+        let stuck = detector.record_turn(&response.tool_calls, &results);
 
         // Append results as user messages.
         for result in results {
@@ -1046,6 +1063,15 @@ mod tests {
     // --- StuckDetector tests ---
 
     use glitchlab_kernel::tool::ToolCallResult;
+    use serde_json::json;
+
+    fn tc(name: &str, input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "t1".into(),
+            name: name.into(),
+            input,
+        }
+    }
 
     fn tcr(content: &str, is_error: bool) -> ToolCallResult {
         ToolCallResult {
@@ -1058,18 +1084,67 @@ mod tests {
     #[test]
     fn stuck_detector_no_stuck_on_varied_results() {
         let mut detector = StuckDetector::new(3);
-        assert_eq!(detector.record_turn(&[tcr("aaa", false)]), None);
-        assert_eq!(detector.record_turn(&[tcr("bbb", false)]), None);
-        assert_eq!(detector.record_turn(&[tcr("ccc", false)]), None);
+        let calls = [tc("read_file", json!({"path": "a.rs"}))];
+        assert_eq!(detector.record_turn(&calls, &[tcr("aaa", false)]), None);
+        let calls = [tc("read_file", json!({"path": "b.rs"}))];
+        assert_eq!(detector.record_turn(&calls, &[tcr("bbb", false)]), None);
+        let calls = [tc("read_file", json!({"path": "c.rs"}))];
+        assert_eq!(detector.record_turn(&calls, &[tcr("ccc", false)]), None);
     }
 
     #[test]
-    fn stuck_detector_repeated_results() {
+    fn stuck_detector_same_calls_same_results_triggers() {
         let mut detector = StuckDetector::new(3);
-        assert_eq!(detector.record_turn(&[tcr("same", false)]), None);
+        let calls = [tc("read_file", json!({"path": "f.rs"}))];
+        assert_eq!(detector.record_turn(&calls, &[tcr("same", false)]), None);
+        // Identical call + identical result → stuck.
         assert_eq!(
-            detector.record_turn(&[tcr("same", false)]),
+            detector.record_turn(&calls, &[tcr("same", false)]),
             Some(StuckReason::RepeatedResults)
+        );
+    }
+
+    #[test]
+    fn stuck_detector_different_calls_same_results_not_stuck() {
+        let mut detector = StuckDetector::new(3);
+        // Two different edits to the same file both return "edited foo.rs".
+        let calls1 = [tc(
+            "edit_file",
+            json!({"path": "foo.rs", "old_string": "aaa", "new_string": "bbb"}),
+        )];
+        let calls2 = [tc(
+            "edit_file",
+            json!({"path": "foo.rs", "old_string": "ccc", "new_string": "ddd"}),
+        )];
+        assert_eq!(
+            detector.record_turn(&calls1, &[tcr("edited foo.rs", false)]),
+            None
+        );
+        // Different inputs → different hash, not stuck.
+        assert_eq!(
+            detector.record_turn(&calls2, &[tcr("edited foo.rs", false)]),
+            None
+        );
+    }
+
+    #[test]
+    fn stuck_detector_interleaved_results_not_stuck() {
+        let mut detector = StuckDetector::new(3);
+        let calls_a = [tc("read_file", json!({"path": "a.rs"}))];
+        let calls_b = [tc(
+            "edit_file",
+            json!({"path": "a.rs", "old_string": "x", "new_string": "y"}),
+        )];
+        // A, B, A pattern is normal (read → edit → read), not stuck.
+        assert_eq!(detector.record_turn(&calls_a, &[tcr("aaa", false)]), None);
+        assert_eq!(
+            detector.record_turn(&calls_b, &[tcr("edited a.rs", false)]),
+            None
+        );
+        assert_eq!(detector.record_turn(&calls_a, &[tcr("aaa", false)]), None);
+        assert_eq!(
+            detector.record_turn(&calls_b, &[tcr("edited a.rs", false)]),
+            None
         );
     }
 
@@ -1077,10 +1152,13 @@ mod tests {
     fn stuck_detector_consecutive_errors() {
         let mut detector = StuckDetector::new(3);
         // Each turn has different content to avoid triggering RepeatedResults.
-        assert_eq!(detector.record_turn(&[tcr("err1", true)]), None);
-        assert_eq!(detector.record_turn(&[tcr("err2", true)]), None);
+        let c1 = [tc("run_command", json!({"command": "test1"}))];
+        let c2 = [tc("run_command", json!({"command": "test2"}))];
+        let c3 = [tc("run_command", json!({"command": "test3"}))];
+        assert_eq!(detector.record_turn(&c1, &[tcr("err1", true)]), None);
+        assert_eq!(detector.record_turn(&c2, &[tcr("err2", true)]), None);
         assert_eq!(
-            detector.record_turn(&[tcr("err3", true)]),
+            detector.record_turn(&c3, &[tcr("err3", true)]),
             Some(StuckReason::ConsecutiveErrors)
         );
     }
@@ -1088,10 +1166,14 @@ mod tests {
     #[test]
     fn stuck_detector_error_streak_resets() {
         let mut detector = StuckDetector::new(3);
-        assert_eq!(detector.record_turn(&[tcr("err1", true)]), None);
-        assert_eq!(detector.record_turn(&[tcr("ok1", false)]), None); // resets
-        assert_eq!(detector.record_turn(&[tcr("err2", true)]), None);
-        assert_eq!(detector.record_turn(&[tcr("err3", true)]), None);
+        let c1 = [tc("run_command", json!({"command": "a"}))];
+        let c2 = [tc("read_file", json!({"path": "ok"}))];
+        let c3 = [tc("run_command", json!({"command": "b"}))];
+        let c4 = [tc("run_command", json!({"command": "c"}))];
+        assert_eq!(detector.record_turn(&c1, &[tcr("err1", true)]), None);
+        assert_eq!(detector.record_turn(&c2, &[tcr("ok1", false)]), None); // resets
+        assert_eq!(detector.record_turn(&c3, &[tcr("err2", true)]), None);
+        assert_eq!(detector.record_turn(&c4, &[tcr("err3", true)]), None);
         // Only 2 consecutive errors, not 3 — no trigger.
     }
 
@@ -1099,12 +1181,24 @@ mod tests {
     fn stuck_detector_mixed_results_not_stuck() {
         let mut detector = StuckDetector::new(3);
         // Turns with some errors and some successes — should NOT trigger consecutive errors.
+        let c1 = [
+            tc("run_command", json!({"command": "a"})),
+            tc("read_file", json!({"path": "b"})),
+        ];
+        let c2 = [
+            tc("run_command", json!({"command": "c"})),
+            tc("read_file", json!({"path": "d"})),
+        ];
+        let c3 = [
+            tc("run_command", json!({"command": "e"})),
+            tc("read_file", json!({"path": "f"})),
+        ];
         let mixed1 = vec![tcr("err", true), tcr("ok", false)];
         let mixed2 = vec![tcr("err2", true), tcr("ok2", false)];
         let mixed3 = vec![tcr("err3", true), tcr("ok3", false)];
-        assert_eq!(detector.record_turn(&mixed1), None);
-        assert_eq!(detector.record_turn(&mixed2), None);
-        assert_eq!(detector.record_turn(&mixed3), None);
+        assert_eq!(detector.record_turn(&c1, &mixed1), None);
+        assert_eq!(detector.record_turn(&c2, &mixed2), None);
+        assert_eq!(detector.record_turn(&c3, &mixed3), None);
     }
 
     #[tokio::test]
