@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -238,6 +239,16 @@ pub enum CeaseReason {
     BudgetExhausted,
     /// Quality gate failed — halting to prevent further damage.
     QualityGateFailed,
+}
+
+impl fmt::Display for CeaseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CeaseReason::AllTasksDone => write!(f, "all tasks done"),
+            CeaseReason::BudgetExhausted => write!(f, "budget exhausted"),
+            CeaseReason::QualityGateFailed => write!(f, "quality gate failed"),
+        }
+    }
 }
 
 /// Result of a single task run within the orchestrator.
@@ -1284,5 +1295,19 @@ mod tests {
         stage_outputs.insert("plan".into(), plan_output);
 
         assert!(Orchestrator::extract_sub_tasks("x", &stage_outputs).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // CeaseReason Display tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cease_reason_display() {
+        assert_eq!(CeaseReason::AllTasksDone.to_string(), "all tasks done");
+        assert_eq!(CeaseReason::BudgetExhausted.to_string(), "budget exhausted");
+        assert_eq!(
+            CeaseReason::QualityGateFailed.to_string(),
+            "quality gate failed"
+        );
     }
 }
