@@ -60,6 +60,8 @@ pub trait Provider: Send + Sync {
 ///
 /// This is a plain struct (no serde) that acts as the boundary between
 /// eng-org config parsing and router provider construction.
+///
+/// API key resolution priority: inline key > custom env var > default env var.
 #[derive(Debug, Clone)]
 pub struct ProviderInit {
     /// Provider kind: "anthropic", "gemini", "openai", or a custom name.
