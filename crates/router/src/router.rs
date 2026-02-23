@@ -8,6 +8,7 @@ use glitchlab_kernel::tool::ToolDefinition;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::chooser::ModelChooser;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::gemini::GeminiProvider;
 use crate::provider::openai::OpenAiProvider;
@@ -29,6 +30,10 @@ pub struct Router {
 
     /// Shared budget tracker (wrapped in Mutex for interior mutability).
     budget: Arc<Mutex<BudgetTracker>>,
+
+    /// Optional cost-aware model chooser. When present, takes precedence
+    /// over the static `routing` map for model resolution.
+    chooser: Option<ModelChooser>,
 }
 
 impl Router {
@@ -55,12 +60,40 @@ impl Router {
             routing,
             providers,
             budget: Arc::new(Mutex::new(budget)),
+            chooser: None,
         }
+    }
+
+    /// Attach a cost-aware model chooser. When set, model resolution
+    /// uses the chooser first and falls back to the static routing map.
+    pub fn with_chooser(mut self, chooser: ModelChooser) -> Self {
+        self.chooser = Some(chooser);
+        self
     }
 
     /// Register a custom provider (e.g. Ollama, LM Studio).
     pub fn register_provider(&mut self, name: String, provider: Arc<dyn Provider>) {
         self.providers.insert(name, provider);
+    }
+
+    /// Resolve role → model string using the chooser (if present) or the
+    /// static routing map as a fallback.
+    async fn resolve_model(&self, role: &str) -> error::Result<String> {
+        if let Some(ref chooser) = self.chooser {
+            let budget = self.budget.lock().await;
+            let remaining = budget.dollars_remaining();
+            let max_budget = budget.max_dollars;
+            drop(budget);
+
+            if let Some(model) = chooser.select(role, remaining, max_budget) {
+                return Ok(model.to_string());
+            }
+            // Fall through to static map if chooser has no match.
+        }
+        self.routing
+            .get(role)
+            .cloned()
+            .ok_or_else(|| error::Error::Config(format!("no model configured for role `{role}`")))
     }
 
     /// Make a completion call for the given agent role.
@@ -81,12 +114,10 @@ impl Router {
             budget.check()?;
         }
 
-        // Resolve role → model string.
-        let model_string = self.routing.get(role).ok_or_else(|| {
-            error::Error::Config(format!("no model configured for role `{role}`"))
-        })?;
+        // Resolve role → model string (chooser-aware).
+        let model_string = self.resolve_model(role).await?;
 
-        let (provider_name, model_id) = parse_model_string(model_string);
+        let (provider_name, model_id) = parse_model_string(&model_string);
 
         // Look up provider.
         let provider = self.providers.get(provider_name).ok_or_else(|| {
@@ -95,7 +126,7 @@ impl Router {
             ))
         })?;
 
-        info!(role, model = model_string, "router: calling LLM");
+        info!(role, model = %model_string, "router: calling LLM");
 
         // Call with retry (up to 5 attempts on transient/overload errors).
         let mut last_err = None;
@@ -183,12 +214,10 @@ impl Router {
             budget.check()?;
         }
 
-        // Resolve role → model string.
-        let model_string = self.routing.get(role).ok_or_else(|| {
-            error::Error::Config(format!("no model configured for role `{role}`"))
-        })?;
+        // Resolve role → model string (chooser-aware).
+        let model_string = self.resolve_model(role).await?;
 
-        let (provider_name, model_id) = parse_model_string(model_string);
+        let (provider_name, model_id) = parse_model_string(&model_string);
 
         // Look up provider.
         let provider = self.providers.get(provider_name).ok_or_else(|| {
@@ -199,7 +228,7 @@ impl Router {
 
         info!(
             role,
-            model = model_string,
+            model = %model_string,
             tool_count = tools.len(),
             "router: calling LLM with tools"
         );
@@ -764,5 +793,103 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // ModelChooser integration tests
+    // -----------------------------------------------------------------------
+
+    use crate::chooser::{ModelChooser, ModelProfile, ModelTier, RolePreference};
+    use std::collections::HashSet;
+
+    fn test_chooser() -> ModelChooser {
+        let models = vec![
+            ModelProfile {
+                model_string: "mock/cheap".into(),
+                input_cost_per_m: 0.1,
+                output_cost_per_m: 0.3,
+                tier: ModelTier::Economy,
+                capabilities: HashSet::from(["tool_use".into(), "code".into()]),
+            },
+            ModelProfile {
+                model_string: "mock/mid".into(),
+                input_cost_per_m: 0.5,
+                output_cost_per_m: 1.0,
+                tier: ModelTier::Standard,
+                capabilities: HashSet::from(["tool_use".into(), "code".into()]),
+            },
+        ];
+        let roles = HashMap::from([(
+            "planner".into(),
+            RolePreference {
+                min_tier: ModelTier::Standard,
+                required_capabilities: HashSet::new(),
+            },
+        )]);
+        ModelChooser::new(models, roles, 0.7)
+    }
+
+    #[tokio::test]
+    async fn resolve_model_uses_chooser_when_present() {
+        let routing = HashMap::from([("planner".to_string(), "mock/fallback".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget).with_chooser(test_chooser());
+
+        let model = router.resolve_model("planner").await.unwrap();
+        // Chooser should pick "mock/mid" (Standard tier, cheapest eligible).
+        assert_eq!(model, "mock/mid");
+    }
+
+    #[tokio::test]
+    async fn resolve_model_falls_back_to_static() {
+        let routing = HashMap::from([("planner".to_string(), "mock/fallback".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        // No chooser attached → uses static routing map.
+        let router = Router::new(routing, budget);
+
+        let model = router.resolve_model("planner").await.unwrap();
+        assert_eq!(model, "mock/fallback");
+    }
+
+    #[tokio::test]
+    async fn resolve_model_chooser_no_match_falls_to_static() {
+        // Chooser with impossible requirements.
+        let models = vec![ModelProfile {
+            model_string: "mock/cheap".into(),
+            input_cost_per_m: 0.1,
+            output_cost_per_m: 0.3,
+            tier: ModelTier::Economy,
+            capabilities: HashSet::new(),
+        }];
+        let roles = HashMap::from([(
+            "planner".into(),
+            RolePreference {
+                min_tier: ModelTier::Economy,
+                required_capabilities: HashSet::from(["nonexistent".into()]),
+            },
+        )]);
+        let chooser = ModelChooser::new(models, roles, 0.5);
+
+        let routing = HashMap::from([("planner".to_string(), "mock/static".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget).with_chooser(chooser);
+
+        let model = router.resolve_model("planner").await.unwrap();
+        assert_eq!(model, "mock/static");
+    }
+
+    #[tokio::test]
+    async fn complete_with_chooser() {
+        let routing = HashMap::from([("planner".to_string(), "mock/fallback".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+
+        // The chooser will select "mock/mid", which starts with provider "mock".
+        let mut router = Router::new(routing, budget).with_chooser(test_chooser());
+        router.register_provider("mock".into(), Arc::new(MockProvider::ok()));
+
+        let result = router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await;
+        assert!(result.is_ok());
     }
 }

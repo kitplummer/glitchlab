@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use glitchlab_kernel::error::{Error, Result};
+use glitchlab_router::chooser::{ModelChooser, ModelProfile, ModelTier, RolePreference};
 use serde::{Deserialize, Serialize};
 
 /// Full GLITCHLAB configuration (engineering org).
@@ -53,6 +54,49 @@ pub struct RoutingConfig {
     pub security: String,
     pub release: String,
     pub archivist: String,
+
+    /// Model pool for cost-aware chooser. When non-empty, enables
+    /// the `ModelChooser` for dynamic model selection.
+    #[serde(default)]
+    pub models: Vec<ModelProfileConfig>,
+
+    /// Per-role preferences for cost-aware routing.
+    #[serde(default)]
+    pub roles: HashMap<String, RolePreferenceConfig>,
+
+    /// Budget pressure sensitivity. 0.0 = quality-first, 1.0 = cost-first.
+    #[serde(default = "default_cost_quality_threshold")]
+    pub cost_quality_threshold: f64,
+}
+
+fn default_cost_quality_threshold() -> f64 {
+    0.5
+}
+
+/// Configuration for a model in the cost-aware pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfileConfig {
+    pub model: String,
+    pub tier: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub input_cost_per_m: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_m: Option<f64>,
+}
+
+/// Configuration for per-role model preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolePreferenceConfig {
+    #[serde(default = "default_min_tier")]
+    pub min_tier: String,
+    #[serde(default)]
+    pub requires: Vec<String>,
+}
+
+fn default_min_tier() -> String {
+    "economy".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +141,9 @@ impl Default for EngConfig {
                 security: "anthropic/claude-haiku-4-5-20251001".into(),
                 release: "anthropic/claude-haiku-4-5-20251001".into(),
                 archivist: "anthropic/claude-haiku-4-5-20251001".into(),
+                models: Vec::new(),
+                roles: HashMap::new(),
+                cost_quality_threshold: default_cost_quality_threshold(),
             },
             limits: LimitsConfig {
                 max_fix_attempts: 2,
@@ -104,7 +151,7 @@ impl Default for EngConfig {
                 max_dollars_per_task: 2.0,
                 require_plan_review: true,
                 require_pr_review: true,
-                max_tool_turns: 10,
+                max_tool_turns: 20,
                 max_pipeline_duration_secs: 600,
             },
             intervention: InterventionConfig {
@@ -205,6 +252,79 @@ impl EngConfig {
             ("archivist".into(), self.routing.archivist.clone()),
         ])
     }
+
+    /// Build a `ModelChooser` from the config's model pool and role preferences.
+    /// Returns `None` if no models are configured (use static routing instead).
+    pub fn build_chooser(&self) -> Option<ModelChooser> {
+        if self.routing.models.is_empty() {
+            return None;
+        }
+
+        let models: Vec<ModelProfile> = self
+            .routing
+            .models
+            .iter()
+            .filter_map(|cfg| {
+                let tier = ModelTier::from_str_loose(&cfg.tier)?;
+                let (default_input, default_output) = default_cost(&cfg.model);
+                Some(ModelProfile {
+                    model_string: cfg.model.clone(),
+                    input_cost_per_m: cfg.input_cost_per_m.unwrap_or(default_input),
+                    output_cost_per_m: cfg.output_cost_per_m.unwrap_or(default_output),
+                    tier,
+                    capabilities: cfg.capabilities.iter().cloned().collect(),
+                })
+            })
+            .collect();
+
+        let role_preferences: HashMap<String, RolePreference> = self
+            .routing
+            .roles
+            .iter()
+            .filter_map(|(role, cfg)| {
+                let tier = ModelTier::from_str_loose(&cfg.min_tier)?;
+                Some((
+                    role.clone(),
+                    RolePreference {
+                        min_tier: tier,
+                        required_capabilities: cfg.requires.iter().cloned().collect(),
+                    },
+                ))
+            })
+            .collect();
+
+        Some(ModelChooser::new(
+            models,
+            role_preferences,
+            self.routing.cost_quality_threshold,
+        ))
+    }
+}
+
+/// Infer default cost per million tokens from model string.
+/// Used when costs are not explicitly set in config.
+fn default_cost(model_string: &str) -> (f64, f64) {
+    let lower = model_string.to_lowercase();
+    if lower.contains("flash-lite") {
+        (0.075, 0.30)
+    } else if lower.contains("flash") {
+        (0.15, 0.60)
+    } else if lower.contains("gemini-2.5-pro") {
+        (1.25, 10.0)
+    } else if lower.contains("haiku") {
+        (0.80, 4.0)
+    } else if lower.contains("sonnet") {
+        (3.0, 15.0)
+    } else if lower.contains("opus") {
+        (15.0, 75.0)
+    } else if lower.contains("gpt-4o-mini") {
+        (0.15, 0.60)
+    } else if lower.contains("gpt-4o") {
+        (2.50, 10.0)
+    } else {
+        // Unknown model — assume mid-range.
+        (1.0, 5.0)
+    }
 }
 
 /// Recursively merge override into base (override wins on conflict).
@@ -282,7 +402,7 @@ mod tests {
         assert!(!config.blocked_patterns.is_empty());
         assert!(config.routing.implementer.contains("anthropic"));
         assert!(config.routing.planner.contains("anthropic"));
-        assert_eq!(config.limits.max_tool_turns, 10);
+        assert_eq!(config.limits.max_tool_turns, 20);
         assert_eq!(config.limits.max_pipeline_duration_secs, 600);
     }
 
@@ -543,5 +663,190 @@ memory:
         );
         assert!(config.memory.beads_enabled);
         assert_eq!(config.memory.beads_bd_path, Some("/opt/bd".into()));
+    }
+
+    // -----------------------------------------------------------------------
+    // ModelChooser config tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn routing_config_with_models_parses() {
+        let yaml = r#"
+routing:
+  planner: "gemini/gemini-2.5-flash"
+  implementer: "gemini/gemini-2.5-flash"
+  debugger: "gemini/gemini-2.5-flash"
+  security: "gemini/gemini-2.5-flash"
+  release: "gemini/gemini-2.5-flash"
+  archivist: "gemini/gemini-2.5-flash"
+  models:
+    - model: "gemini/gemini-2.5-flash-lite"
+      tier: economy
+      capabilities: [tool_use, code]
+    - model: "gemini/gemini-2.5-flash"
+      tier: standard
+      capabilities: [tool_use, code, long_context]
+  roles:
+    planner:
+      min_tier: standard
+    debugger:
+      min_tier: economy
+      requires: [tool_use]
+  cost_quality_threshold: 0.7
+limits:
+  max_fix_attempts: 2
+  max_tokens_per_task: 150000
+  max_dollars_per_task: 2.0
+  require_plan_review: true
+  require_pr_review: true
+  max_tool_turns: 20
+  max_pipeline_duration_secs: 600
+intervention:
+  pause_after_plan: true
+  pause_before_pr: true
+  pause_on_core_change: true
+  pause_on_budget_exceeded: true
+workspace:
+  worktree_dir: ".glitchlab/worktrees"
+  task_dir: ".glitchlab/tasks"
+  log_dir: ".glitchlab/logs"
+allowed_tools: []
+blocked_patterns: []
+boundaries:
+  protected_paths: []
+"#;
+        let config: EngConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.routing.models.len(), 2);
+        assert_eq!(config.routing.models[0].tier, "economy");
+        assert_eq!(config.routing.roles.len(), 2);
+        assert!((config.routing.cost_quality_threshold - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn routing_config_without_models_backward_compat() {
+        let config = EngConfig::default();
+        assert!(config.routing.models.is_empty());
+        assert!(config.routing.roles.is_empty());
+        assert!((config.routing.cost_quality_threshold - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn build_chooser_returns_none_without_models() {
+        let config = EngConfig::default();
+        assert!(config.build_chooser().is_none());
+    }
+
+    #[test]
+    fn build_chooser_returns_some_with_models() {
+        let mut config = EngConfig::default();
+        config.routing.models = vec![
+            ModelProfileConfig {
+                model: "gemini/gemini-2.5-flash-lite".into(),
+                tier: "economy".into(),
+                capabilities: vec!["tool_use".into()],
+                input_cost_per_m: None,
+                output_cost_per_m: None,
+            },
+            ModelProfileConfig {
+                model: "gemini/gemini-2.5-flash".into(),
+                tier: "standard".into(),
+                capabilities: vec!["tool_use".into(), "code".into()],
+                input_cost_per_m: Some(0.15),
+                output_cost_per_m: Some(0.60),
+            },
+        ];
+        config.routing.roles.insert(
+            "planner".into(),
+            RolePreferenceConfig {
+                min_tier: "standard".into(),
+                requires: vec![],
+            },
+        );
+
+        let chooser = config.build_chooser();
+        assert!(chooser.is_some());
+        let chooser = chooser.unwrap();
+        assert!(!chooser.is_empty());
+    }
+
+    #[test]
+    fn cost_quality_threshold_defaults() {
+        let yaml = r#"
+routing:
+  planner: "x"
+  implementer: "x"
+  debugger: "x"
+  security: "x"
+  release: "x"
+  archivist: "x"
+limits:
+  max_fix_attempts: 2
+  max_tokens_per_task: 150000
+  max_dollars_per_task: 2.0
+  require_plan_review: true
+  require_pr_review: true
+  max_tool_turns: 20
+  max_pipeline_duration_secs: 600
+intervention:
+  pause_after_plan: true
+  pause_before_pr: true
+  pause_on_core_change: true
+  pause_on_budget_exceeded: true
+workspace:
+  worktree_dir: "."
+  task_dir: "."
+  log_dir: "."
+allowed_tools: []
+blocked_patterns: []
+boundaries:
+  protected_paths: []
+"#;
+        let config: EngConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!((config.routing.cost_quality_threshold - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn build_chooser_skips_invalid_tier() {
+        let mut config = EngConfig::default();
+        config.routing.models = vec![
+            ModelProfileConfig {
+                model: "gemini/gemini-2.5-flash-lite".into(),
+                tier: "invalid_tier".into(),
+                capabilities: vec![],
+                input_cost_per_m: None,
+                output_cost_per_m: None,
+            },
+            ModelProfileConfig {
+                model: "gemini/gemini-2.5-flash".into(),
+                tier: "standard".into(),
+                capabilities: vec![],
+                input_cost_per_m: None,
+                output_cost_per_m: None,
+            },
+        ];
+
+        let chooser = config.build_chooser().unwrap();
+        // Only one model should make it through (the one with valid tier).
+        let selected = chooser.select("any", 10.0, 10.0);
+        assert_eq!(selected, Some("gemini/gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn default_cost_inference() {
+        let (i, o) = default_cost("gemini/gemini-2.5-flash-lite");
+        assert!((i - 0.075).abs() < f64::EPSILON);
+        assert!((o - 0.30).abs() < f64::EPSILON);
+
+        let (i, o) = default_cost("gemini/gemini-2.5-flash");
+        assert!((i - 0.15).abs() < f64::EPSILON);
+        assert!((o - 0.60).abs() < f64::EPSILON);
+
+        let (i, o) = default_cost("anthropic/claude-sonnet-4-20250514");
+        assert!((i - 3.0).abs() < f64::EPSILON);
+        assert!((o - 15.0).abs() < f64::EPSILON);
+
+        let (i, o) = default_cost("unknown/model");
+        assert!((i - 1.0).abs() < f64::EPSILON);
+        assert!((o - 5.0).abs() < f64::EPSILON);
     }
 }
