@@ -503,6 +503,8 @@ struct GeminiCandidate {
 
 #[derive(Deserialize)]
 struct GeminiCandidateContent {
+    /// Parts may be absent when the model returns empty content.
+    #[serde(default)]
     parts: Vec<GeminiResponsePart>,
 }
 
@@ -1078,5 +1080,25 @@ mod tests {
         });
         let cleaned = strip_unsupported_schema_keys(&schema);
         assert_eq!(cleaned, schema);
+    }
+
+    #[test]
+    fn parse_response_with_missing_parts() {
+        // Gemini can return content with role but no parts field.
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model"},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "totalTokenCount": 100
+            }
+        });
+        let resp: GeminiResponse = serde_json::from_value(raw).unwrap();
+        let candidate = &resp.candidates[0];
+        let parts = candidate.content.as_ref().map(|c| &c.parts).unwrap();
+        assert!(parts.is_empty());
     }
 }

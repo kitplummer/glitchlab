@@ -23,12 +23,18 @@ tool calls — use this to stay within budget. Reserve 2 turns for final verific
 
 ## Available tools
 
-- `read_file` — Read a file's contents. Only use if the file is NOT already in the
-  Relevant File Contents section below.
-- `list_files` — List files matching a glob pattern.
+- `read_file` — Read a file's contents. Supports optional `start_line` and `end_line`
+  parameters to read a specific range (1-based, inclusive). For large files (>200 lines),
+  prefer reading in sections. Only use if the file is NOT already in the Relevant File
+  Contents section below.
+- `list_files` — List files matching a glob pattern (e.g. "crates/**/*.rs", "src/*.ts").
+  Use this FIRST to discover file paths — do NOT use shell commands like `find` or `ls`.
 - `write_file` — Create or overwrite a file.
-- `edit_file` — Replace an exact string in a file.
-- `run_command` — Run a shell command (e.g. build, lint, test commands).
+- `edit_file` — Replace an exact string in a file. The `old_string` must be a UNIQUE,
+  EXACT match of existing content (copy it from `read_file` output). Include enough
+  surrounding context lines to ensure uniqueness.
+- `run_command` — Run a shell command. Allowed: build, test, lint, git, and read-only
+  commands (find, ls, grep, head, tail, cat). NOT allowed: curl, wget, sudo, rm -rf.
 
 ## IMPORTANT: Parallel tool calls
 

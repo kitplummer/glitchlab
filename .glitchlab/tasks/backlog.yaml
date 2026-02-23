@@ -7,8 +7,9 @@ tasks:
     or "Memory: jsonl (dolt unavailable)"). Use the `backend_name()` and `is_available()`
     trait methods. Add a unit test that verifies the output format string.
   priority: 40
-  status: pending
+  status: completed
   depends_on: []
+  pr_url: https://github.com/kitplummer/glitchlab/pull/12
 - id: history-dolt-aware
   objective: |
     Update the `glitchlab history` command to use the composite memory backend
@@ -18,9 +19,10 @@ tasks:
     fall back to JSONL otherwise. Add a test that verifies the command works
     with the default (JSONL-only) backend.
   priority: 20
-  status: pending
+  status: completed
   depends_on:
   - status-memory-info
+  pr_url: https://github.com/kitplummer/glitchlab/pull/13
 - id: indexer-compose-yaml
   objective: |
     The repo indexer in `crates/eng-org/src/indexer.rs` already has `docker-compose.yml`
@@ -28,9 +30,9 @@ tasks:
     `"compose.yaml"` to the KEY_FILES constant. Add a test that creates a temp repo
     with a `compose.yaml` file and verifies `build_index()` includes it in `key_files`.
   priority: 10
-  status: failed
+  status: completed
   depends_on: []
-  error: debugger recommends not retrying
+  pr_url: https://github.com/kitplummer/glitchlab/pull/11
 - id: router-request-id
   objective: |
     Add a `request_id: String` field (UUID v4) to `RouterResponse` in
@@ -39,8 +41,9 @@ tasks:
     all log lines for a single LLM call can be correlated. Add `uuid` as a
     workspace dependency. Test that each response has a unique, non-empty request_id.
   priority: 50
-  status: pending
+  status: completed
   depends_on: []
+  pr_url: https://github.com/kitplummer/glitchlab/pull/17
 - id: batch-dry-run
   objective: |
     Add a `--dry-run` flag to the `glitchlab batch` CLI command. When set, the
@@ -49,8 +52,9 @@ tasks:
     or make LLM calls. Implement in `crates/cli/src/commands/batch.rs`. Add a
     clap arg `--dry-run` (bool flag). Test with a mock task file.
   priority: 50
-  status: pending
+  status: completed
   depends_on: []
+  pr_url: https://github.com/kitplummer/glitchlab/pull/14
 - id: memory-error-thiserror
   objective: |
     The memory crate's `crates/memory/src/error.rs` should use `thiserror` derive
@@ -59,8 +63,9 @@ tasks:
     implementation uses thiserror. If it already does, mark this task as complete.
     If it uses manual `impl Display` / `impl Error`, migrate to `#[derive(thiserror::Error)]`.
   priority: 60
-  status: pending
+  status: completed
   depends_on: []
+  pr_url: https://github.com/kitplummer/glitchlab/pull/15
 - id: orchestrator-duration-tracking
   objective: |
     Add wall-clock duration tracking to `OrchestratorResult` in
@@ -70,5 +75,6 @@ tasks:
     tracing info log. Add a test that verifies duration is non-zero after a
     (mocked) orchestrator run.
   priority: 70
-  status: pending
+  status: completed
   depends_on: []
+  pr_url: https://github.com/kitplummer/glitchlab/pull/16

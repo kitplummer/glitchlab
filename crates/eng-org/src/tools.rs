@@ -8,11 +8,11 @@ use tracing::warn;
 /// Maximum number of results returned by `list_files`.
 const LIST_FILES_CAP: usize = 500;
 
-/// Maximum chars for `run_command` output (~1,500 tokens).
-const RUN_COMMAND_MAX_CHARS: usize = 6_000;
+/// Maximum chars for `run_command` output (~4,000 tokens).
+const RUN_COMMAND_MAX_CHARS: usize = 16_000;
 
-/// Maximum chars for `read_file` output (~3,000 tokens).
-const READ_FILE_MAX_CHARS: usize = 12_000;
+/// Maximum chars for `read_file` output (~12,000 tokens).
+const READ_FILE_MAX_CHARS: usize = 48_000;
 
 /// Truncate tool output to `max_chars`, keeping the **tail** (errors and
 /// summaries tend to appear at the end). Breaks at a newline boundary and
@@ -38,13 +38,21 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".into(),
-            description: "Read the contents of a file relative to the repository root.".into(),
+            description: "Read the contents of a file relative to the repository root. For large files, use start_line and end_line to read a specific range.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "File path relative to the repository root."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Optional 1-based start line number."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Optional 1-based end line number (inclusive)."
                     }
                 },
                 "required": ["path"],
@@ -192,7 +200,40 @@ impl ToolDispatcher {
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|e| format!("failed to read {path}: {e}"))?;
-        Ok(truncate_tool_output(&content, READ_FILE_MAX_CHARS))
+
+        let start_line = input.get("start_line").and_then(|v| v.as_u64());
+        let end_line = input.get("end_line").and_then(|v| v.as_u64());
+
+        let output = match (start_line, end_line) {
+            (Some(s), Some(e)) => {
+                let s = (s as usize).max(1);
+                let e = e as usize;
+                let total_lines = content.lines().count();
+                let numbered: String = content
+                    .lines()
+                    .enumerate()
+                    .filter(|(i, _)| *i + 1 >= s && *i < e)
+                    .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("[lines {s}-{e} of {total_lines}]\n{numbered}")
+            }
+            (Some(s), None) => {
+                let s = (s as usize).max(1);
+                let total_lines = content.lines().count();
+                let numbered: String = content
+                    .lines()
+                    .enumerate()
+                    .filter(|(i, _)| *i + 1 >= s)
+                    .map(|(i, l)| format!("{:>4}| {}", i + 1, l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("[lines {s}-{total_lines} of {total_lines}]\n{numbered}")
+            }
+            _ => content,
+        };
+
+        Ok(truncate_tool_output(&output, READ_FILE_MAX_CHARS))
     }
 
     async fn handle_write_file(&self, input: &serde_json::Value) -> Result<String, String> {
@@ -226,7 +267,29 @@ impl ToolDispatcher {
             .map_err(|e| format!("failed to read {path}: {e}"))?;
 
         if !contents.contains(old_string) {
-            return Err(format!("old_string not found in {path}"));
+            // Provide a hint: show a nearby snippet if the first line matches.
+            let first_line = old_string.lines().next().unwrap_or("").trim();
+            let hint = if !first_line.is_empty() {
+                contents
+                    .lines()
+                    .enumerate()
+                    .find(|(_, l)| l.trim() == first_line)
+                    .map(|(i, _)| {
+                        let start = i.saturating_sub(1);
+                        let end = (i + 4).min(contents.lines().count());
+                        let snippet: Vec<&str> =
+                            contents.lines().skip(start).take(end - start).collect();
+                        format!(
+                            ". Hint: line {} has similar content:\n{}",
+                            start + 1,
+                            snippet.join("\n")
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            return Err(format!("old_string not found in {path}{hint}"));
         }
 
         let new_contents = contents.replacen(old_string, new_string, 1);
@@ -494,6 +557,28 @@ mod tests {
         let result = dispatcher.dispatch(&call).await;
         assert!(!result.is_error);
         assert_eq!(result.content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn read_file_line_range() {
+        let dir = TempDir::new().unwrap();
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("lines.txt"), &content).unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+        let call = make_call(
+            "read_file",
+            json!({"path": "lines.txt", "start_line": 3, "end_line": 5}),
+        );
+        let result = dispatcher.dispatch(&call).await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("line 3"));
+        assert!(result.content.contains("line 5"));
+        assert!(!result.content.contains("line 2"));
+        assert!(!result.content.contains("line 6"));
+        assert!(result.content.contains("[lines 3-5 of 10]"));
     }
 
     #[tokio::test]

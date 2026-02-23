@@ -196,6 +196,7 @@ impl Default for EngConfig {
                 log_dir: ".glitchlab/logs".into(),
             },
             allowed_tools: vec![
+                // Build / test / lint
                 "cargo test".into(),
                 "cargo fmt".into(),
                 "cargo clippy".into(),
@@ -211,6 +212,7 @@ impl Default for EngConfig {
                 "go vet".into(),
                 "mix test".into(),
                 "mix format".into(),
+                // Git / GitHub
                 "git diff".into(),
                 "git add".into(),
                 "git commit".into(),
@@ -219,6 +221,18 @@ impl Default for EngConfig {
                 "gh pr create".into(),
                 "gh issue view".into(),
                 "gh issue list".into(),
+                // Read-only discovery (safe shell commands)
+                "find ".into(),
+                "ls".into(),
+                "cat ".into(),
+                "head ".into(),
+                "tail ".into(),
+                "grep ".into(),
+                "rg ".into(),
+                "wc ".into(),
+                "sed ".into(),
+                "awk ".into(),
+                // Build tool
                 "make".into(),
             ],
             blocked_patterns: vec![

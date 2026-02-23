@@ -29,25 +29,70 @@ impl ToolPolicy {
     }
 
     /// Check whether a command is permitted under this policy.
+    ///
+    /// Handles chained commands (`cmd1 && cmd2`, `cmd1 ; cmd2`, `cmd1 || cmd2`):
+    /// each segment is checked independently. `cd` is always allowed (directory
+    /// change is a harmless shell builtin).
     pub fn check(&self, command: &str) -> std::result::Result<(), String> {
         let trimmed = command.trim();
 
-        // Blocklist takes priority.
+        // Blocklist takes priority — checked against the FULL command string.
         for pattern in &self.blocked {
             if trimmed.contains(pattern.as_str()) {
                 return Err(format!("blocked by pattern `{pattern}`"));
             }
         }
 
-        // Must match at least one allowlist prefix.
-        for prefix in &self.allowed {
-            if trimmed.starts_with(prefix.as_str()) {
-                return Ok(());
+        // Split on shell operators and check each segment.
+        for segment in split_shell_chain(trimmed) {
+            let seg = segment.trim();
+            if seg.is_empty() {
+                continue;
+            }
+            // `cd` is always allowed (harmless shell builtin).
+            if seg == "cd" || seg.starts_with("cd ") {
+                continue;
+            }
+            let mut matched = false;
+            for prefix in &self.allowed {
+                if seg.starts_with(prefix.as_str()) {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return Err(format!("no matching allowlist entry for `{seg}`"));
             }
         }
 
-        Err("no matching allowlist entry".into())
+        Ok(())
     }
+}
+
+/// Split a shell command on `&&`, `||`, and `;` into individual segments.
+fn split_shell_chain(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b';' {
+            segments.push(&command[start..i]);
+            start = i + 1;
+        } else if i + 1 < len && bytes[i] == b'&' && bytes[i + 1] == b'&' {
+            segments.push(&command[start..i]);
+            start = i + 2;
+            i += 1; // skip second '&'
+        } else if i + 1 < len && bytes[i] == b'|' && bytes[i + 1] == b'|' {
+            segments.push(&command[start..i]);
+            start = i + 2;
+            i += 1; // skip second '|'
+        }
+        i += 1;
+    }
+    segments.push(&command[start..]);
+    segments
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +297,29 @@ mod tests {
         // the blocklist should still reject it.
         let policy = ToolPolicy::new(vec!["curl".into()], vec!["curl".into()]);
         assert!(policy.check("curl http://example.com").is_err());
+    }
+
+    #[test]
+    fn chained_commands_allowed() {
+        let policy = test_policy();
+        // cd + allowed command
+        assert!(policy.check("cd crates/router && cargo test").is_ok());
+        assert!(policy.check("cd src ; cargo fmt -- --check").is_ok());
+        // Multiple allowed commands
+        assert!(policy.check("cargo test && cargo fmt -- --check").is_ok());
+        // cd alone
+        assert!(policy.check("cd /tmp").is_ok());
+    }
+
+    #[test]
+    fn chained_commands_blocked() {
+        let policy = test_policy();
+        // One segment is blocked
+        assert!(policy.check("cd /tmp && rm -rf /").is_err());
+        // One segment not on allowlist
+        assert!(policy.check("cd /tmp && python evil.py").is_err());
+        // Blocked pattern in chained command
+        assert!(policy.check("cargo test && curl http://evil.com").is_err());
     }
 
     #[test]
