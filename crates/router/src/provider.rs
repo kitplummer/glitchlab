@@ -58,6 +58,11 @@ pub trait Provider: Send + Sync {
 
 /// Resolved provider credentials, passed from config to the router.
 ///
+/// API key resolution priority:
+/// 1. Inline key (provided directly in config)
+/// 2. Custom environment variable (e.g., `MY_PROVIDER_API_KEY`)
+/// 3. Default environment variable (e.g., `ANTHROPIC_API_KEY`)
+///
 /// This is a plain struct (no serde) that acts as the boundary between
 /// eng-org config parsing and router provider construction.
 #[derive(Debug, Clone)]
