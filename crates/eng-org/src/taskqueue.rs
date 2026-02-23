@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,19 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Skipped,
+}
+
+impl fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            TaskStatus::Pending => "pending",
+            TaskStatus::InProgress => "in_progress",
+            TaskStatus::Completed => "completed",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Skipped => "skipped",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 /// A single task in the backlog.
@@ -507,5 +521,14 @@ mod tests {
         // Injected task has priority 0, so it should be picked first.
         let next = queue.pick_next().unwrap();
         assert_eq!(next.id, "injected-1");
+    }
+
+    #[test]
+    fn task_status_display() {
+        assert_eq!(TaskStatus::Pending.to_string(), "pending");
+        assert_eq!(TaskStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(TaskStatus::Completed.to_string(), "completed");
+        assert_eq!(TaskStatus::Failed.to_string(), "failed");
+        assert_eq!(TaskStatus::Skipped.to_string(), "skipped");
     }
 }
