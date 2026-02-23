@@ -4,6 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod commands;
+#[cfg(test)]
+mod main_test;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
