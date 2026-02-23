@@ -8,6 +8,31 @@ use tracing::warn;
 /// Maximum number of results returned by `list_files`.
 const LIST_FILES_CAP: usize = 500;
 
+/// Maximum chars for `run_command` output (~1,500 tokens).
+const RUN_COMMAND_MAX_CHARS: usize = 6_000;
+
+/// Maximum chars for `read_file` output (~3,000 tokens).
+const READ_FILE_MAX_CHARS: usize = 12_000;
+
+/// Truncate tool output to `max_chars`, keeping the **tail** (errors and
+/// summaries tend to appear at the end). Breaks at a newline boundary and
+/// prepends a `[...truncated N chars]` marker.
+pub(crate) fn truncate_tool_output(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+
+    let skip = s.len() - max_chars;
+    // Find the next newline after the skip point so we break cleanly.
+    let break_at = s[skip..]
+        .find('\n')
+        .map(|pos| skip + pos + 1)
+        .unwrap_or(skip);
+
+    let truncated_count = break_at;
+    format!("[...truncated {truncated_count} chars]\n{}", &s[break_at..])
+}
+
 /// Returns the 5 tool definitions offered to LLMs.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -164,9 +189,10 @@ impl ToolDispatcher {
     async fn handle_read_file(&self, input: &serde_json::Value) -> Result<String, String> {
         let path = extract_str(input, "path")?;
         let resolved = self.resolve_path(path)?;
-        tokio::fs::read_to_string(&resolved)
+        let content = tokio::fs::read_to_string(&resolved)
             .await
-            .map_err(|e| format!("failed to read {path}: {e}"))
+            .map_err(|e| format!("failed to read {path}: {e}"))?;
+        Ok(truncate_tool_output(&content, READ_FILE_MAX_CHARS))
     }
 
     async fn handle_write_file(&self, input: &serde_json::Value) -> Result<String, String> {
@@ -227,7 +253,7 @@ impl ToolDispatcher {
                     output.push_str(&result.stderr);
                 }
                 output.push_str(&format!("\nexit code: {}", result.returncode));
-                Ok(output)
+                Ok(truncate_tool_output(&output, RUN_COMMAND_MAX_CHARS))
             }
             Err(e) => Err(format!("command rejected: {e}")),
         }
@@ -373,6 +399,41 @@ mod tests {
             name: name.into(),
             input,
         }
+    }
+
+    // -- truncate_tool_output --
+
+    #[test]
+    fn truncate_tool_output_short_noop() {
+        let input = "hello world";
+        assert_eq!(truncate_tool_output(input, 100), input);
+    }
+
+    #[test]
+    fn truncate_tool_output_long_keeps_tail() {
+        let lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+        let input = lines.join("\n");
+        let result = truncate_tool_output(&input, 200);
+        assert!(result.starts_with("[...truncated"));
+        assert!(result.contains("chars]"));
+        // The tail (last lines) should be preserved.
+        assert!(result.contains("line 99"));
+        assert!(result.len() <= 200 + 40); // output + marker overhead
+    }
+
+    #[test]
+    fn truncate_tool_output_breaks_at_newline() {
+        let input = "aaaa\nbbbb\ncccc\ndddd\neeee";
+        let result = truncate_tool_output(input, 15);
+        assert!(result.starts_with("[...truncated"));
+        // Should not start mid-line after the marker.
+        let after_marker = result.split_once("]\n").unwrap().1;
+        // The kept portion should start at a line boundary.
+        assert!(
+            after_marker.starts_with("cccc")
+                || after_marker.starts_with("dddd")
+                || after_marker.starts_with("eeee")
+        );
     }
 
     // -- tool_definitions --
