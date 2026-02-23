@@ -14,7 +14,7 @@ use glitchlab_kernel::agent::{AgentContext, ContentBlock, Message, MessageConten
 use glitchlab_kernel::error;
 use glitchlab_kernel::tool::{ToolCall, ToolCallResult, ToolDefinition};
 use glitchlab_router::RouterResponse;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::tools::ToolDispatcher;
 
@@ -244,7 +244,18 @@ pub(crate) async fn tool_use_loop(
         // Execute each tool call and collect results.
         let mut results = Vec::with_capacity(response.tool_calls.len());
         for call in &response.tool_calls {
-            results.push(params.dispatcher.dispatch(call).await);
+            let result = params.dispatcher.dispatch(call).await;
+            if result.is_error {
+                warn!(
+                    role,
+                    tool = call.name.as_str(),
+                    error = result.content.lines().next().unwrap_or(""),
+                    "tool call returned error"
+                );
+            } else {
+                info!(role, tool = call.name.as_str(), "tool call succeeded");
+            }
+            results.push(result);
         }
 
         // Check for stuck agent before appending results.
