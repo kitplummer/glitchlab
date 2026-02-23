@@ -366,6 +366,7 @@ pub(crate) mod test_helpers {
         ) -> ProviderFuture<'_> {
             Box::pin(async move {
                 Ok(RouterResponse {
+                    request_id: String::new(), // Set by router
                     content: r#"{"result": "ok", "steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "trivial", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false, "verdict": "pass", "issues": [], "version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": [], "diagnosis": "none", "root_cause": "none", "files_changed": ["src/new.rs"], "confidence": "high", "should_retry": false, "notes": null, "tests_added": [], "commit_message": "feat: add greet function", "summary": "test", "adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#.into(),
                     model: "mock/test-model".into(),
                     prompt_tokens: 100,
@@ -409,6 +410,7 @@ pub(crate) mod test_helpers {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| RouterResponse {
+                    request_id: String::new(), // Set by router
                     content: "no more responses".into(),
                     model: "mock/test".into(),
                     prompt_tokens: 0,
@@ -457,6 +459,7 @@ pub(crate) mod test_helpers {
     /// Create a simple RouterResponse with no tool calls.
     pub(crate) fn final_response(content: &str) -> RouterResponse {
         RouterResponse {
+            request_id: String::new(), // Set by router
             content: content.into(),
             model: "mock/test".into(),
             prompt_tokens: 50,
@@ -472,6 +475,7 @@ pub(crate) mod test_helpers {
     /// Create a RouterResponse with tool calls.
     pub(crate) fn tool_response(calls: Vec<ToolCall>) -> RouterResponse {
         RouterResponse {
+            request_id: String::new(), // Set by router
             content: String::new(),
             model: "mock/test".into(),
             prompt_tokens: 50,

@@ -7,6 +7,7 @@ use glitchlab_kernel::error;
 use glitchlab_kernel::tool::ToolDefinition;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::chooser::ModelChooser;
 use crate::provider::anthropic::AnthropicProvider;
@@ -124,6 +125,7 @@ impl Router {
     ///
     /// Resolves role → model → provider, checks budget, calls the API,
     /// records usage, and retries on transient failures.
+    #[tracing::instrument(skip(self, messages, response_format), fields(request_id))]
     pub async fn complete(
         &self,
         role: &str,
@@ -132,6 +134,10 @@ impl Router {
         max_tokens: u32,
         response_format: Option<&serde_json::Value>,
     ) -> error::Result<RouterResponse> {
+        // Generate unique request ID
+        let request_id = Uuid::new_v4().to_string();
+        tracing::Span::current().record("request_id", &request_id);
+
         // Check budget before calling.
         {
             let budget = self.budget.lock().await;
@@ -150,7 +156,7 @@ impl Router {
             ))
         })?;
 
-        info!(role, model = %model_string, "router: calling LLM");
+        info!(role, model = %model_string, request_id = %request_id, "router: calling LLM");
 
         // Call with retry (up to 5 attempts on transient/overload errors).
         let mut last_err = None;
@@ -159,7 +165,10 @@ impl Router {
                 .complete(model_id, messages, temperature, max_tokens, response_format)
                 .await
             {
-                Ok(response) => {
+                Ok(mut response) => {
+                    // Set the request_id in the response
+                    response.request_id = request_id.clone();
+
                     // Record usage.
                     let mut budget = self.budget.lock().await;
                     budget.record(
@@ -171,6 +180,7 @@ impl Router {
                     info!(
                         role,
                         model = %response.model,
+                        request_id = %request_id,
                         tokens = response.total_tokens,
                         cost = format!("${:.4}", response.cost),
                         latency_ms = response.latency_ms,
@@ -185,6 +195,7 @@ impl Router {
                     warn!(
                         role,
                         attempt,
+                        request_id = %request_id,
                         wait_ms = wait,
                         "router: rate limited / overloaded, retrying"
                     );
@@ -196,6 +207,7 @@ impl Router {
                     warn!(
                         role,
                         attempt,
+                        request_id = %request_id,
                         error = %e,
                         "router: transient HTTP error, retrying"
                     );
@@ -224,6 +236,7 @@ impl Router {
     ///
     /// Same as `complete()` — resolves role, checks budget, retries — but
     /// passes tool definitions through to the provider.
+    #[tracing::instrument(skip(self, messages, tools, response_format), fields(request_id))]
     pub async fn complete_with_tools(
         &self,
         role: &str,
@@ -233,6 +246,10 @@ impl Router {
         tools: &[ToolDefinition],
         response_format: Option<&serde_json::Value>,
     ) -> error::Result<RouterResponse> {
+        // Generate unique request ID
+        let request_id = Uuid::new_v4().to_string();
+        tracing::Span::current().record("request_id", &request_id);
+
         // Check budget before calling.
         {
             let budget = self.budget.lock().await;
@@ -254,6 +271,7 @@ impl Router {
         info!(
             role,
             model = %model_string,
+            request_id = %request_id,
             tool_count = tools.len(),
             "router: calling LLM with tools"
         );
@@ -272,7 +290,10 @@ impl Router {
                 )
                 .await
             {
-                Ok(response) => {
+                Ok(mut response) => {
+                    // Set the request_id in the response
+                    response.request_id = request_id.clone();
+
                     // Record usage.
                     let mut budget = self.budget.lock().await;
                     budget.record(
@@ -284,6 +305,7 @@ impl Router {
                     info!(
                         role,
                         model = %response.model,
+                        request_id = %request_id,
                         tokens = response.total_tokens,
                         cost = format!("${:.4}", response.cost),
                         latency_ms = response.latency_ms,
@@ -298,6 +320,7 @@ impl Router {
                     warn!(
                         role,
                         attempt,
+                        request_id = %request_id,
                         wait_ms = wait,
                         "router: rate limited / overloaded, retrying"
                     );
@@ -309,6 +332,7 @@ impl Router {
                     warn!(
                         role,
                         attempt,
+                        request_id = %request_id,
                         error = %e,
                         "router: transient HTTP error, retrying"
                     );
@@ -436,6 +460,7 @@ mod tests {
         fn ok() -> Self {
             Self {
                 response: RouterResponse {
+                    request_id: String::new(), // Will be set by router
                     content: r#"{"result": "ok"}"#.into(),
                     model: "mock/test-model".into(),
                     prompt_tokens: 100,
@@ -673,9 +698,58 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // -----------------------------------------------------------------------
-    // complete_with_tools tests
-    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn request_id_is_unique_and_valid_uuid() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget);
+        router.register_provider("mock".into(), Arc::new(MockProvider::ok()));
+
+        // Make multiple requests
+        let response1 = router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await
+            .unwrap();
+        let response2 = router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await
+            .unwrap();
+
+        // Check that request_ids are non-empty
+        assert!(!response1.request_id.is_empty());
+        assert!(!response2.request_id.is_empty());
+
+        // Check that request_ids are unique
+        assert_ne!(response1.request_id, response2.request_id);
+
+        // Check that request_ids are valid UUIDs
+        assert!(uuid::Uuid::parse_str(&response1.request_id).is_ok());
+        assert!(uuid::Uuid::parse_str(&response2.request_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_id_in_tools_response() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget);
+        router.register_provider("mock".into(), Arc::new(MockToolProvider::with_tool_call()));
+
+        let response = router
+            .complete_with_tools(
+                "planner",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Check that request_id is present and valid
+        assert!(!response.request_id.is_empty());
+        assert!(uuid::Uuid::parse_str(&response.request_id).is_ok());
+    }
 
     fn test_tool_defs() -> Vec<ToolDefinition> {
         vec![ToolDefinition {
@@ -699,6 +773,7 @@ mod tests {
         fn with_tool_call() -> Self {
             Self {
                 response: RouterResponse {
+                    request_id: String::new(), // Will be set by router
                     content: String::new(),
                     model: "mock/test-model".into(),
                     prompt_tokens: 100,

@@ -56,6 +56,7 @@ impl Provider for SequentialMockProvider {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| RouterResponse {
+                request_id: String::new(), // Set by router
                 content: "no more responses".into(),
                 model: "mock/test".into(),
                 prompt_tokens: 0,
@@ -84,6 +85,7 @@ impl Provider for SequentialMockProvider {
 
 fn final_response(content: &str) -> RouterResponse {
     RouterResponse {
+        request_id: String::new(), // Set by router
         content: content.into(),
         model: "mock/test".into(),
         prompt_tokens: 50,
@@ -98,6 +100,7 @@ fn final_response(content: &str) -> RouterResponse {
 
 fn tool_response(calls: Vec<ToolCall>) -> RouterResponse {
     RouterResponse {
+        request_id: String::new(), // Set by router
         content: String::new(),
         model: "mock/test".into(),
         prompt_tokens: 50,

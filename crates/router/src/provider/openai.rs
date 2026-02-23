@@ -146,6 +146,7 @@ impl OpenAiProvider {
             estimate_openai_cost(&self.provider_name, model, prompt_tokens, completion_tokens);
 
         Ok(RouterResponse {
+            request_id: String::new(), // Set by router
             content,
             model: format!("{}/{model}", self.provider_name),
             prompt_tokens,
