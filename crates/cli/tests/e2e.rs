@@ -314,6 +314,90 @@ async fn cli_run_records_history() {
     server_handle.abort();
 }
 
+/// Test that `glitchlab history` works with the default (JSONL-only) backend.
+#[tokio::test]
+async fn history_command_uses_composite_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let _base_branch = init_test_repo(dir.path());
+
+    // Initialize glitchlab
+    let init_output = Command::new(glitchlab_bin())
+        .args(["init", dir.path().to_str().unwrap()])
+        .output()
+        .await
+        .unwrap();
+    assert!(init_output.status.success());
+
+    // Create .glitchlab/logs directory
+    let logs_dir = dir.path().join(".glitchlab/logs");
+    std::fs::create_dir_all(&logs_dir).unwrap();
+
+    // Manually add a dummy history entry to the JSONL file
+    let history_file = logs_dir.join("history.jsonl");
+    let dummy_entry = serde_json::json!({
+        "timestamp": "2024-01-01T00:00:00Z",
+        "task_id": "test-task-123",
+        "status": "committed",
+        "pr_url": null,
+        "branch": "test-branch",
+        "error": null,
+        "budget": {
+            "estimated_cost": 0.05,
+            "total_tokens": 1000,
+            "input_tokens": 800,
+            "output_tokens": 200
+        },
+        "events_summary": {
+            "total_events": 5,
+            "planning_events": 1,
+            "implementation_events": 3,
+            "verification_events": 1
+        },
+        "stage_outputs": null,
+        "events": null
+    });
+    std::fs::write(&history_file, format!("{}\n", dummy_entry)).unwrap();
+
+    // Run `glitchlab history` and verify it reads the entry
+    let hist_output = Command::new(glitchlab_bin())
+        .args([
+            "history",
+            "--repo",
+            dir.path().to_str().unwrap(),
+            "--count",
+            "5",
+        ])
+        .output()
+        .await
+        .unwrap();
+
+    let hist_stderr = String::from_utf8_lossy(&hist_output.stderr);
+    let hist_stdout = String::from_utf8_lossy(&hist_output.stdout);
+
+    assert!(
+        hist_output.status.success(),
+        "history command failed: {hist_stderr}"
+    );
+
+    // Verify the dummy entry appears in the output
+    assert!(
+        hist_stdout.contains("test-task-123"),
+        "history output should contain test-task-123:\nstdout: {hist_stdout}\nstderr: {hist_stderr}"
+    );
+    assert!(
+        hist_stdout.contains("committed"),
+        "history output should contain status 'committed':\nstdout: {hist_stdout}\nstderr: {hist_stderr}"
+    );
+    assert!(
+        hist_stdout.contains("$0.0500"),
+        "history output should contain cost '$0.0500':\nstdout: {hist_stdout}\nstderr: {hist_stderr}"
+    );
+    assert!(
+        hist_stdout.contains("1000 tokens"),
+        "history output should contain '1000 tokens':\nstdout: {hist_stdout}\nstderr: {hist_stderr}"
+    );
+}
+
 /// E2E failure path: tests fail → history records the failure → `glitchlab history`
 /// shows it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
