@@ -75,7 +75,7 @@ impl Agent for PlannerAgent {
         let json_fmt = json_response_format();
         let response = self
             .router
-            .complete("planner", &messages, 0.2, 4096, Some(&json_fmt))
+            .complete("planner", &messages, 0.2, 16_384, Some(&json_fmt))
             .await?;
 
         let metadata = AgentMetadata {
