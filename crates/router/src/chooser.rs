@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 // ---------------------------------------------------------------------------
 // ModelChooser — rule-based cost-aware model routing (Tier 1)
@@ -30,6 +31,17 @@ impl ModelTier {
             Self::Standard => Self::Economy,
             Self::Economy => Self::Economy,
         }
+    }
+}
+
+impl fmt::Display for ModelTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Economy => "economy",
+            Self::Standard => "standard",
+            Self::Premium => "premium",
+        };
+        write!(f, "{}", s)
     }
 }
 
@@ -419,5 +431,12 @@ mod tests {
         let pref = RolePreference::default();
         assert_eq!(pref.min_tier, ModelTier::Economy);
         assert!(pref.required_capabilities.is_empty());
+    }
+
+    #[test]
+    fn model_tier_display() {
+        assert_eq!(ModelTier::Economy.to_string(), "economy");
+        assert_eq!(ModelTier::Standard.to_string(), "standard");
+        assert_eq!(ModelTier::Premium.to_string(), "premium");
     }
 }
