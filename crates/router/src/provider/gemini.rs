@@ -209,11 +209,22 @@ impl GeminiProvider {
             .next()
             .ok_or_else(|| ProviderError::Parse("no candidates in response".into()))?;
 
+        // Handle error finish reasons where content is absent.
+        if let Some(ref reason) = candidate.finish_reason
+            && (reason == "MALFORMED_FUNCTION_CALL" || reason == "SAFETY")
+        {
+            return Err(ProviderError::RateLimited {
+                retry_after_ms: Some(500),
+            });
+        }
+
+        let parts = candidate.content.map(|c| c.parts).unwrap_or_default();
+
         let mut text_parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut call_idx = 0u32;
 
-        for part in candidate.content.parts {
+        for part in parts {
             match part {
                 GeminiResponsePart::Text { text } => {
                     text_parts.push(text);
@@ -481,7 +492,10 @@ struct GeminiResponse {
 
 #[derive(Deserialize)]
 struct GeminiCandidate {
-    content: GeminiCandidateContent,
+    /// Content may be absent when `finishReason` is an error like
+    /// `MALFORMED_FUNCTION_CALL` or `SAFETY`.
+    #[serde(default)]
+    content: Option<GeminiCandidateContent>,
     #[serde(rename = "finishReason")]
     #[serde(default)]
     finish_reason: Option<String>,
