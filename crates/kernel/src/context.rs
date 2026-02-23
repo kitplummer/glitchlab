@@ -96,18 +96,23 @@ impl ContextAssembler {
         let mut sorted: Vec<&ContextSegment> = segments.iter().collect();
         sorted.sort_by_key(|s| s.priority);
 
-        let mut system_parts: Vec<&str> = Vec::new();
-        let mut user_parts: Vec<&str> = Vec::new();
+        let mut owned_parts: Vec<String> = Vec::new();
         let mut used_tokens = 0;
         let mut included = Vec::new();
         let mut dropped = Vec::new();
 
+        // Track which owned_parts indices are system vs user.
+        let mut system_indices: Vec<usize> = Vec::new();
+        let mut user_indices: Vec<usize> = Vec::new();
+
         for segment in &sorted {
             if used_tokens + segment.estimated_tokens <= self.max_tokens {
                 // Fits entirely.
+                let idx = owned_parts.len();
+                owned_parts.push(segment.content.clone());
                 match segment.kind {
-                    SegmentKind::SystemPrompt => system_parts.push(&segment.content),
-                    _ => user_parts.push(&segment.content),
+                    SegmentKind::SystemPrompt => system_indices.push(idx),
+                    _ => user_indices.push(idx),
                 }
                 used_tokens += segment.estimated_tokens;
                 included.push(segment.kind);
@@ -118,13 +123,11 @@ impl ContextAssembler {
                     // Worth truncating if we can fit >100 tokens.
                     let truncated = truncate_to_tokens(&segment.content, remaining);
                     let truncated_tokens = estimate_tokens(&truncated);
+                    let idx = owned_parts.len();
+                    owned_parts.push(truncated);
                     match segment.kind {
-                        SegmentKind::SystemPrompt => system_parts.push(
-                            // Leak is fine here — we're building a one-shot result.
-                            // In practice, use a collected String.
-                            Box::leak(truncated.into_boxed_str()),
-                        ),
-                        _ => user_parts.push(Box::leak(truncated.into_boxed_str())),
+                        SegmentKind::SystemPrompt => system_indices.push(idx),
+                        _ => user_indices.push(idx),
                     }
                     used_tokens += truncated_tokens;
                     included.push(segment.kind);
@@ -134,14 +137,25 @@ impl ContextAssembler {
             }
         }
 
+        let system_text = system_indices
+            .iter()
+            .map(|&i| owned_parts[i].as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let user_text = user_indices
+            .iter()
+            .map(|&i| owned_parts[i].as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+
         let messages = vec![
             Message {
                 role: MessageRole::System,
-                content: MessageContent::Text(system_parts.join("\n\n")),
+                content: MessageContent::Text(system_text),
             },
             Message {
                 role: MessageRole::User,
-                content: MessageContent::Text(user_parts.join("\n\n---\n\n")),
+                content: MessageContent::Text(user_text),
             },
         ];
 
@@ -235,7 +249,7 @@ pub struct AssemblyResult {
 /// Rough token estimate: ~4 characters per token.
 /// This is a conservative approximation. Real tokenizers vary by model,
 /// but for budget/truncation decisions this is good enough.
-fn estimate_tokens(text: &str) -> usize {
+pub fn estimate_tokens(text: &str) -> usize {
     // Use byte length / 4 as a rough estimate.
     // This is deliberately conservative (overestimates for ASCII,
     // reasonable for mixed content).
@@ -244,7 +258,7 @@ fn estimate_tokens(text: &str) -> usize {
 
 /// Truncate text to approximately `max_tokens` tokens.
 /// Tries to break at a newline boundary for cleaner output.
-fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
+pub fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
     let max_chars = max_tokens * 4;
     if text.len() <= max_chars {
         return text.to_string();

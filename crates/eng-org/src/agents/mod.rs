@@ -27,6 +27,69 @@ pub(crate) struct ToolLoopParams<'a> {
     pub max_turns: u32,
     pub temperature: f32,
     pub max_tokens: u32,
+    /// Approximate token budget for the message history. When exceeded,
+    /// old `ToolResult` content is replaced with one-line summaries to
+    /// stay within budget. Set to `usize::MAX` to disable pruning.
+    pub context_token_budget: usize,
+}
+
+/// Estimate the total token count of a message list using the ~4 chars/token
+/// heuristic. Counts all text, tool-use JSON, and tool-result content.
+pub(crate) fn estimate_message_tokens(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| match &m.content {
+            MessageContent::Text(s) => s.len(),
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .map(|b| match b {
+                    ContentBlock::Text { text } => text.len(),
+                    ContentBlock::ToolUse(tc) => tc.input.to_string().len() + tc.name.len(),
+                    ContentBlock::ToolResult(tr) => tr.content.len(),
+                })
+                .sum(),
+        })
+        .sum::<usize>()
+        .div_ceil(4)
+}
+
+/// Prune old tool-result content when the message history exceeds `budget` tokens.
+///
+/// Strategy:
+/// - Preserve the first 2 messages (system prompt + initial user message) and
+///   the last 4 messages (most recent 2 turn-pairs) untouched.
+/// - Never modify assistant `ToolUse` blocks (API requires paired IDs).
+/// - Replace old `ToolResult` content with a one-line summary.
+pub(crate) fn prune_messages(messages: &mut [Message], budget: usize) {
+    if estimate_message_tokens(messages) <= budget {
+        return;
+    }
+
+    let len = messages.len();
+    // Preserve first 2 (system + user) and last 4 (2 turn-pairs).
+    let protect_head = 2.min(len);
+    let protect_tail = 4.min(len);
+    let protect_tail_start = len.saturating_sub(protect_tail);
+
+    for msg in &mut messages[protect_head..protect_tail_start] {
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            for block in blocks.iter_mut() {
+                if let ContentBlock::ToolResult(result) = block {
+                    let first_line = result
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
+                    let original_len = result.content.len();
+                    let status = if result.is_error { "err" } else { "ok" };
+                    result.content = format!("[{status}: {first_line}... ({original_len} chars)]");
+                }
+            }
+        }
+    }
 }
 
 /// Shared tool-use execution loop for agents that support iterative tool use.
@@ -42,6 +105,8 @@ pub(crate) async fn tool_use_loop(
     let mut turns = 0u32;
 
     loop {
+        prune_messages(messages, params.context_token_budget);
+
         let response = router
             .complete_with_tools(
                 role,
@@ -464,6 +529,7 @@ mod tests {
             max_turns: 20,
             temperature: 0.2,
             max_tokens: 4096,
+            context_token_budget: usize::MAX,
         };
         let resp = tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
@@ -504,6 +570,7 @@ mod tests {
             max_turns: 20,
             temperature: 0.2,
             max_tokens: 4096,
+            context_token_budget: usize::MAX,
         };
         let resp = tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
@@ -563,6 +630,7 @@ mod tests {
             max_turns: 3,
             temperature: 0.2,
             max_tokens: 4096,
+            context_token_budget: usize::MAX,
         };
         let resp = tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
@@ -603,6 +671,7 @@ mod tests {
             max_turns: 20,
             temperature: 0.2,
             max_tokens: 4096,
+            context_token_budget: usize::MAX,
         };
         let resp = tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
@@ -645,6 +714,7 @@ mod tests {
             max_turns: 20,
             temperature: 0.2,
             max_tokens: 4096,
+            context_token_budget: usize::MAX,
         };
         tool_use_loop(&router, "implementer", &mut messages, &params)
             .await
@@ -661,6 +731,194 @@ mod tests {
             } else {
                 panic!("expected ToolResult block");
             }
+        }
+    }
+
+    // --- estimate_message_tokens tests ---
+
+    #[test]
+    fn estimate_message_tokens_text() {
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: MessageContent::Text("x".repeat(400)),
+        }];
+        let tokens = estimate_message_tokens(&messages);
+        assert_eq!(tokens, 100); // 400 chars / 4
+    }
+
+    #[test]
+    fn estimate_message_tokens_blocks() {
+        use glitchlab_kernel::tool::ToolCallResult;
+
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult(ToolCallResult {
+                tool_call_id: "c1".into(),
+                content: "x".repeat(800),
+                is_error: false,
+            })]),
+        }];
+        let tokens = estimate_message_tokens(&messages);
+        assert_eq!(tokens, 200); // 800 chars / 4
+    }
+
+    // --- prune_messages tests ---
+
+    fn make_tool_result_msg(id: &str, content: &str, is_error: bool) -> Message {
+        use glitchlab_kernel::tool::ToolCallResult;
+        Message {
+            role: MessageRole::User,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult(ToolCallResult {
+                tool_call_id: id.into(),
+                content: content.into(),
+                is_error,
+            })]),
+        }
+    }
+
+    fn make_assistant_tool_use_msg(id: &str) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse(
+                glitchlab_kernel::tool::ToolCall {
+                    id: id.into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "f.txt"}),
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn prune_messages_under_budget_noop() {
+        let mut messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: MessageContent::Text("system".into()),
+            },
+            Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("task".into()),
+            },
+            make_assistant_tool_use_msg("c1"),
+            make_tool_result_msg("c1", "short result", false),
+        ];
+        let original = messages.clone();
+        prune_messages(&mut messages, usize::MAX);
+        // Nothing should change.
+        assert_eq!(messages.len(), original.len());
+        if let MessageContent::Blocks(blocks) = &messages[3].content
+            && let ContentBlock::ToolResult(r) = &blocks[0]
+        {
+            assert_eq!(r.content, "short result");
+        }
+    }
+
+    #[test]
+    fn prune_messages_compresses_old_results() {
+        let big_content = "x".repeat(4000);
+        let mut messages = vec![
+            // Index 0: system (protected head)
+            Message {
+                role: MessageRole::System,
+                content: MessageContent::Text("system".into()),
+            },
+            // Index 1: user (protected head)
+            Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("task".into()),
+            },
+            // Index 2: assistant tool use (middle — eligible but is ToolUse, not ToolResult)
+            make_assistant_tool_use_msg("c1"),
+            // Index 3: tool result (middle — should be compressed)
+            make_tool_result_msg("c1", &big_content, false),
+            // Index 4: assistant tool use (middle)
+            make_assistant_tool_use_msg("c2"),
+            // Index 5: tool result (middle — should be compressed)
+            make_tool_result_msg("c2", &big_content, false),
+            // Last 4 (protected tail):
+            // Index 6: assistant tool use
+            make_assistant_tool_use_msg("c3"),
+            // Index 7: tool result
+            make_tool_result_msg("c3", &big_content, false),
+            // Index 8: assistant tool use
+            make_assistant_tool_use_msg("c4"),
+            // Index 9: tool result
+            make_tool_result_msg("c4", "final result", false),
+        ];
+
+        // Budget is tiny so pruning must fire.
+        prune_messages(&mut messages, 100);
+
+        // Middle tool results (indices 3, 5) should be compressed.
+        if let MessageContent::Blocks(blocks) = &messages[3].content
+            && let ContentBlock::ToolResult(r) = &blocks[0]
+        {
+            assert!(
+                r.content.starts_with("[ok:"),
+                "expected compressed, got: {}",
+                r.content
+            );
+            assert!(r.content.contains("chars)]"));
+            assert_eq!(r.tool_call_id, "c1"); // ID preserved
+        }
+        if let MessageContent::Blocks(blocks) = &messages[5].content
+            && let ContentBlock::ToolResult(r) = &blocks[0]
+        {
+            assert!(r.content.starts_with("[ok:"));
+        }
+
+        // Tail tool results (indices 7, 9) should be untouched.
+        if let MessageContent::Blocks(blocks) = &messages[7].content
+            && let ContentBlock::ToolResult(r) = &blocks[0]
+        {
+            assert_eq!(r.content, big_content);
+        }
+        if let MessageContent::Blocks(blocks) = &messages[9].content
+            && let ContentBlock::ToolResult(r) = &blocks[0]
+        {
+            assert_eq!(r.content, "final result");
+        }
+
+        // Head messages should be untouched.
+        assert_eq!(messages[0].content.text(), "system");
+        assert_eq!(messages[1].content.text(), "task");
+
+        // Assistant ToolUse blocks should be untouched.
+        if let MessageContent::Blocks(blocks) = &messages[2].content {
+            assert!(matches!(&blocks[0], ContentBlock::ToolUse(tc) if tc.id == "c1"));
+        }
+    }
+
+    #[test]
+    fn prune_messages_preserves_error_status() {
+        let mut messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: MessageContent::Text("s".into()),
+            },
+            Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("t".into()),
+            },
+            make_assistant_tool_use_msg("c1"),
+            make_tool_result_msg("c1", &"e".repeat(2000), true),
+            // Tail (last 4):
+            make_assistant_tool_use_msg("c2"),
+            make_tool_result_msg("c2", "ok", false),
+            make_assistant_tool_use_msg("c3"),
+            make_tool_result_msg("c3", "ok", false),
+        ];
+
+        prune_messages(&mut messages, 10);
+
+        if let MessageContent::Blocks(blocks) = &messages[3].content
+            && let ContentBlock::ToolResult(r) = &blocks[0]
+        {
+            assert!(
+                r.content.starts_with("[err:"),
+                "error status should be preserved"
+            );
         }
     }
 }

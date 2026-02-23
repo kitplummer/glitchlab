@@ -96,6 +96,7 @@ impl Agent for DebuggerAgent {
             max_turns: self.max_tool_turns,
             temperature: 0.2,
             max_tokens: 4096,
+            context_token_budget: 60_000,
         };
         let response = tool_use_loop(&self.router, "debugger", &mut messages, &params).await?;
 
