@@ -224,6 +224,7 @@ env/
 # GLITCHLAB runtime
 .glitchlab/worktrees/
 .glitchlab/logs/
+.glitchlab/secrets.yaml
 
 # IDE
 .vscode/

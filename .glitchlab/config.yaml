@@ -51,3 +51,9 @@ routing:
       min_tier: economy
 
   cost_quality_threshold: 0.7
+
+providers:
+  gemini:
+    api_key_env: GEMINI_API_KEY
+  anthropic:
+    api_key_env: ANTHROPIC_API_KEY

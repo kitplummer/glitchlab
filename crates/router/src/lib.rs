@@ -4,5 +4,6 @@ pub mod response;
 pub mod router;
 
 pub use chooser::ModelChooser;
+pub use provider::ProviderInit;
 pub use response::RouterResponse;
 pub use router::Router;

@@ -52,6 +52,26 @@ pub trait Provider: Send + Sync {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ProviderInit — boundary type between config and router
+// ---------------------------------------------------------------------------
+
+/// Resolved provider credentials, passed from config to the router.
+///
+/// This is a plain struct (no serde) that acts as the boundary between
+/// eng-org config parsing and router provider construction.
+#[derive(Debug, Clone)]
+pub struct ProviderInit {
+    /// Provider kind: "anthropic", "gemini", "openai", or a custom name.
+    pub kind: String,
+    /// Resolved API key.
+    pub api_key: String,
+    /// Optional base URL override.
+    pub base_url: Option<String>,
+    /// Display/map key (defaults to kind if not set).
+    pub name: Option<String>,
+}
+
 /// Errors from a provider.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -107,5 +127,29 @@ mod tests {
         let (provider, model) = parse_model_string("gpt-4o");
         assert_eq!(provider, "openai");
         assert_eq!(model, "gpt-4o");
+    }
+
+    #[test]
+    fn provider_init_fields() {
+        let init = ProviderInit {
+            kind: "anthropic".into(),
+            api_key: "sk-test".into(),
+            base_url: Some("http://localhost:8080".into()),
+            name: Some("my-anthropic".into()),
+        };
+        assert_eq!(init.kind, "anthropic");
+        assert_eq!(init.api_key, "sk-test");
+        assert_eq!(init.base_url.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(init.name.as_deref(), Some("my-anthropic"));
+
+        // Default name is None.
+        let init2 = ProviderInit {
+            kind: "openai".into(),
+            api_key: "key".into(),
+            base_url: None,
+            name: None,
+        };
+        assert!(init2.base_url.is_none());
+        assert!(init2.name.is_none());
     }
 }

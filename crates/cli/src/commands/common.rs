@@ -58,7 +58,8 @@ pub async fn setup_pipeline(
         config.limits.max_tokens_per_task,
         config.limits.max_dollars_per_task,
     );
-    let mut router = Router::new(config.routing_map(), budget);
+    let provider_inits = config.resolve_providers();
+    let mut router = Router::with_providers(config.routing_map(), budget, provider_inits);
     if let Some(chooser) = config.build_chooser() {
         router = router.with_chooser(chooser);
     }

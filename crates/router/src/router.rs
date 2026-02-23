@@ -12,7 +12,7 @@ use crate::chooser::ModelChooser;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::gemini::GeminiProvider;
 use crate::provider::openai::OpenAiProvider;
-use crate::provider::{Provider, ProviderError, parse_model_string};
+use crate::provider::{Provider, ProviderError, ProviderInit, parse_model_string};
 use crate::response::RouterResponse;
 
 // ---------------------------------------------------------------------------
@@ -43,16 +43,40 @@ impl Router {
     /// Missing API keys are not an error until a model from that
     /// provider is actually requested.
     pub fn new(routing: HashMap<String, String>, budget: BudgetTracker) -> Self {
+        Self::with_providers(routing, budget, HashMap::new())
+    }
+
+    /// Build a router with pre-resolved provider credentials.
+    ///
+    /// For each entry in `init_configs`, creates the appropriate provider.
+    /// For known providers ("anthropic", "gemini", "openai") not present
+    /// in `init_configs`, falls back to the existing `from_env()` behavior.
+    pub fn with_providers(
+        routing: HashMap<String, String>,
+        budget: BudgetTracker,
+        init_configs: HashMap<String, ProviderInit>,
+    ) -> Self {
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
 
-        // Try to initialize each provider from env.
-        if let Ok(p) = AnthropicProvider::from_env() {
+        // Create providers from explicit init configs.
+        for (name, init) in &init_configs {
+            providers.insert(name.clone(), Arc::from(create_provider(init)));
+        }
+
+        // Fall back to env for known providers not in init_configs.
+        if !providers.contains_key("anthropic")
+            && let Ok(p) = AnthropicProvider::from_env()
+        {
             providers.insert("anthropic".into(), Arc::new(p));
         }
-        if let Ok(p) = OpenAiProvider::openai_from_env() {
+        if !providers.contains_key("openai")
+            && let Ok(p) = OpenAiProvider::openai_from_env()
+        {
             providers.insert("openai".into(), Arc::new(p));
         }
-        if let Ok(p) = GeminiProvider::from_env() {
+        if !providers.contains_key("gemini")
+            && let Ok(p) = GeminiProvider::from_env()
+        {
             providers.insert("gemini".into(), Arc::new(p));
         }
 
@@ -340,6 +364,58 @@ impl Router {
     /// Check if budget is exceeded.
     pub async fn budget_exceeded(&self) -> bool {
         self.budget.lock().await.exceeded()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provider factory
+// ---------------------------------------------------------------------------
+
+/// Create a provider instance from a `ProviderInit`.
+///
+/// Matches on `init.kind`:
+/// - `"anthropic"` → `AnthropicProvider`
+/// - `"gemini"` → `GeminiProvider`
+/// - `"openai"` or anything else → `OpenAiProvider` (OpenAI-compatible)
+///
+/// For OpenAI-compatible providers, if `base_url` ends with `/v1`,
+/// `/chat/completions` is appended automatically.
+fn create_provider(init: &ProviderInit) -> Box<dyn Provider> {
+    let name = init.name.clone().unwrap_or_else(|| init.kind.clone());
+
+    match init.kind.as_str() {
+        "anthropic" => match &init.base_url {
+            Some(url) => Box::new(AnthropicProvider::with_base_url(
+                init.api_key.clone(),
+                url.clone(),
+            )),
+            None => Box::new(AnthropicProvider::new(init.api_key.clone())),
+        },
+        "gemini" => match &init.base_url {
+            Some(url) => Box::new(GeminiProvider::with_base_url(
+                init.api_key.clone(),
+                url.clone(),
+            )),
+            None => Box::new(GeminiProvider::new(init.api_key.clone())),
+        },
+        _ => {
+            // OpenAI-compatible (including "openai" and custom providers).
+            let base_url = match &init.base_url {
+                Some(url) => normalize_openai_url(url),
+                None => "https://api.openai.com/v1/chat/completions".into(),
+            };
+            Box::new(OpenAiProvider::new(init.api_key.clone(), base_url, name))
+        }
+    }
+}
+
+/// If a URL ends with `/v1`, append `/chat/completions` for convenience.
+fn normalize_openai_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{trimmed}/chat/completions")
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -891,5 +967,163 @@ mod tests {
             .complete("planner", &test_messages(), 0.2, 4096, None)
             .await;
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // with_providers / create_provider tests
+    // -----------------------------------------------------------------------
+
+    use crate::provider::ProviderInit;
+
+    #[test]
+    fn with_providers_creates_provider() {
+        let init = ProviderInit {
+            kind: "anthropic".into(),
+            api_key: "test-key".into(),
+            base_url: None,
+            name: None,
+        };
+        let inits = HashMap::from([("anthropic".into(), init)]);
+        let routing = HashMap::from([("planner".into(), "anthropic/claude-test".into())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+
+        let router = Router::with_providers(routing, budget, inits);
+        // The anthropic provider should be registered.
+        assert!(router.providers.contains_key("anthropic"));
+    }
+
+    #[test]
+    fn with_providers_env_fallback() {
+        // Providers not in init_configs still try from_env().
+        let routing = HashMap::new();
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::with_providers(routing, budget, HashMap::new());
+
+        // We can't guarantee env vars are set, but the function should not panic.
+        // Equivalent to Router::new().
+        let _ = router.preflight_check();
+    }
+
+    #[test]
+    fn with_providers_config_overrides_env() {
+        // When config provides "anthropic", env fallback should NOT override it.
+        let init = ProviderInit {
+            kind: "anthropic".into(),
+            api_key: "from-config".into(),
+            base_url: Some("http://config-host".into()),
+            name: None,
+        };
+        let inits = HashMap::from([("anthropic".into(), init)]);
+        let routing = HashMap::new();
+        let budget = BudgetTracker::new(100_000, 10.0);
+
+        let router = Router::with_providers(routing, budget, inits);
+        // anthropic should be present (from config, not env).
+        assert!(router.providers.contains_key("anthropic"));
+    }
+
+    #[test]
+    fn new_delegates_to_with_providers() {
+        // Router::new() should behave the same as with_providers(empty).
+        let routing = HashMap::from([("planner".into(), "mock/test".into())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let r1 = Router::new(routing.clone(), budget.clone());
+        let r2 = Router::with_providers(routing, budget, HashMap::new());
+
+        // Both should have the same provider set (env-based).
+        assert_eq!(r1.providers.len(), r2.providers.len());
+        for key in r1.providers.keys() {
+            assert!(r2.providers.contains_key(key));
+        }
+    }
+
+    #[test]
+    fn create_provider_anthropic() {
+        let init = ProviderInit {
+            kind: "anthropic".into(),
+            api_key: "key".into(),
+            base_url: None,
+            name: None,
+        };
+        let _provider = super::create_provider(&init);
+    }
+
+    #[test]
+    fn create_provider_anthropic_with_base_url() {
+        let init = ProviderInit {
+            kind: "anthropic".into(),
+            api_key: "key".into(),
+            base_url: Some("http://localhost:8080".into()),
+            name: None,
+        };
+        let _provider = super::create_provider(&init);
+    }
+
+    #[test]
+    fn create_provider_gemini() {
+        let init = ProviderInit {
+            kind: "gemini".into(),
+            api_key: "key".into(),
+            base_url: None,
+            name: None,
+        };
+        let _provider = super::create_provider(&init);
+    }
+
+    #[test]
+    fn create_provider_gemini_with_base_url() {
+        let init = ProviderInit {
+            kind: "gemini".into(),
+            api_key: "key".into(),
+            base_url: Some("http://localhost:9090".into()),
+            name: None,
+        };
+        let _provider = super::create_provider(&init);
+    }
+
+    #[test]
+    fn create_provider_openai() {
+        let init = ProviderInit {
+            kind: "openai".into(),
+            api_key: "key".into(),
+            base_url: None,
+            name: None,
+        };
+        let _provider = super::create_provider(&init);
+    }
+
+    #[test]
+    fn create_provider_unknown_kind_uses_openai_compat() {
+        let init = ProviderInit {
+            kind: "ollama".into(),
+            api_key: "none".into(),
+            base_url: Some("http://localhost:11434/v1".into()),
+            name: Some("ollama".into()),
+        };
+        let _provider = super::create_provider(&init);
+    }
+
+    #[test]
+    fn normalize_openai_url_appends_chat_completions() {
+        assert_eq!(
+            super::normalize_openai_url("http://localhost:11434/v1"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_url_leaves_full_path() {
+        assert_eq!(
+            super::normalize_openai_url("http://localhost:11434/v1/chat/completions"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_url_trims_trailing_slash() {
+        assert_eq!(
+            super::normalize_openai_url("http://localhost:11434/v1/"),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 }

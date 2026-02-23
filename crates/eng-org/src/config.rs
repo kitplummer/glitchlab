@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use glitchlab_kernel::error::{Error, Result};
+use glitchlab_router::ProviderInit;
 use glitchlab_router::chooser::{ModelChooser, ModelProfile, ModelTier, RolePreference};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,8 @@ pub struct EngConfig {
     pub test_command_override: Option<String>,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderConfigEntry>,
 }
 
 /// Configuration for the memory/persistence layer.
@@ -131,6 +134,23 @@ pub struct BoundariesConfig {
     pub protected_paths: Vec<String>,
 }
 
+/// Configuration for a single LLM provider (from config or secrets file).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfigEntry {
+    /// Provider kind (e.g. "anthropic", "gemini", "openai"). Defaults to the map key.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Inline API key (typically from secrets.yaml).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Custom env var name to read the API key from.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Base URL override.
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
 impl Default for EngConfig {
     fn default() -> Self {
         Self {
@@ -206,17 +226,19 @@ impl Default for EngConfig {
             },
             test_command_override: None,
             memory: MemoryConfig::default(),
+            providers: HashMap::new(),
         }
     }
 }
 
 impl EngConfig {
-    /// Load config with deep merge: built-in defaults + repo overrides.
+    /// Load config with deep merge: built-in defaults + repo overrides + secrets.
     pub fn load(repo_path: Option<&Path>) -> Result<Self> {
         let mut config = Self::default();
 
         if let Some(repo) = repo_path {
-            let override_path = repo.join(".glitchlab").join("config.yaml");
+            let glitchlab_dir = repo.join(".glitchlab");
+            let override_path = glitchlab_dir.join("config.yaml");
             if override_path.exists() {
                 let contents = std::fs::read_to_string(&override_path)
                     .map_err(|e| Error::Config(format!("failed to read config: {e}")))?;
@@ -233,6 +255,26 @@ impl EngConfig {
                     let merged = deep_merge(base, overrides);
                     config = serde_yaml::from_value(merged).map_err(|e| {
                         Error::Config(format!("failed to parse merged config: {e}"))
+                    })?;
+                }
+            }
+
+            // Deep-merge secrets.yaml (if present) on top of config.
+            let secrets_path = glitchlab_dir.join("secrets.yaml");
+            if secrets_path.exists() {
+                let contents = std::fs::read_to_string(&secrets_path)
+                    .map_err(|e| Error::Config(format!("failed to read secrets: {e}")))?;
+
+                let secrets: serde_yaml::Value = serde_yaml::from_str(&contents)
+                    .map_err(|e| Error::Config(format!("invalid secrets YAML: {e}")))?;
+
+                if !secrets.is_null() {
+                    let base: serde_yaml::Value = serde_yaml::to_value(&config)
+                        .map_err(|e| Error::Config(format!("failed to serialize config: {e}")))?;
+
+                    let merged = deep_merge(base, secrets);
+                    config = serde_yaml::from_value(merged).map_err(|e| {
+                        Error::Config(format!("failed to parse merged secrets: {e}"))
                     })?;
                 }
             }
@@ -298,6 +340,59 @@ impl EngConfig {
             role_preferences,
             self.routing.cost_quality_threshold,
         ))
+    }
+
+    /// Resolve provider configs into `ProviderInit` values for the router.
+    ///
+    /// Resolution order per entry:
+    /// 1. `api_key` field (inline literal, typically from secrets.yaml)
+    /// 2. env var named by `api_key_env`
+    /// 3. default env var(s) for the provider kind
+    ///
+    /// Only entries with a resolvable key are included.
+    pub fn resolve_providers(&self) -> HashMap<String, ProviderInit> {
+        let mut result = HashMap::new();
+
+        for (name, entry) in &self.providers {
+            let kind = entry.kind.clone().unwrap_or_else(|| name.clone());
+
+            let api_key = entry
+                .api_key
+                .clone()
+                .or_else(|| {
+                    entry
+                        .api_key_env
+                        .as_ref()
+                        .and_then(|var| std::env::var(var).ok())
+                })
+                .or_else(|| resolve_default_env_key(&kind));
+
+            if let Some(api_key) = api_key {
+                result.insert(
+                    name.clone(),
+                    ProviderInit {
+                        kind,
+                        api_key,
+                        base_url: entry.base_url.clone(),
+                        name: Some(name.clone()),
+                    },
+                );
+            }
+        }
+
+        result
+    }
+}
+
+/// Look up the default env var(s) for a known provider kind.
+fn resolve_default_env_key(kind: &str) -> Option<String> {
+    match kind {
+        "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
+        "gemini" => std::env::var("GOOGLE_API_KEY")
+            .or_else(|_| std::env::var("GEMINI_API_KEY"))
+            .ok(),
+        "openai" => std::env::var("OPENAI_API_KEY").ok(),
+        _ => None,
     }
 }
 
@@ -848,5 +943,232 @@ boundaries:
         let (i, o) = default_cost("unknown/model");
         assert!((i - 1.0).abs() < f64::EPSILON);
         assert!((o - 5.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider config tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn provider_config_entry_deserializes() {
+        let yaml = r#"
+kind: anthropic
+api_key: sk-test-123
+api_key_env: MY_CUSTOM_KEY
+base_url: http://localhost:8080
+"#;
+        let entry: ProviderConfigEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.kind.as_deref(), Some("anthropic"));
+        assert_eq!(entry.api_key.as_deref(), Some("sk-test-123"));
+        assert_eq!(entry.api_key_env.as_deref(), Some("MY_CUSTOM_KEY"));
+        assert_eq!(entry.base_url.as_deref(), Some("http://localhost:8080"));
+
+        // Roundtrip.
+        let serialized = serde_yaml::to_string(&entry).unwrap();
+        let roundtrip: ProviderConfigEntry = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(roundtrip.kind, entry.kind);
+        assert_eq!(roundtrip.api_key, entry.api_key);
+    }
+
+    #[test]
+    fn provider_config_empty_defaults() {
+        let yaml = "providers: {}\n";
+        // Parse a minimal config with empty providers.
+        let config = EngConfig::default();
+        let base: serde_yaml::Value = serde_yaml::to_value(&config).unwrap();
+        let over: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let merged = deep_merge(base, over);
+        let parsed: EngConfig = serde_yaml::from_value(merged).unwrap();
+        assert!(parsed.providers.is_empty());
+    }
+
+    #[test]
+    fn resolve_providers_inline_key() {
+        let mut config = EngConfig::default();
+        config.providers.insert(
+            "anthropic".into(),
+            ProviderConfigEntry {
+                kind: None,
+                api_key: Some("sk-inline".into()),
+                api_key_env: None,
+                base_url: None,
+            },
+        );
+
+        let resolved = config.resolve_providers();
+        assert!(resolved.contains_key("anthropic"));
+        assert_eq!(resolved["anthropic"].api_key, "sk-inline");
+        assert_eq!(resolved["anthropic"].kind, "anthropic");
+    }
+
+    #[test]
+    fn resolve_providers_custom_env_var() {
+        unsafe {
+            std::env::set_var("GLITCHLAB_TEST_KEY_CUSTOM", "from-custom-env");
+        }
+
+        let mut config = EngConfig::default();
+        config.providers.insert(
+            "anthropic".into(),
+            ProviderConfigEntry {
+                kind: None,
+                api_key: None,
+                api_key_env: Some("GLITCHLAB_TEST_KEY_CUSTOM".into()),
+                base_url: None,
+            },
+        );
+
+        let resolved = config.resolve_providers();
+        assert!(resolved.contains_key("anthropic"));
+        assert_eq!(resolved["anthropic"].api_key, "from-custom-env");
+
+        unsafe {
+            std::env::remove_var("GLITCHLAB_TEST_KEY_CUSTOM");
+        }
+    }
+
+    #[test]
+    fn resolve_providers_default_env_fallback() {
+        // Set the default env var for anthropic.
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "default-env-key");
+        }
+
+        let mut config = EngConfig::default();
+        config.providers.insert(
+            "anthropic".into(),
+            ProviderConfigEntry {
+                kind: None,
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+            },
+        );
+
+        let resolved = config.resolve_providers();
+        assert!(resolved.contains_key("anthropic"));
+        assert_eq!(resolved["anthropic"].api_key, "default-env-key");
+    }
+
+    #[test]
+    fn resolve_providers_priority_order() {
+        // Inline key should take precedence over env var.
+        unsafe {
+            std::env::set_var("GLITCHLAB_TEST_KEY_PRIO", "from-env");
+        }
+
+        let mut config = EngConfig::default();
+        config.providers.insert(
+            "anthropic".into(),
+            ProviderConfigEntry {
+                kind: None,
+                api_key: Some("inline-wins".into()),
+                api_key_env: Some("GLITCHLAB_TEST_KEY_PRIO".into()),
+                base_url: None,
+            },
+        );
+
+        let resolved = config.resolve_providers();
+        assert_eq!(resolved["anthropic"].api_key, "inline-wins");
+
+        unsafe {
+            std::env::remove_var("GLITCHLAB_TEST_KEY_PRIO");
+        }
+    }
+
+    #[test]
+    fn resolve_providers_skips_unresolvable() {
+        let mut config = EngConfig::default();
+        config.providers.insert(
+            "custom-local".into(),
+            ProviderConfigEntry {
+                kind: Some("ollama".into()),
+                api_key: None,
+                api_key_env: Some("NONEXISTENT_GLITCHLAB_VAR_12345".into()),
+                base_url: Some("http://localhost:11434/v1".into()),
+            },
+        );
+
+        let resolved = config.resolve_providers();
+        // No key resolvable → should be omitted.
+        assert!(!resolved.contains_key("custom-local"));
+    }
+
+    #[test]
+    fn resolve_providers_custom_kind() {
+        let mut config = EngConfig::default();
+        config.providers.insert(
+            "my-ollama".into(),
+            ProviderConfigEntry {
+                kind: Some("openai".into()),
+                api_key: Some("dummy".into()),
+                api_key_env: None,
+                base_url: Some("http://localhost:11434/v1".into()),
+            },
+        );
+
+        let resolved = config.resolve_providers();
+        assert!(resolved.contains_key("my-ollama"));
+        assert_eq!(resolved["my-ollama"].kind, "openai");
+        assert_eq!(resolved["my-ollama"].name.as_deref(), Some("my-ollama"));
+    }
+
+    #[test]
+    fn secrets_file_merges_into_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+
+        // Main config with provider entry (no api_key).
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "providers:\n  anthropic:\n    api_key_env: ANTHROPIC_API_KEY\n",
+        )
+        .unwrap();
+
+        // Secrets file with inline key.
+        std::fs::write(
+            glitchlab_dir.join("secrets.yaml"),
+            "providers:\n  anthropic:\n    api_key: sk-secret-123\n",
+        )
+        .unwrap();
+
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(
+            config.providers["anthropic"].api_key.as_deref(),
+            Some("sk-secret-123")
+        );
+        // The api_key_env from config should also still be there.
+        assert_eq!(
+            config.providers["anthropic"].api_key_env.as_deref(),
+            Some("ANTHROPIC_API_KEY")
+        );
+    }
+
+    #[test]
+    fn secrets_file_missing_no_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "limits:\n  max_fix_attempts: 3\n",
+        )
+        .unwrap();
+        // No secrets.yaml — should be fine.
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(config.limits.max_fix_attempts, 3);
+    }
+
+    #[test]
+    fn backward_compat_no_providers_section() {
+        // Existing configs without `providers:` should still parse.
+        let config = EngConfig::default();
+        assert!(config.providers.is_empty());
+
+        // From YAML without providers section.
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let parsed: EngConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed.providers.is_empty());
     }
 }
