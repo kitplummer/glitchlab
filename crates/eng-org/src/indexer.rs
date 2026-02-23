@@ -438,6 +438,47 @@ mod tests {
         assert!(KEY_FILES.contains(&"compose.yaml"));
     }
 
+    #[tokio::test]
+    async fn test_build_index_with_compose_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Create a compose.yaml file
+        std::fs::write(
+            dir.path().join("compose.yaml"),
+            "version: '3'\nservices:\n  web:\n    image: nginx",
+        )
+        .unwrap();
+
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let index = build_index(dir.path()).await.unwrap();
+        assert!(index.key_files.contains(&"compose.yaml".to_string()));
+    }
+
     #[test]
     fn repo_index_serde_roundtrip() {
         let index = RepoIndex {
