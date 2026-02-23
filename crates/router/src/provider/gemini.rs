@@ -315,7 +315,7 @@ impl Provider for GeminiProvider {
                 .map(|t| GeminiFunctionDeclaration {
                     name: &t.name,
                     description: &t.description,
-                    parameters: &t.input_schema,
+                    parameters: strip_unsupported_schema_keys(&t.input_schema),
                 })
                 .collect();
 
@@ -430,7 +430,32 @@ struct GeminiToolDef<'a> {
 struct GeminiFunctionDeclaration<'a> {
     name: &'a str,
     description: &'a str,
-    parameters: &'a serde_json::Value,
+    parameters: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// Schema sanitization
+// ---------------------------------------------------------------------------
+
+/// Recursively strip JSON Schema keys that Gemini does not support
+/// (e.g. `additionalProperties`).
+fn strip_unsupported_schema_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut cleaned = serde_json::Map::new();
+            for (key, val) in map {
+                if key == "additionalProperties" {
+                    continue;
+                }
+                cleaned.insert(key.clone(), strip_unsupported_schema_keys(val));
+            }
+            serde_json::Value::Object(cleaned)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(strip_unsupported_schema_keys).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -968,5 +993,66 @@ mod tests {
     fn cost_zero_tokens() {
         let cost = estimate_gemini_cost("gemini-2.5-flash", 0, 0);
         assert!((cost - 0.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema sanitization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_unsupported_schema_keys_removes_additional_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        let cleaned = strip_unsupported_schema_keys(&schema);
+        assert!(cleaned.get("additionalProperties").is_none());
+        assert_eq!(cleaned["type"], "object");
+        assert_eq!(cleaned["properties"]["path"]["type"], "string");
+        assert_eq!(cleaned["required"][0], "path");
+    }
+
+    #[test]
+    fn strip_unsupported_schema_keys_recursive() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "x": {"type": "string"}
+                    }
+                }
+            },
+            "additionalProperties": false
+        });
+        let cleaned = strip_unsupported_schema_keys(&schema);
+        assert!(cleaned.get("additionalProperties").is_none());
+        assert!(
+            cleaned["properties"]["nested"]
+                .get("additionalProperties")
+                .is_none()
+        );
+        assert_eq!(
+            cleaned["properties"]["nested"]["properties"]["x"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn strip_unsupported_schema_keys_noop_when_absent() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            }
+        });
+        let cleaned = strip_unsupported_schema_keys(&schema);
+        assert_eq!(cleaned, schema);
     }
 }
