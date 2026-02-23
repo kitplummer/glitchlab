@@ -24,6 +24,7 @@ pub struct BatchArgs<'a> {
     pub test: Option<&'a str>,
     pub quality_gate: Option<&'a str>,
     pub stop_on_failure: bool,
+    pub dry_run: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,66 @@ pub async fn execute(args: BatchArgs<'_>) -> Result<()> {
 
     if let Some(cmd) = args.test {
         config.test_command_override = Some(cmd.to_string());
+    }
+
+    // --- Load task queue ---
+    let tasks_path = match args.tasks_file {
+        Some(p) => p.to_path_buf(),
+        None => args.repo.join(".glitchlab/tasks/backlog.yaml"),
+    };
+    let mut queue = TaskQueue::load(&tasks_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("failed to load task queue from {}", tasks_path.display()))?;
+
+    let summary = queue.summary();
+    eprintln!(
+        "task queue: {} total, {} pending",
+        summary.total, summary.pending
+    );
+    if summary.pending == 0 {
+        eprintln!("no pending tasks — nothing to do");
+        return Ok(());
+    }
+
+    // --- Dry run mode ---
+    if args.dry_run {
+        eprintln!();
+        eprintln!("=== DRY RUN MODE ===");
+        eprintln!(
+            "Budget per task: ${:.2}",
+            config.limits.max_dollars_per_task
+        );
+        eprintln!();
+
+        // Show pending tasks
+        let pending_tasks: Vec<_> = queue
+            .tasks()
+            .iter()
+            .filter(|task| task.status == glitchlab_eng_org::taskqueue::TaskStatus::Pending)
+            .collect();
+
+        if pending_tasks.is_empty() {
+            eprintln!("No pending tasks to display.");
+        } else {
+            eprintln!("Pending tasks:");
+            for task in pending_tasks {
+                // Truncate objective to 80 characters
+                let objective = if task.objective.len() > 80 {
+                    format!("{}...", &task.objective[..77])
+                } else {
+                    task.objective.clone()
+                };
+
+                eprintln!(
+                    "  [{}] {} (${:.2})",
+                    task.id, objective, config.limits.max_dollars_per_task
+                );
+            }
+        }
+
+        eprintln!();
+        eprintln!("Dry run complete. No tasks were executed.");
+        return Ok(());
     }
 
     // --- Preflight check ---
@@ -70,25 +131,6 @@ pub async fn execute(args: BatchArgs<'_>) -> Result<()> {
             "missing API keys for {} role(s). Set the required environment variables and retry.",
             preflight_errors.len()
         );
-    }
-
-    // --- Load task queue ---
-    let tasks_path = match args.tasks_file {
-        Some(p) => p.to_path_buf(),
-        None => args.repo.join(".glitchlab/tasks/backlog.yaml"),
-    };
-    let mut queue = TaskQueue::load(&tasks_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("failed to load task queue from {}", tasks_path.display()))?;
-
-    let summary = queue.summary();
-    eprintln!(
-        "task queue: {} total, {} pending",
-        summary.total, summary.pending
-    );
-    if summary.pending == 0 {
-        eprintln!("no pending tasks — nothing to do");
-        return Ok(());
     }
 
     // --- Cumulative budget ---
