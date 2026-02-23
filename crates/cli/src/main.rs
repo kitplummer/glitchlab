@@ -90,27 +90,35 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Run multiple tasks in parallel
+    /// Run multiple tasks from a backlog with cumulative budget tracking
     Batch {
         /// Path to the target repository
         #[arg(long)]
         repo: PathBuf,
 
-        /// Directory containing task YAML files
+        /// Total dollar budget for all tasks combined
         #[arg(long)]
-        tasks_dir: Option<PathBuf>,
+        budget: f64,
 
-        /// Maximum concurrent tasks
-        #[arg(long, default_value = "3")]
-        workers: usize,
-
-        /// Allow modifications to protected paths
+        /// Path to tasks YAML file (default: .glitchlab/tasks/backlog.yaml)
         #[arg(long)]
-        allow_core: bool,
+        tasks_file: Option<PathBuf>,
+
+        /// Skip human intervention gates
+        #[arg(long)]
+        auto_approve: bool,
 
         /// Override test command
         #[arg(long, short)]
         test: Option<String>,
+
+        /// Quality gate command to run between tasks (e.g. "cargo test --workspace")
+        #[arg(long)]
+        quality_gate: Option<String>,
+
+        /// Stop on first task failure
+        #[arg(long)]
+        stop_on_failure: bool,
 
         /// Enable verbose logging
         #[arg(long, short)]
@@ -185,9 +193,27 @@ async fn main() -> Result<()> {
             commands::setup_logging(verbose);
             commands::interactive::execute(&repo, allow_core, auto_approve, test.as_deref()).await
         }
-        Commands::Batch { repo, verbose, .. } => {
+        Commands::Batch {
+            repo,
+            budget,
+            tasks_file,
+            auto_approve,
+            test,
+            quality_gate,
+            stop_on_failure,
+            verbose,
+        } => {
             commands::setup_logging(verbose);
-            commands::batch::execute(&repo).await
+            commands::batch::execute(commands::batch::BatchArgs {
+                repo: &repo,
+                budget,
+                tasks_file: tasks_file.as_deref(),
+                auto_approve,
+                test: test.as_deref(),
+                quality_gate: quality_gate.as_deref(),
+                stop_on_failure,
+            })
+            .await
         }
         Commands::Init { path } => commands::init::execute(&path).await,
         Commands::Status { repo } => commands::status::execute(repo.as_deref()).await,
