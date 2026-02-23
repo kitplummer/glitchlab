@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -256,6 +257,7 @@ pub struct OrchestratorResult {
     pub tasks_failed: u32,
     pub total_cost: f64,
     pub total_tokens: u64,
+    pub duration: Duration,
     pub cease_reason: CeaseReason,
     pub run_results: Vec<TaskRunResult>,
 }
@@ -310,12 +312,15 @@ impl Orchestrator {
         budget: &mut CumulativeBudget,
         params: &OrchestratorParams,
     ) -> OrchestratorResult {
+        let start_time = Instant::now();
+
         let mut result = OrchestratorResult {
             tasks_attempted: 0,
             tasks_succeeded: 0,
             tasks_failed: 0,
             total_cost: 0.0,
             total_tokens: 0,
+            duration: Duration::from_secs(0), // Will be updated before return
             cease_reason: CeaseReason::AllTasksDone,
             run_results: Vec::new(),
         };
@@ -454,6 +459,19 @@ impl Orchestrator {
                 break;
             }
         }
+
+        result.duration = start_time.elapsed();
+
+        info!(
+            tasks_attempted = result.tasks_attempted,
+            tasks_succeeded = result.tasks_succeeded,
+            tasks_failed = result.tasks_failed,
+            total_cost = result.total_cost,
+            total_tokens = result.total_tokens,
+            duration_ms = result.duration.as_millis(),
+            cease_reason = ?result.cease_reason,
+            "orchestrator run complete"
+        );
 
         result
     }
@@ -792,6 +810,7 @@ mod tests {
             tasks_failed: 1,
             total_cost: 12.50,
             total_tokens: 150000,
+            duration: Duration::from_millis(5000),
             cease_reason: CeaseReason::BudgetExhausted,
             run_results: vec![TaskRunResult {
                 task_id: "t1".into(),
@@ -1032,6 +1051,42 @@ mod tests {
     fn budget_limit_accessor() {
         let budget = CumulativeBudget::new(42.0);
         assert!((budget.limit_dollars() - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_duration_tracking() {
+        let config = EngConfig::default();
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        let tasks = vec![pending_task("duration-test", "test duration tracking")];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut budget = CumulativeBudget::new(100.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: false,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+
+        // Verify that duration is non-zero (orchestrator should take some time to run)
+        assert!(
+            result.duration.as_nanos() > 0,
+            "Duration should be non-zero, got: {:?}",
+            result.duration
+        );
+
+        // Duration should be reasonable (less than 10 seconds for this simple test)
+        assert!(
+            result.duration.as_secs() < 10,
+            "Duration should be reasonable, got: {:?}",
+            result.duration
+        );
     }
 
     #[tokio::test]
