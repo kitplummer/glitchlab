@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+default = ["dolt"]
 dolt = ["sqlx"]
 
 [dependencies]

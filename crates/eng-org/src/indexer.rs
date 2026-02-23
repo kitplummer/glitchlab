@@ -52,6 +52,7 @@ const KEY_FILES: &[&str] = &[
     "Makefile",
     "Dockerfile",
     "docker-compose.yml",
+    "compose.yaml",
     "fly.toml",
     "README.md",
     "CHANGELOG.md",
@@ -430,6 +431,11 @@ mod tests {
                 "should skip node_modules: {file}"
             );
         }
+    }
+
+    #[test]
+    fn key_files_includes_compose_yaml() {
+        assert!(KEY_FILES.contains(&"compose.yaml"));
     }
 
     #[test]

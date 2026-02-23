@@ -52,6 +52,9 @@ routing:
 
   cost_quality_threshold: 0.7
 
+memory:
+  dolt_connection: "mysql://root@localhost:3306/glitchlab"
+
 providers:
   gemini:
     api_key_env: GEMINI_API_KEY

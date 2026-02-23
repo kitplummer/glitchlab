@@ -225,6 +225,9 @@ env/
 .glitchlab/worktrees/
 .glitchlab/logs/
 .glitchlab/secrets.yaml
+.dolt/
+tarpaulin-report.html
+tarpaulin-report.json
 
 # IDE
 .vscode/

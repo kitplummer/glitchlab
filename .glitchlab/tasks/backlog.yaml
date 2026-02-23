@@ -1,0 +1,121 @@
+# GLITCHLAB self-improvement backlog
+# Tasks are ordered by priority (lower = higher priority).
+# Each task is safe to run autonomously — none touch protected paths.
+
+- id: status-memory-info
+  priority: 10
+  objective: |
+    Add memory backend information to the `glitchlab status` CLI output.
+    In `crates/cli/src/commands/status.rs`, after printing the repo index summary,
+    call `build_backend()` and print which backends are available (e.g. "Memory: dolt, jsonl"
+    or "Memory: jsonl (dolt unavailable)"). Use the `backend_name()` and `is_available()`
+    trait methods. Add a unit test that verifies the output format string.
+  constraints:
+    - "Only modify crates/cli/"
+    - "No new dependencies"
+  acceptance:
+    - "glitchlab status shows memory backend info"
+    - "cargo test --workspace passes"
+    - "cargo clippy clean"
+  risk: low
+
+- id: history-dolt-aware
+  priority: 20
+  depends_on: status-memory-info
+  objective: |
+    Update the `glitchlab history` command to use the composite memory backend
+    instead of hardcoded JSONL. In `crates/cli/src/commands/history.rs`, replace
+    direct `JsonlHistory::new()` calls with `build_backend()` from `glitchlab_memory`.
+    This makes `glitchlab history` transparently query Dolt when available and
+    fall back to JSONL otherwise. Add a test that verifies the command works
+    with the default (JSONL-only) backend.
+  constraints:
+    - "Only modify crates/cli/"
+    - "Preserve existing CLI flags and output format"
+  acceptance:
+    - "glitchlab history queries via composite backend"
+    - "Existing history output format unchanged"
+    - "cargo test --workspace passes"
+  risk: low
+
+- id: indexer-compose-yaml
+  priority: 30
+  objective: |
+    The repo indexer in `crates/eng-org/src/indexer.rs` already has `docker-compose.yml`
+    in KEY_FILES but not `compose.yaml` (the modern Docker Compose filename). Add
+    `"compose.yaml"` to the KEY_FILES constant. Add a test that creates a temp repo
+    with a `compose.yaml` file and verifies `build_index()` includes it in `key_files`.
+  constraints:
+    - "Only modify crates/eng-org/src/indexer.rs"
+  acceptance:
+    - "compose.yaml detected as key file"
+    - "Existing tests still pass"
+  risk: low
+
+- id: router-request-id
+  priority: 40
+  objective: |
+    Add a `request_id: String` field (UUID v4) to `RouterResponse` in
+    `crates/router/src/lib.rs`. Generate the UUID in the `route()` method before
+    dispatching to the provider. Include the request_id in the tracing span so
+    all log lines for a single LLM call can be correlated. Add `uuid` as a
+    workspace dependency. Test that each response has a unique, non-empty request_id.
+  constraints:
+    - "Only modify crates/router/"
+    - "Add uuid to workspace Cargo.toml"
+  acceptance:
+    - "RouterResponse contains unique request_id"
+    - "Tracing spans include request_id"
+    - "cargo test --workspace passes"
+  risk: low
+
+- id: batch-dry-run
+  priority: 50
+  objective: |
+    Add a `--dry-run` flag to the `glitchlab batch` CLI command. When set, the
+    orchestrator loads the task queue and prints each task's ID, objective summary
+    (first 80 chars), and estimated budget share — but does not execute any tasks
+    or make LLM calls. Implement in `crates/cli/src/commands/batch.rs`. Add a
+    clap arg `--dry-run` (bool flag). Test with a mock task file.
+  constraints:
+    - "Only modify crates/cli/"
+    - "No LLM calls in dry-run mode"
+  acceptance:
+    - "glitchlab batch --dry-run prints task summary"
+    - "No API calls made"
+    - "cargo test --workspace passes"
+  risk: low
+
+- id: memory-error-thiserror
+  priority: 60
+  objective: |
+    The memory crate's `crates/memory/src/error.rs` should use `thiserror` derive
+    macros for the `MemoryError` enum, consistent with the project convention
+    (CLAUDE.md: "Use thiserror for library error types"). Verify the current
+    implementation uses thiserror. If it already does, mark this task as complete.
+    If it uses manual `impl Display` / `impl Error`, migrate to `#[derive(thiserror::Error)]`.
+  constraints:
+    - "Only modify crates/memory/src/error.rs"
+    - "Preserve all existing error variants"
+  acceptance:
+    - "MemoryError uses thiserror derives"
+    - "All existing tests pass unchanged"
+  risk: low
+
+- id: orchestrator-duration-tracking
+  priority: 70
+  objective: |
+    Add wall-clock duration tracking to `OrchestratorResult` in
+    `crates/eng-org/src/orchestrator.rs`. Add a `duration: std::time::Duration`
+    field. Capture `Instant::now()` at the start of `Orchestrator::run()` and
+    set `duration = start.elapsed()` before returning. Include duration in the
+    tracing info log. Add a test that verifies duration is non-zero after a
+    (mocked) orchestrator run.
+  constraints:
+    - "Only modify crates/eng-org/src/orchestrator.rs"
+    - "Do not change OrchestratorConfig or public API signatures"
+  acceptance:
+    - "OrchestratorResult includes duration"
+    - "Duration logged at info level"
+    - "cargo test --workspace passes"
+  risk: low

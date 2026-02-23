@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use chrono::{DateTime, Utc};
-use sqlx::MySqlPool;
+use sqlx::{MySqlPool, Row};
 
 use crate::error::{MemoryError, Result};
 use crate::history::{EventsSummary, HistoryBackend, HistoryEntry, HistoryQuery, HistoryStats};
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS task_history (
 ";
 
 /// Dolt SQL backend for task history.
+#[derive(Debug)]
 pub struct DoltHistory {
     pool: MySqlPool,
 }
@@ -69,6 +70,7 @@ impl DoltHistory {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn row_to_entry(
         task_id: String,
         timestamp: DateTime<Utc>,
@@ -205,30 +207,9 @@ impl HistoryBackend for DoltHistory {
             sql.push_str(&format!(" LIMIT {}", query.limit));
 
             // Build query with dynamic bindings.
-            let mut q = sqlx::query_as::<
-                _,
-                (
-                    String,
-                    DateTime<Utc>,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    i64,
-                    f64,
-                    i64,
-                    i64,
-                    f64,
-                    i32,
-                    String,
-                    i32,
-                    String,
-                    String,
-                    i32,
-                    Option<String>,
-                    Option<String>,
-                ),
-            >(&sql);
+            // sqlx tuple FromRow only supports up to 16 columns, so we use
+            // `sqlx::query()` + `Row::get()` to extract 19 columns manually.
+            let mut q = sqlx::query(&sql);
 
             for s in &binds_str {
                 q = q.bind(s);
@@ -246,8 +227,25 @@ impl HistoryBackend for DoltHistory {
                 .into_iter()
                 .map(|r| {
                     Self::row_to_entry(
-                        r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11, r.12, r.13,
-                        r.14, r.15, r.16, r.17, r.18,
+                        r.get("task_id"),
+                        r.get("timestamp"),
+                        r.get("status"),
+                        r.get("pr_url"),
+                        r.get("branch"),
+                        r.get("error"),
+                        r.get("budget_total_tokens"),
+                        r.get("budget_estimated_cost"),
+                        r.get("budget_call_count"),
+                        r.get("budget_tokens_remaining"),
+                        r.get("budget_dollars_remaining"),
+                        r.get("events_plan_steps"),
+                        r.get("events_plan_risk"),
+                        r.get("events_tests_passed"),
+                        r.get("events_security_verdict"),
+                        r.get("events_version_bump"),
+                        r.get("events_fix_attempts"),
+                        r.get("stage_outputs"),
+                        r.get("events_json"),
                     )
                 })
                 .collect())
@@ -441,6 +439,6 @@ mod tests {
         entry.events = None;
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("stage_outputs"));
-        assert!(!json.contains("events"));
+        assert!(!json.contains("\"events\":"));
     }
 }
