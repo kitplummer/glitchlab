@@ -60,6 +60,13 @@ pub trait Provider: Send + Sync {
 ///
 /// This is a plain struct (no serde) that acts as the boundary between
 /// eng-org config parsing and router provider construction.
+///
+/// ## API Key Resolution Priority
+///
+/// The `api_key` field contains the resolved API key based on the following priority order:
+/// 1. **Inline key** - Explicitly provided key in configuration
+/// 2. **Custom env var** - Provider-specific environment variable (e.g., `CUSTOM_ANTHROPIC_KEY`)
+/// 3. **Default env var** - Standard environment variable (e.g., `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`)
 #[derive(Debug, Clone)]
 pub struct ProviderInit {
     /// Provider kind: "anthropic", "gemini", "openai", or a custom name.
