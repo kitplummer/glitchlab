@@ -1037,21 +1037,19 @@ mod tests {
     #[tokio::test]
     async fn quality_gate_truncates_long_output() {
         let dir = tempfile::tempdir().unwrap();
-        // Write a script that generates > 2000 chars of output.
+        // Write a non-executable script file; run it via `bash <script>`
+        // so the kernel never executes the file directly (avoids ETXTBSY
+        // race under parallel test load).
         let script_path = dir.path().join("longout.sh");
-        std::fs::write(
-            &script_path,
-            "#!/bin/bash\nfor i in $(seq 1 3000); do printf x; done\nexit 1\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &script_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
-        let result = run_quality_gate(script_path.to_str().unwrap(), dir.path()).await;
+        std::fs::write(&script_path, "printf '%0.sx' {1..3000}\nexit 1\n").unwrap();
+        let cmd = format!("bash {}", script_path.display());
+        let result = run_quality_gate(&cmd, dir.path()).await;
         assert!(!result.passed);
-        assert!(result.details.contains("...[truncated]"));
+        assert!(
+            result.details.contains("...[truncated]"),
+            "expected truncation marker, got: {}",
+            &result.details[..result.details.len().min(100)]
+        );
         // Should be truncated to ~2000 + the suffix length.
         assert!(result.details.len() < 2100);
     }
