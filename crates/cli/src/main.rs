@@ -120,6 +120,10 @@ enum Commands {
         #[arg(long)]
         stop_on_failure: bool,
 
+        /// Show task information without executing (dry run)
+        #[arg(long)]
+        dry_run: bool,
+
         /// Enable verbose logging
         #[arg(long, short)]
         verbose: bool,
@@ -201,6 +205,7 @@ async fn main() -> Result<()> {
             test,
             quality_gate,
             stop_on_failure,
+            dry_run,
             verbose,
         } => {
             commands::setup_logging(verbose);
@@ -212,6 +217,7 @@ async fn main() -> Result<()> {
                 test: test.as_deref(),
                 quality_gate: quality_gate.as_deref(),
                 stop_on_failure,
+                dry_run,
             })
             .await
         }
