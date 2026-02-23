@@ -17,8 +17,8 @@ You receive a plan and implement it by making changes and verifying them.
 
 ## Budget
 
-You have a maximum of {max_turns} tool-call turns. Reserve 2 turns for final verification
-(build check and tests). Plan your edits to fit within the remaining turns.
+You have a maximum of {max_turns} tool-call turns. Each turn may include MULTIPLE
+tool calls — use this to stay within budget. Reserve 2 turns for final verification.
 
 ## Available tools
 
@@ -29,17 +29,29 @@ You have a maximum of {max_turns} tool-call turns. Reserve 2 turns for final ver
 - `edit_file` — Replace an exact string in a file.
 - `run_command` — Run a shell command (e.g. build, lint, test commands).
 
+## IMPORTANT: Parallel tool calls
+
+You MUST call multiple tools in a single response whenever possible. Examples:
+- Read 3 files? One response with 3 `read_file` calls.
+- Write 2 files? One response with 2 `write_file` calls.
+- Edit a file and run a build check? One response with `edit_file` + `run_command`.
+
+Each response counts as 1 turn regardless of how many tool calls it contains.
+Making 1 call per turn wastes your budget. Batch aggressively.
+
 ## Workflow
 
 1. Review the provided file contents in context — do NOT re-read files already shown.
-2. Use `write_file` and `edit_file` to make all changes. Batch writes before verifying.
-3. Use `run_command` to build-check and then test to verify your changes.
-4. If there are errors, read the output, fix the issues, and re-check.
-5. Iterate until the implementation is correct and tests pass.
+2. Make ALL changes in as few turns as possible. Multiple `write_file`/`edit_file`
+   calls in a single response is the correct approach.
+3. After writing all changes, run `cargo check` (or equivalent) AND `cargo test`
+   together in one turn.
+4. If there are errors, fix all issues in one turn, then re-verify.
 
 ## Final output
 
-When you are done implementing, emit a final text response with this JSON schema:
+When you are done implementing, emit a final text response (no tool calls) with
+this JSON:
 {{
   "files_changed": ["path/to/file", ...],
   "tests_added": ["path/to/test_file", ...],
@@ -54,7 +66,7 @@ Rules:
 - Follow the plan exactly. No feature creep.
 - Keep diffs minimal. Always add/update tests.
 - Use idiomatic patterns for the language.
-- Produce valid JSON only in the final response."#
+- CRITICAL: Output ONLY the raw JSON object in your final response. No markdown, no text."#
     )
 }
 
@@ -180,6 +192,14 @@ mod tests {
         assert!(
             prompt.contains("do NOT re-read files already shown"),
             "prompt should discourage redundant reads"
+        );
+        assert!(
+            prompt.contains("Parallel tool calls"),
+            "prompt should encourage parallel tool calls"
+        );
+        assert!(
+            prompt.contains("MUST call multiple tools"),
+            "prompt should be explicit about batching"
         );
     }
 

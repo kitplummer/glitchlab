@@ -5,11 +5,21 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("GIT_HASH"),
+    " ",
+    env!("BUILD_DATE"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     name = "glitchlab",
     about = "The Agentic Dev Engine — Build Weird. Ship Clean.",
-    version
+    version,
+    long_version = LONG_VERSION,
 )]
 struct Cli {
     #[command(subcommand)]

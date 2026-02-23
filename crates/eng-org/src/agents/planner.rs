@@ -37,7 +37,8 @@ Rules:
 - List ALL files that will be touched.
 - If the task is ambiguous, choose the simplest interpretation.
 - If the task requires changes to protected paths, set requires_core_change to true.
-- Produce valid JSON only. No markdown, no commentary."#;
+- CRITICAL: Output ONLY the raw JSON object. No text before or after it.
+  No markdown code fences. No explanations. Just the JSON."#;
 
 pub struct PlannerAgent {
     router: RouterRef,

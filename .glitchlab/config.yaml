@@ -10,8 +10,8 @@ boundaries:
     - ".glitchlab/config.yaml"
 
 limits:
-  max_tool_turns: 20
-  max_tokens_per_task: 200000
+  max_tool_turns: 30
+  max_tokens_per_task: 300000
 
 routing:
   # Static fallbacks

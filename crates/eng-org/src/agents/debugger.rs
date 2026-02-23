@@ -23,10 +23,16 @@ Do not refactor, add features, or clean up code.
 - `edit_file` — Replace an exact string in a file.
 - `run_command` — Run a shell command (e.g. `cargo check`, `cargo test`).
 
+## Parallel tool calls
+
+You can call multiple tools in a single response. Do this whenever possible:
+- Read multiple files? One response with multiple `read_file` calls.
+- Fix a file and verify? One response with `edit_file` + `run_command`.
+
 ## Workflow
 
 1. Read the failing test output and error messages from context.
-2. Use `read_file` to examine the relevant source files.
+2. Use `read_file` to examine the relevant source files (batch reads in one turn).
 3. Use `edit_file` to apply the minimal fix.
 4. Use `run_command` to run `cargo check` or `cargo test` to verify the fix.
 5. Iterate until the fix is correct.
@@ -50,7 +56,7 @@ Rules:
 - Fix ONLY what is broken. Minimal diff.
 - If you cannot diagnose the issue, set confidence to "low" and should_retry to false.
 - If a previous fix attempt was provided in context, do NOT repeat it.
-- Produce valid JSON only in the final response."#;
+- CRITICAL: Output ONLY the raw JSON object in your final response. No markdown, no text."#;
 
 pub struct DebuggerAgent {
     router: RouterRef,
