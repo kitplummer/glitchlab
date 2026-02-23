@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 glitchlab-kernel.workspace = true
 glitchlab-eng-org.workspace = true
-glitchlab-memory.workspace = true
+glitchlab-memory = { workspace = true, features = ["dolt"] }
 glitchlab-router.workspace = true
 tokio.workspace = true
 clap.workspace = true
