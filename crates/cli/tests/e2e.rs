@@ -398,6 +398,29 @@ async fn history_command_uses_composite_backend() {
     );
 }
 
+/// Test the version subcommand.
+#[tokio::test]
+async fn cli_version_command() {
+    let output = Command::new(glitchlab_bin())
+        .args(["version"])
+        .output()
+        .await
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "version command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim() == "glitchlab 0.1.0",
+        "expected 'glitchlab 0.1.0', got: '{}'",
+        stdout.trim()
+    );
+}
+
 /// E2E failure path: tests fail → history records the failure → `glitchlab history`
 /// shows it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
