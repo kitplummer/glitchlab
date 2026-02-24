@@ -2576,6 +2576,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipeline_decomposition_returns_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — returns a decomposition array
+            final_response(
+                r#"{"steps": [], "files_likely_affected": [], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "sub-1", "description": "sub-task 1"}, {"id": "sub-2", "description": "sub-task 2"}]}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+
+        let result = pipeline
+            .run(
+                "test-decompose",
+                "Build a complex feature",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::Decomposed);
+        assert!(result.error.is_none());
+        assert!(result.stage_outputs.contains_key("plan"));
+        // No implementation should have been attempted.
+        assert!(!result.stage_outputs.contains_key("implement"));
+        assert!(!result.stage_outputs.contains_key("architect_triage"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_triage_loads_affected_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Create the file that the planner says is affected, so the triage
+        // stage can load it into file_context.
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/existing.rs"),
+            "pub fn greet() -> &'static str { \"hello\" }\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add existing file"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let responses = vec![
+            // 1. Planner — references files_likely_affected with a file on disk
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature"}], "files_likely_affected": ["src/existing.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — already_done (file already exists)
+            final_response(
+                r#"{"verdict": "already_done", "confidence": 0.95, "reasoning": "feature exists in src/existing.rs", "evidence": ["src/existing.rs"], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+
+        let result = pipeline
+            .run(
+                "test-triage-files",
+                "Add greet function",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::AlreadyDone);
+        assert!(result.stage_outputs.contains_key("architect_triage"));
+    }
+
+    #[tokio::test]
+    async fn read_relevant_files_truncates_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a file larger than MAX_FILE_BYTES (8KB).
+        let big_content = "x".repeat(MAX_FILE_BYTES + 100);
+        tokio::fs::write(dir.path().join("big.rs"), &big_content)
+            .await
+            .unwrap();
+
+        let indexed = vec!["big.rs".to_string()];
+        let result = read_relevant_files(dir.path(), "Fix big.rs", &indexed).await;
+
+        assert!(result.contains_key("big.rs"));
+        let content = &result["big.rs"];
+        assert!(content.ends_with("...\n[truncated]"));
+        assert!(content.len() < big_content.len());
+    }
+
+    #[tokio::test]
+    async fn pipeline_security_block_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "high", "risk_notes": "risky", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "not done", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+            // 3. Implementer — write_file
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() {}\n"}),
+            }]),
+            // 4. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: greet", "summary": "done"}"#,
+            ),
+            // 5. Security — block
+            final_response(
+                r#"{"verdict": "block", "issues": [{"severity": "critical", "description": "SQL injection"}], "summary": "blocked"}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+
+        let result = pipeline
+            .run(
+                "test-sec-block",
+                "Add greet function",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::SecurityBlocked);
+        assert!(result.error.is_some());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("security review blocked")
+        );
+    }
+
+    #[tokio::test]
     async fn pipeline_timeout_produces_timed_out_status() {
         let dir = tempfile::tempdir().unwrap();
         let base_branch = init_test_repo(dir.path());
