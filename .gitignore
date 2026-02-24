@@ -235,6 +235,19 @@ tarpaulin-report.json
 *.swp
 *.swo
 
+# Beads runtime (keep issues.jsonl, config.yaml, metadata.json, README.md)
+.beads/*.db
+.beads/*.db-shm
+.beads/*.db-wal
+.beads/*.sock
+.beads/*.pid
+.beads/*.lock
+.beads/*.log
+.beads/beads.left.jsonl
+.beads/beads.left.meta.json
+.beads/interactions.jsonl
+.beads/last-touched
+
 # OS
 .DS_Store
 Thumbs.db
