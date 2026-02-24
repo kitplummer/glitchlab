@@ -54,6 +54,7 @@ routing:
   cost_quality_threshold: 0.7
 
 memory:
+  beads_enabled: true
   dolt_connection: "mysql://glitchlab:glitchlab@localhost:3306/glitchlab"
 
 providers:

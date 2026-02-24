@@ -41,10 +41,14 @@ pub struct Bead {
 }
 
 /// A dependency edge between two beads.
+///
+/// The `bd` CLI outputs `depends_on_id` and `type`; our internal model uses
+/// `target_id` and `dep_type`. Serde aliases bridge both conventions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeadDependency {
+    #[serde(alias = "depends_on_id")]
     pub target_id: String,
-    #[serde(default)]
+    #[serde(default, alias = "type")]
     pub dep_type: String,
 }
 
@@ -347,20 +351,92 @@ mod tests {
         assert_eq!(dep.dep_type, "");
     }
 
+    #[test]
+    fn bead_dependency_bd_json_format() {
+        // Actual field names from `bd list --json`
+        let json = r#"{
+            "issue_id": "gl-1e0.5",
+            "depends_on_id": "gl-1e0",
+            "type": "blocks",
+            "created_at": "2026-02-23T22:20:42Z",
+            "created_by": "Kit Plummer"
+        }"#;
+        let dep: BeadDependency = serde_json::from_str(json).unwrap();
+        assert_eq!(dep.target_id, "gl-1e0");
+        assert_eq!(dep.dep_type, "blocks");
+    }
+
+    #[test]
+    fn bead_deserialize_real_bd_output() {
+        // Mirrors actual `bd list --json` output structure
+        let json = r#"{
+            "id": "gl-1e0.5",
+            "title": "Pipeline writes bead status on task failure",
+            "description": "When a pipeline task fails, write a failure status.",
+            "status": "open",
+            "priority": 0,
+            "issue_type": "task",
+            "owner": "kit@example.com",
+            "created_at": "2026-02-23T22:20:42Z",
+            "created_by": "Kit Plummer",
+            "updated_at": "2026-02-23T22:20:42Z",
+            "labels": ["beads", "error", "pipeline"],
+            "dependencies": [
+                {
+                    "issue_id": "gl-1e0.5",
+                    "depends_on_id": "gl-1e0",
+                    "type": "parent-child",
+                    "created_at": "2026-02-23T22:20:42Z",
+                    "created_by": "Kit Plummer"
+                },
+                {
+                    "issue_id": "gl-1e0.5",
+                    "depends_on_id": "gl-1e0.1",
+                    "type": "blocks",
+                    "created_at": "2026-02-23T22:20:42Z",
+                    "created_by": "Kit Plummer"
+                }
+            ],
+            "dependency_count": 2,
+            "dependent_count": 0,
+            "comment_count": 0
+        }"#;
+        let bead: Bead = serde_json::from_str(json).unwrap();
+        assert_eq!(bead.id, "gl-1e0.5");
+        assert_eq!(bead.dependencies.len(), 2);
+        assert_eq!(bead.dependencies[0].target_id, "gl-1e0");
+        assert_eq!(bead.dependencies[0].dep_type, "parent-child");
+        assert_eq!(bead.dependencies[1].target_id, "gl-1e0.1");
+        assert_eq!(bead.dependencies[1].dep_type, "blocks");
+    }
+
     // -----------------------------------------------------------------------
     // list_parsed / ready_parsed tests (using shell script as mock bd)
     // -----------------------------------------------------------------------
 
     /// Create a temporary shell script that echoes the given JSON to stdout.
+    ///
+    /// Uses a unique filename per invocation to avoid "Text file busy" races
+    /// when multiple tests share a tempdir or run in parallel.
     fn mock_bd_script(dir: &std::path::Path, json: &str) -> PathBuf {
-        let script = dir.join("mock_bd");
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let script = dir.join(format!("mock_bd_{n}"));
         let content = format!("#!/bin/sh\nprintf '%s' '{}'\n", json.replace('\'', "'\\''"));
-        std::fs::write(&script, content).unwrap();
+        let mut f = std::fs::File::create(&script).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        // Brief yield to let the kernel finish closing the file descriptor,
+        // preventing ETXTBSY ("Text file busy") on immediate exec.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         script
     }
 
