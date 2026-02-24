@@ -1,3 +1,4 @@
+pub mod architect;
 pub mod archivist;
 pub mod debugger;
 pub mod implementer;
@@ -446,6 +447,8 @@ pub(crate) mod test_helpers {
             ("security".to_string(), "seq/test".to_string()),
             ("release".to_string(), "seq/test".to_string()),
             ("archivist".to_string(), "seq/test".to_string()),
+            ("architect_triage".to_string(), "seq/test".to_string()),
+            ("architect_review".to_string(), "seq/test".to_string()),
         ]);
         let budget = BudgetTracker::new(1_000_000, 100.0);
         let mut router = glitchlab_router::Router::new(routing, budget);
@@ -496,6 +499,8 @@ pub(crate) mod test_helpers {
             ("security".to_string(), "mock/test".to_string()),
             ("release".to_string(), "mock/test".to_string()),
             ("archivist".to_string(), "mock/test".to_string()),
+            ("architect_triage".to_string(), "mock/test".to_string()),
+            ("architect_review".to_string(), "mock/test".to_string()),
         ]);
         let budget = BudgetTracker::new(1_000_000, 100.0);
         let mut router = glitchlab_router::Router::new(routing, budget);

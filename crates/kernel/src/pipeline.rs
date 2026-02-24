@@ -167,6 +167,12 @@ pub enum PipelineStatus {
     Blocked,
     /// Transient failure — safe to retry with backoff.
     Retryable,
+    /// Work already done — triage detected no implementation needed.
+    AlreadyDone,
+    /// Architect review rejected the changes.
+    ArchitectRejected,
+    /// PR was created and merged automatically.
+    PrMerged,
     /// Unrecoverable error.
     Error,
 }
@@ -208,6 +214,9 @@ pub enum EventKind {
     DocumentationWritten,
     Committed,
     PrCreated,
+    ArchitectTriage,
+    ArchitectReview,
+    PrMerged,
     BudgetExceeded,
     Error,
 }
@@ -323,6 +332,54 @@ mod tests {
         assert_eq!(json, "\"retryable\"");
         let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, PipelineStatus::Retryable);
+    }
+
+    #[test]
+    fn pipeline_status_already_done_serde() {
+        let status = PipelineStatus::AlreadyDone;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"already_done\"");
+        let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PipelineStatus::AlreadyDone);
+    }
+
+    #[test]
+    fn pipeline_status_architect_rejected_serde() {
+        let status = PipelineStatus::ArchitectRejected;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"architect_rejected\"");
+        let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PipelineStatus::ArchitectRejected);
+    }
+
+    #[test]
+    fn pipeline_status_pr_merged_serde() {
+        let status = PipelineStatus::PrMerged;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"pr_merged\"");
+        let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PipelineStatus::PrMerged);
+    }
+
+    #[test]
+    fn event_kind_architect_triage_serde() {
+        let kind = EventKind::ArchitectTriage;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"architect_triage\"");
+    }
+
+    #[test]
+    fn event_kind_architect_review_serde() {
+        let kind = EventKind::ArchitectReview;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"architect_review\"");
+    }
+
+    #[test]
+    fn event_kind_pr_merged_serde() {
+        let kind = EventKind::PrMerged;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"pr_merged\"");
     }
 
     #[test]

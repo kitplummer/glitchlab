@@ -588,7 +588,10 @@ impl Orchestrator {
 
             let succeeded = matches!(
                 pipeline_result.status,
-                PipelineStatus::PrCreated | PipelineStatus::Committed
+                PipelineStatus::PrCreated
+                    | PipelineStatus::Committed
+                    | PipelineStatus::PrMerged
+                    | PipelineStatus::AlreadyDone
             );
 
             info!(
@@ -696,7 +699,10 @@ impl Orchestrator {
         pipeline_result: &glitchlab_kernel::pipeline::PipelineResult,
     ) -> OutcomeRouting {
         match pipeline_result.status {
-            PipelineStatus::PrCreated | PipelineStatus::Committed => OutcomeRouting {
+            PipelineStatus::PrCreated
+            | PipelineStatus::Committed
+            | PipelineStatus::PrMerged
+            | PipelineStatus::AlreadyDone => OutcomeRouting {
                 task_status: TaskStatus::Completed,
                 counter: OutcomeCounter::Succeeded,
                 save_context: false,
@@ -721,6 +727,12 @@ impl Orchestrator {
                 track_attempt: false,
             },
             PipelineStatus::Retryable => OutcomeRouting {
+                task_status: TaskStatus::Failed,
+                counter: OutcomeCounter::Failed,
+                save_context: true,
+                track_attempt: true,
+            },
+            PipelineStatus::ArchitectRejected => OutcomeRouting {
                 task_status: TaskStatus::Failed,
                 counter: OutcomeCounter::Failed,
                 save_context: true,
@@ -1705,6 +1717,36 @@ mod tests {
         let routing = Orchestrator::route_outcome(&pr);
         assert_eq!(routing.task_status, TaskStatus::Failed);
         assert_eq!(routing.counter, OutcomeCounter::Failed);
+    }
+
+    #[test]
+    fn route_outcome_already_done() {
+        let pr = make_pipeline_result(PipelineStatus::AlreadyDone);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Completed);
+        assert_eq!(routing.counter, OutcomeCounter::Succeeded);
+        assert!(!routing.save_context);
+        assert!(!routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_architect_rejected() {
+        let pr = make_pipeline_result(PipelineStatus::ArchitectRejected);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Failed);
+        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert!(routing.save_context);
+        assert!(routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_pr_merged() {
+        let pr = make_pipeline_result(PipelineStatus::PrMerged);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Completed);
+        assert_eq!(routing.counter, OutcomeCounter::Succeeded);
+        assert!(!routing.save_context);
+        assert!(!routing.track_attempt);
     }
 
     #[test]

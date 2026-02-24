@@ -58,6 +58,14 @@ pub struct RoutingConfig {
     pub release: String,
     pub archivist: String,
 
+    /// Architect triage agent — checks if work is already done before implementation.
+    #[serde(default = "default_architect_model")]
+    pub architect_triage: String,
+
+    /// Architect review agent — reviews diff quality and gates merge.
+    #[serde(default = "default_architect_model")]
+    pub architect_review: String,
+
     /// Model pool for cost-aware chooser. When non-empty, enables
     /// the `ModelChooser` for dynamic model selection.
     #[serde(default)]
@@ -70,6 +78,10 @@ pub struct RoutingConfig {
     /// Budget pressure sensitivity. 0.0 = quality-first, 1.0 = cost-first.
     #[serde(default = "default_cost_quality_threshold")]
     pub cost_quality_threshold: f64,
+}
+
+fn default_architect_model() -> String {
+    "anthropic/claude-haiku-4-5-20251001".into()
 }
 
 fn default_cost_quality_threshold() -> f64 {
@@ -170,6 +182,8 @@ impl Default for EngConfig {
                 security: "anthropic/claude-haiku-4-5-20251001".into(),
                 release: "anthropic/claude-haiku-4-5-20251001".into(),
                 archivist: "anthropic/claude-haiku-4-5-20251001".into(),
+                architect_triage: default_architect_model(),
+                architect_review: default_architect_model(),
                 models: Vec::new(),
                 roles: HashMap::new(),
                 cost_quality_threshold: default_cost_quality_threshold(),
@@ -316,6 +330,14 @@ impl EngConfig {
             ("security".into(), self.routing.security.clone()),
             ("release".into(), self.routing.release.clone()),
             ("archivist".into(), self.routing.archivist.clone()),
+            (
+                "architect_triage".into(),
+                self.routing.architect_triage.clone(),
+            ),
+            (
+                "architect_review".into(),
+                self.routing.architect_review.clone(),
+            ),
         ])
     }
 
@@ -535,7 +557,9 @@ mod tests {
         assert!(map.contains_key("security"));
         assert!(map.contains_key("release"));
         assert!(map.contains_key("archivist"));
-        assert_eq!(map.len(), 6);
+        assert!(map.contains_key("architect_triage"));
+        assert!(map.contains_key("architect_review"));
+        assert_eq!(map.len(), 8);
     }
 
     #[test]

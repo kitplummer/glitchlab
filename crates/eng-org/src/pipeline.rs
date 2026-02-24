@@ -18,6 +18,7 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::agents::RouterRef;
+use crate::agents::architect::{ArchitectReviewAgent, ArchitectTriageAgent};
 use crate::agents::archivist::ArchivistAgent;
 use crate::agents::debugger::DebuggerAgent;
 use crate::agents::implementer::ImplementerAgent;
@@ -265,6 +266,79 @@ impl EngineeringPipeline {
                 stage_outputs: ctx.stage_outputs,
                 events: ctx.events,
                 budget: self.router.budget_summary().await,
+                pr_url: None,
+                branch: None,
+                error: None,
+                outcome_context: None,
+            };
+        }
+
+        // --- Stage 3c: Architect triage ---
+        ctx.current_stage = Some("architect_triage".into());
+        ctx.agent_context.previous_output = plan_output.data.clone();
+
+        // Re-load affected files so triage can check if code already exists.
+        let triage_files: Vec<String> = plan_output.data["files_likely_affected"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for file in &triage_files {
+            let full_path = repo_path.join(file);
+            if let Ok(content) = tokio::fs::read_to_string(&full_path).await {
+                let truncated = if content.len() > 8192 {
+                    format!("{}...\n[truncated]", &content[..8192])
+                } else {
+                    content
+                };
+                ctx.agent_context
+                    .file_context
+                    .insert(file.clone(), truncated);
+            }
+        }
+
+        let triage_agent = ArchitectTriageAgent::new(Arc::clone(&self.router));
+        let triage_output = match triage_agent.execute(&ctx.agent_context).await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(task_id, error = %e, "architect triage failed, continuing");
+                fallback_output(
+                    "architect_triage",
+                    serde_json::json!({
+                        "verdict": "proceed",
+                        "confidence": 0.0,
+                        "reasoning": "triage agent failed",
+                        "evidence": [],
+                        "architectural_notes": "",
+                        "suggested_changes": []
+                    }),
+                )
+            }
+        };
+
+        let triage_verdict = triage_output.data["verdict"]
+            .as_str()
+            .unwrap_or("proceed")
+            .to_string();
+        self.emit(
+            &mut ctx,
+            EventKind::ArchitectTriage,
+            triage_output.data.clone(),
+        );
+        ctx.stage_outputs
+            .insert("architect_triage".into(), triage_output);
+
+        if triage_verdict == "already_done" {
+            info!(task_id, "architect triage: work already done, skipping");
+            let budget = self.router.budget_summary().await;
+            return PipelineResult {
+                status: PipelineStatus::AlreadyDone,
+                stage_outputs: ctx.stage_outputs,
+                events: ctx.events,
+                budget,
                 pr_url: None,
                 branch: None,
                 error: None,
@@ -635,7 +709,7 @@ impl EngineeringPipeline {
             serde_json::json!({ "sha": commit_sha }),
         );
 
-        // --- Stage 14: Human gate — PR review ---
+        // --- Stage 14: Human gate — PR review (override, before architect) ---
         if self.config.intervention.pause_before_pr {
             let stat = workspace.diff_stat(base_branch).await.unwrap_or_default();
             if !self
@@ -658,6 +732,78 @@ impl EngineeringPipeline {
                     error: None,
                     outcome_context: None,
                 };
+            }
+        }
+
+        // --- Stage 13b: Architect review ---
+        ctx.current_stage = Some("architect_review".into());
+        let review_diff = workspace.diff_full(base_branch).await.unwrap_or_default();
+        ctx.agent_context.previous_output = serde_json::json!({
+            "diff": truncate(&review_diff, 4000),
+            "plan": plan_output.data,
+            "implementation": impl_output.data,
+            "security": security_output.data,
+        });
+
+        let review_agent = ArchitectReviewAgent::new(Arc::clone(&self.router));
+        let review_output = match review_agent.execute(&ctx.agent_context).await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(task_id, error = %e, "architect review failed, defaulting to request_changes");
+                fallback_output(
+                    "architect_review",
+                    serde_json::json!({
+                        "verdict": "request_changes",
+                        "confidence": 0.0,
+                        "reasoning": "review agent failed",
+                        "quality_score": 0,
+                        "issues": [],
+                        "architectural_fitness": "unknown",
+                        "merge_strategy": "squash"
+                    }),
+                )
+            }
+        };
+
+        let review_verdict = review_output.data["verdict"]
+            .as_str()
+            .unwrap_or("request_changes")
+            .to_string();
+        self.emit(
+            &mut ctx,
+            EventKind::ArchitectReview,
+            review_output.data.clone(),
+        );
+        ctx.stage_outputs
+            .insert("architect_review".into(), review_output);
+
+        match review_verdict.as_str() {
+            "close" => {
+                info!(task_id, "architect review: rejected changes");
+                return self
+                    .fail(
+                        ctx,
+                        PipelineStatus::ArchitectRejected,
+                        "architect review rejected changes".into(),
+                    )
+                    .await;
+            }
+            "request_changes" => {
+                info!(task_id, "architect review: changes requested, stopping");
+                let budget = self.router.budget_summary().await;
+                return PipelineResult {
+                    status: PipelineStatus::Committed,
+                    stage_outputs: ctx.stage_outputs,
+                    events: ctx.events,
+                    budget,
+                    pr_url: None,
+                    branch: Some(workspace.branch_name().into()),
+                    error: Some("architect review requested changes".into()),
+                    outcome_context: None,
+                };
+            }
+            _ => {
+                // "merge" or any other value — continue to push + PR
             }
         }
 
@@ -711,9 +857,63 @@ impl EngineeringPipeline {
             serde_json::json!({ "url": &pr_url }),
         );
 
+        // --- Stage 15b: Auto-merge PR ---
+        let mut final_status = PipelineStatus::PrCreated;
+        let merge_result = Command::new("gh")
+            .args(["pr", "merge", &pr_url, "--squash", "--delete-branch"])
+            .current_dir(&wt_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
+        match merge_result {
+            Ok(output) if output.status.success() => {
+                info!(task_id, "PR auto-merged successfully");
+                self.emit(
+                    &mut ctx,
+                    EventKind::PrMerged,
+                    serde_json::json!({ "url": &pr_url }),
+                );
+                final_status = PipelineStatus::PrMerged;
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(task_id, error = %stderr, "PR auto-merge failed, PR still open");
+            }
+            Err(e) => {
+                warn!(task_id, error = %e, "failed to run gh pr merge");
+            }
+        }
+
+        // --- Stage 15c: Close bead ---
+        if self.config.memory.beads_enabled {
+            let bd_path = self.config.memory.beads_bd_path.as_deref().unwrap_or("bd");
+            let close_result = Command::new(bd_path)
+                .args(["close", task_id])
+                .current_dir(repo_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await;
+
+            match close_result {
+                Ok(output) if output.status.success() => {
+                    info!(task_id, "bead closed successfully");
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!(task_id, error = %stderr, "bead close failed");
+                }
+                Err(e) => {
+                    warn!(task_id, error = %e, "failed to run bd close");
+                }
+            }
+        }
+
         let budget = self.router.budget_summary().await;
         PipelineResult {
-            status: PipelineStatus::PrCreated,
+            status: final_status,
             stage_outputs: ctx.stage_outputs,
             events: ctx.events,
             budget,
@@ -1125,25 +1325,33 @@ mod tests {
             final_response(
                 r#"{"steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "trivial", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
             ),
-            // 2. Implementer — write_file tool call
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "work not yet done", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+            // 3. Implementer — write_file tool call
             tool_response(vec![ToolCall {
                 id: "toolu_01".into(),
                 name: "write_file".into(),
                 input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() -> &'static str { \"hello\" }\n"}),
             }]),
-            // 3. Implementer — final metadata
+            // 4. Implementer — final metadata
             final_response(
                 r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: add greet function", "summary": "test"}"#,
             ),
-            // 4. Security
+            // 5. Security
             final_response(r#"{"verdict": "pass", "issues": [], "summary": "no issues"}"#),
-            // 5. Release
+            // 6. Release
             final_response(
                 r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
             ),
-            // 6. Archivist
+            // 7. Archivist
             final_response(
                 r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
+            ),
+            // 8. Architect review — merge
+            final_response(
+                r#"{"verdict": "merge", "confidence": 0.9, "reasoning": "looks good", "quality_score": 8, "issues": [], "architectural_fitness": "good", "merge_strategy": "squash"}"#,
             ),
         ]
     }
@@ -1856,17 +2064,21 @@ mod tests {
             final_response(
                 r#"{"steps": [{"step_number": 1, "description": "fix bug"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
             ),
-            // 2. Implementer — write_file tool call
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "not done", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+            // 3. Implementer — write_file tool call
             tool_response(vec![ToolCall {
                 id: "toolu_01".into(),
                 name: "write_file".into(),
                 input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() -> &'static str { \"hello\" }\n"}),
             }]),
-            // 3. Implementer — final metadata
+            // 4. Implementer — final metadata
             final_response(
                 r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "fix: bug", "summary": "fixed"}"#,
             ),
-            // 4. Debugger — should_retry: false
+            // 5. Debugger — should_retry: false
             final_response(
                 r#"{"diagnosis": "test failure", "root_cause": "bug", "files_changed": [], "confidence": "low", "should_retry": false, "notes": null}"#,
             ),
@@ -2171,6 +2383,196 @@ mod tests {
             "should have steps array: {:?}",
             output.data
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_triage_already_done_skips_implementation() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — already_done
+            final_response(
+                r#"{"verdict": "already_done", "confidence": 0.95, "reasoning": "feature exists", "evidence": ["src/new.rs already has greet()"], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+
+        let result = pipeline
+            .run(
+                "test-already-done",
+                "Add greet function",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::AlreadyDone);
+        assert!(result.error.is_none());
+        // Implementer should NOT have been called.
+        assert!(!result.stage_outputs.contains_key("implement"));
+        // Triage should be present.
+        assert!(result.stage_outputs.contains_key("architect_triage"));
+        // Should have triage event.
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::ArchitectTriage),
+            "expected ArchitectTriage event"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_review_close_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "not done", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+            // 3. Implementer — write_file
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() {}\n"}),
+            }]),
+            // 4. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: greet", "summary": "done"}"#,
+            ),
+            // 5. Security
+            final_response(r#"{"verdict": "pass", "issues": [], "summary": "ok"}"#),
+            // 6. Release
+            final_response(
+                r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
+            ),
+            // 7. Archivist
+            final_response(
+                r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
+            ),
+            // 8. Architect review — close
+            final_response(
+                r#"{"verdict": "close", "confidence": 0.8, "reasoning": "fundamentally wrong", "quality_score": 2, "issues": [], "architectural_fitness": "poor", "merge_strategy": "squash"}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+
+        let result = pipeline
+            .run(
+                "test-review-close",
+                "Add greet function",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::ArchitectRejected);
+        assert!(result.error.is_some());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("architect review rejected")
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_review_request_changes_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "not done", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+            // 3. Implementer — write_file
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() {}\n"}),
+            }]),
+            // 4. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: greet", "summary": "done"}"#,
+            ),
+            // 5. Security
+            final_response(r#"{"verdict": "pass", "issues": [], "summary": "ok"}"#),
+            // 6. Release
+            final_response(
+                r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
+            ),
+            // 7. Archivist
+            final_response(
+                r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
+            ),
+            // 8. Architect review — request_changes
+            final_response(
+                r#"{"verdict": "request_changes", "confidence": 0.7, "reasoning": "needs tests", "quality_score": 5, "issues": [{"severity": "medium", "description": "no tests", "suggestion": "add unit tests"}], "architectural_fitness": "acceptable", "merge_strategy": "squash"}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+
+        let result = pipeline
+            .run(
+                "test-review-changes",
+                "Add greet function",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(result.error.is_some());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("architect review requested changes")
+        );
+        assert!(result.branch.is_some());
+        assert!(result.pr_url.is_none());
     }
 
     #[tokio::test]
