@@ -17,7 +17,7 @@ limits:
 routing:
   # Static fallbacks
   planner: "gemini/gemini-2.5-flash"
-  implementer: "anthropic/claude-sonnet-4-20250514"
+  implementer: "gemini/gemini-2.5-pro"
   debugger: "anthropic/claude-sonnet-4-20250514"
   security: "gemini/gemini-2.5-flash"
   release: "gemini/gemini-2.5-flash"
@@ -31,6 +31,9 @@ routing:
     - model: "gemini/gemini-2.5-flash"
       tier: standard
       capabilities: [tool_use, code, long_context]
+    - model: "gemini/gemini-2.5-pro"
+      tier: standard
+      capabilities: [tool_use, code, long_context]
     - model: "anthropic/claude-sonnet-4-20250514"
       tier: premium
       capabilities: [tool_use, code, long_context, vision]
@@ -39,7 +42,7 @@ routing:
     planner:
       min_tier: standard
     implementer:
-      min_tier: premium
+      min_tier: standard
       requires: [tool_use]
     debugger:
       min_tier: standard
