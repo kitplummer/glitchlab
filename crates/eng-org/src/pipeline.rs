@@ -1501,24 +1501,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_with_previous_attempts_injects_context() {
         let dir = tempfile::tempdir().unwrap();
-        // Init git repo.
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-
-        let output = std::process::Command::new("git")
-            .args(["branch", "--show-current"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        let base_branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let base_branch = init_test_repo(dir.path());
 
         let router = sequential_router_ref(pipeline_mock_responses());
         let mut config = EngConfig::default();
