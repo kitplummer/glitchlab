@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use glitchlab_kernel::error::{Error, Result};
+use glitchlab_memory::beads::{Bead, BeadsClient};
 
 // ---------------------------------------------------------------------------
 // Task types
@@ -84,6 +85,22 @@ impl TaskQueue {
     /// Create a task queue from an in-memory list (for testing).
     pub fn from_tasks(tasks: Vec<Task>) -> Self {
         Self { tasks, path: None }
+    }
+
+    /// Load a task queue from Beads via `bd list --json`.
+    ///
+    /// Only includes actionable issue types (task, bug, feature, chore).
+    pub async fn load_from_beads(client: &BeadsClient) -> Result<Self> {
+        let beads = client
+            .list_parsed()
+            .await
+            .map_err(|e| Error::Config(format!("failed to load from beads: {e}")))?;
+        let tasks: Vec<Task> = beads
+            .into_iter()
+            .filter(|b| is_actionable_type(&b.issue_type))
+            .map(bead_to_task)
+            .collect();
+        Ok(Self { tasks, path: None })
     }
 
     /// Pick the next eligible task: pending, all dependencies completed, lowest priority number.
@@ -203,6 +220,57 @@ pub struct TaskQueueSummary {
     pub completed: u32,
     pub failed: u32,
     pub skipped: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Bead → Task conversion
+// ---------------------------------------------------------------------------
+
+/// Issue types we consider actionable for the task queue.
+fn is_actionable_type(issue_type: &str) -> bool {
+    matches!(
+        issue_type,
+        "task" | "bug" | "feature" | "chore" | "" // empty = untyped, include by default
+    )
+}
+
+/// Convert a [`Bead`] into a [`Task`].
+fn bead_to_task(bead: Bead) -> Task {
+    let objective = if bead.description.is_empty() {
+        bead.title
+    } else {
+        format!("{}\n\n{}", bead.title, bead.description)
+    };
+
+    let status = match bead.status.as_str() {
+        "open" => TaskStatus::Pending,
+        "in_progress" => TaskStatus::InProgress,
+        "closed" => TaskStatus::Completed,
+        "blocked" | "deferred" => TaskStatus::Skipped,
+        _ => TaskStatus::Pending,
+    };
+
+    // Map beads priority 0-4 → task priority 0-100 (multiply by 25).
+    let priority = (bead.priority.clamp(0, 4) as u32) * 25;
+
+    let depends_on: Vec<String> = bead
+        .dependencies
+        .into_iter()
+        .filter(|d| d.dep_type == "blocks")
+        .map(|d| d.target_id)
+        .collect();
+
+    let pr_url = bead.external_ref.filter(|r| r.starts_with("http"));
+
+    Task {
+        id: bead.id,
+        objective,
+        priority,
+        status,
+        depends_on,
+        error: None,
+        pr_url,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -507,5 +575,215 @@ mod tests {
         // Injected task has priority 0, so it should be picked first.
         let next = queue.pick_next().unwrap();
         assert_eq!(next.id, "injected-1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bead → Task conversion tests
+    // -----------------------------------------------------------------------
+
+    fn sample_bead() -> Bead {
+        Bead {
+            id: "bead-1".into(),
+            title: "Implement feature X".into(),
+            description: "Detailed description here".into(),
+            status: "open".into(),
+            priority: 1,
+            issue_type: "task".into(),
+            dependencies: vec![
+                glitchlab_memory::beads::BeadDependency {
+                    target_id: "bead-0".into(),
+                    dep_type: "blocks".into(),
+                },
+                glitchlab_memory::beads::BeadDependency {
+                    target_id: "bead-parent".into(),
+                    dep_type: "parent".into(),
+                },
+            ],
+            external_ref: Some("https://github.com/org/repo/pull/42".into()),
+            labels: vec!["backend".into()],
+            assignee: Some("alice".into()),
+        }
+    }
+
+    #[test]
+    fn bead_to_task_full() {
+        let task = bead_to_task(sample_bead());
+        assert_eq!(task.id, "bead-1");
+        assert_eq!(
+            task.objective,
+            "Implement feature X\n\nDetailed description here"
+        );
+        assert_eq!(task.priority, 25); // 1 * 25
+        assert_eq!(task.status, TaskStatus::Pending);
+        // Only "blocks" deps, not "parent"
+        assert_eq!(task.depends_on, vec!["bead-0"]);
+        assert_eq!(
+            task.pr_url.as_deref(),
+            Some("https://github.com/org/repo/pull/42")
+        );
+        assert!(task.error.is_none());
+    }
+
+    #[test]
+    fn bead_to_task_no_description() {
+        let bead = Bead {
+            id: "b".into(),
+            title: "Title only".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: 0,
+            issue_type: "bug".into(),
+            dependencies: vec![],
+            external_ref: None,
+            labels: vec![],
+            assignee: None,
+        };
+        let task = bead_to_task(bead);
+        assert_eq!(task.objective, "Title only");
+        assert_eq!(task.priority, 0); // 0 * 25
+    }
+
+    #[test]
+    fn bead_to_task_status_mapping() {
+        let statuses = [
+            ("open", TaskStatus::Pending),
+            ("in_progress", TaskStatus::InProgress),
+            ("closed", TaskStatus::Completed),
+            ("blocked", TaskStatus::Skipped),
+            ("deferred", TaskStatus::Skipped),
+            ("unknown_status", TaskStatus::Pending),
+        ];
+        for (bead_status, expected) in statuses {
+            let bead = Bead {
+                id: "s".into(),
+                title: "S".into(),
+                description: String::new(),
+                status: bead_status.into(),
+                priority: 2,
+                issue_type: "task".into(),
+                dependencies: vec![],
+                external_ref: None,
+                labels: vec![],
+                assignee: None,
+            };
+            let task = bead_to_task(bead);
+            assert_eq!(task.status, expected, "status mapping for '{bead_status}'");
+        }
+    }
+
+    #[test]
+    fn bead_to_task_priority_clamped() {
+        // Priority > 4 should be clamped to 4 → 100
+        let bead = Bead {
+            id: "p".into(),
+            title: "P".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: 99,
+            issue_type: "task".into(),
+            dependencies: vec![],
+            external_ref: None,
+            labels: vec![],
+            assignee: None,
+        };
+        let task = bead_to_task(bead);
+        assert_eq!(task.priority, 100);
+
+        // Negative priority should be clamped to 0 → 0
+        let bead_neg = Bead {
+            id: "n".into(),
+            title: "N".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: -5,
+            issue_type: "task".into(),
+            dependencies: vec![],
+            external_ref: None,
+            labels: vec![],
+            assignee: None,
+        };
+        let task_neg = bead_to_task(bead_neg);
+        assert_eq!(task_neg.priority, 0);
+    }
+
+    #[test]
+    fn bead_to_task_external_ref_not_url() {
+        let bead = Bead {
+            id: "e".into(),
+            title: "E".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: 2,
+            issue_type: "task".into(),
+            dependencies: vec![],
+            external_ref: Some("JIRA-1234".into()),
+            labels: vec![],
+            assignee: None,
+        };
+        let task = bead_to_task(bead);
+        assert!(
+            task.pr_url.is_none(),
+            "non-URL external_ref should not become pr_url"
+        );
+    }
+
+    #[test]
+    fn is_actionable_type_filters() {
+        assert!(is_actionable_type("task"));
+        assert!(is_actionable_type("bug"));
+        assert!(is_actionable_type("feature"));
+        assert!(is_actionable_type("chore"));
+        assert!(is_actionable_type("")); // untyped
+        assert!(!is_actionable_type("epic"));
+        assert!(!is_actionable_type("milestone"));
+    }
+
+    #[tokio::test]
+    async fn load_from_beads_filters_and_converts() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"[
+            {"id":"t1","title":"A task","issue_type":"task","priority":1},
+            {"id":"t2","title":"An epic","issue_type":"epic","priority":0},
+            {"id":"t3","title":"A bug","issue_type":"bug","priority":2,"status":"in_progress"}
+        ]"#;
+        let script = mock_bd_script(dir.path(), json);
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+
+        let queue = TaskQueue::load_from_beads(&client).await.unwrap();
+        // "epic" should be filtered out
+        assert_eq!(queue.tasks().len(), 2);
+        assert_eq!(queue.tasks()[0].id, "t1");
+        assert_eq!(queue.tasks()[1].id, "t3");
+        assert_eq!(queue.tasks()[1].status, TaskStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn load_from_beads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = mock_bd_script(dir.path(), "[]");
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+
+        let queue = TaskQueue::load_from_beads(&client).await.unwrap();
+        assert!(queue.tasks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_from_beads_error_propagates() {
+        let client = BeadsClient::new(Path::new("/tmp"), Some("nonexistent-bd-binary-xyz".into()));
+        let result = TaskQueue::load_from_beads(&client).await;
+        assert!(result.is_err());
+    }
+
+    /// Create a temporary shell script that echoes the given JSON to stdout.
+    fn mock_bd_script(dir: &std::path::Path, json: &str) -> std::path::PathBuf {
+        let script = dir.join("mock_bd");
+        let content = format!("#!/bin/sh\nprintf '%s' '{}'\n", json.replace('\'', "'\\''"));
+        std::fs::write(&script, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
     }
 }

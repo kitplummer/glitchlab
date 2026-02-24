@@ -8,7 +8,9 @@ use glitchlab_eng_org::orchestrator::{
 };
 use glitchlab_eng_org::pipeline::{AutoApproveHandler, InterventionHandler};
 use glitchlab_eng_org::taskqueue::TaskQueue;
+use glitchlab_memory::beads::BeadsClient;
 use glitchlab_memory::history::HistoryBackend;
+use tracing::{info, warn};
 
 use super::common;
 
@@ -52,9 +54,35 @@ pub async fn execute(args: BatchArgs<'_>) -> Result<()> {
         Some(p) => p.to_path_buf(),
         None => args.repo.join(".glitchlab/tasks/backlog.yaml"),
     };
-    let mut queue = TaskQueue::load(&tasks_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("failed to load task queue from {}", tasks_path.display()))?;
+    let mut queue = if config.memory.beads_enabled {
+        let client = BeadsClient::new(args.repo, config.memory.beads_bd_path.clone());
+        match TaskQueue::load_from_beads(&client).await {
+            Ok(q) if !q.tasks().is_empty() => {
+                info!(count = q.tasks().len(), "loaded tasks from beads");
+                q
+            }
+            Ok(_) => {
+                info!("beads returned no tasks, falling back to YAML");
+                TaskQueue::load(&tasks_path)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .with_context(|| {
+                        format!("failed to load task queue from {}", tasks_path.display())
+                    })?
+            }
+            Err(e) => {
+                warn!(error = %e, "beads loading failed, falling back to YAML");
+                TaskQueue::load(&tasks_path)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .with_context(|| {
+                        format!("failed to load task queue from {}", tasks_path.display())
+                    })?
+            }
+        }
+    } else {
+        TaskQueue::load(&tasks_path)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("failed to load task queue from {}", tasks_path.display()))?
+    };
 
     let summary = queue.summary();
     eprintln!(

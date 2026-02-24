@@ -1,13 +1,60 @@
 //! Beads (task graph) backend via the `bd` CLI subprocess.
 //!
-//! Beads is write-only for history purposes; reads go through Dolt or JSONL.
+//! Supports both write (history recording) and read (backlog loading via
+//! `bd list --json`). Reads are parsed into [`Bead`] structs which the
+//! eng-org `TaskQueue` can convert to `Task` items.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{MemoryError, Result};
 use crate::history::{HistoryBackend, HistoryEntry, HistoryQuery, HistoryStats};
+
+// ---------------------------------------------------------------------------
+// Bead data model (mirrors `bd list --json` output)
+// ---------------------------------------------------------------------------
+
+/// A single bead/issue from `bd list --json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bead {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_bead_status")]
+    pub status: String,
+    #[serde(default = "default_bead_priority")]
+    pub priority: i32,
+    #[serde(default)]
+    pub issue_type: String,
+    #[serde(default)]
+    pub dependencies: Vec<BeadDependency>,
+    #[serde(default)]
+    pub external_ref: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+}
+
+/// A dependency edge between two beads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadDependency {
+    pub target_id: String,
+    #[serde(default)]
+    pub dep_type: String,
+}
+
+fn default_bead_status() -> String {
+    "open".into()
+}
+
+fn default_bead_priority() -> i32 {
+    2
+}
 
 /// Beads task-graph client wrapping the `bd` CLI.
 pub struct BeadsClient {
@@ -70,9 +117,23 @@ impl BeadsClient {
             .await
     }
 
-    /// List beads.
+    /// List beads (raw text output).
     pub async fn list(&self) -> Result<String> {
         self.run_bd(&["list"]).await
+    }
+
+    /// List all beads, parsed from JSON.
+    pub async fn list_parsed(&self) -> Result<Vec<Bead>> {
+        let json = self.run_bd(&["list", "--json"]).await?;
+        serde_json::from_str(&json)
+            .map_err(|e| MemoryError::Beads(format!("failed to parse bd list: {e}")))
+    }
+
+    /// List ready (unblocked) beads, parsed from JSON.
+    pub async fn ready_parsed(&self) -> Result<Vec<Bead>> {
+        let json = self.run_bd(&["ready", "--json"]).await?;
+        serde_json::from_str(&json)
+            .map_err(|e| MemoryError::Beads(format!("failed to parse bd ready: {e}")))
     }
 }
 
@@ -182,5 +243,189 @@ mod tests {
         let result = client.run_bd(&["hello", "world"]).await.unwrap();
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bead struct tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bead_deserialize_full() {
+        let json = r#"{
+            "id": "task-42",
+            "title": "Fix the widget",
+            "description": "The widget is broken",
+            "status": "in_progress",
+            "priority": 1,
+            "issue_type": "bug",
+            "dependencies": [{"target_id": "task-1", "dep_type": "blocks"}],
+            "external_ref": "https://github.com/org/repo/pull/99",
+            "labels": ["urgent"],
+            "assignee": "alice"
+        }"#;
+        let bead: Bead = serde_json::from_str(json).unwrap();
+        assert_eq!(bead.id, "task-42");
+        assert_eq!(bead.title, "Fix the widget");
+        assert_eq!(bead.description, "The widget is broken");
+        assert_eq!(bead.status, "in_progress");
+        assert_eq!(bead.priority, 1);
+        assert_eq!(bead.issue_type, "bug");
+        assert_eq!(bead.dependencies.len(), 1);
+        assert_eq!(bead.dependencies[0].target_id, "task-1");
+        assert_eq!(bead.dependencies[0].dep_type, "blocks");
+        assert_eq!(
+            bead.external_ref.as_deref(),
+            Some("https://github.com/org/repo/pull/99")
+        );
+        assert_eq!(bead.labels, vec!["urgent"]);
+        assert_eq!(bead.assignee.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn bead_deserialize_minimal() {
+        let json = r#"{"id": "t1", "title": "Do something"}"#;
+        let bead: Bead = serde_json::from_str(json).unwrap();
+        assert_eq!(bead.id, "t1");
+        assert_eq!(bead.title, "Do something");
+        assert_eq!(bead.description, "");
+        assert_eq!(bead.status, "open");
+        assert_eq!(bead.priority, 2);
+        assert_eq!(bead.issue_type, "");
+        assert!(bead.dependencies.is_empty());
+        assert!(bead.external_ref.is_none());
+        assert!(bead.labels.is_empty());
+        assert!(bead.assignee.is_none());
+    }
+
+    #[test]
+    fn bead_deserialize_array() {
+        let json = r#"[
+            {"id": "a", "title": "First"},
+            {"id": "b", "title": "Second", "priority": 0}
+        ]"#;
+        let beads: Vec<Bead> = serde_json::from_str(json).unwrap();
+        assert_eq!(beads.len(), 2);
+        assert_eq!(beads[0].id, "a");
+        assert_eq!(beads[1].priority, 0);
+    }
+
+    #[test]
+    fn bead_deserialize_empty_array() {
+        let beads: Vec<Bead> = serde_json::from_str("[]").unwrap();
+        assert!(beads.is_empty());
+    }
+
+    #[test]
+    fn bead_serde_roundtrip() {
+        let bead = Bead {
+            id: "rt-1".into(),
+            title: "Roundtrip".into(),
+            description: "test".into(),
+            status: "open".into(),
+            priority: 3,
+            issue_type: "task".into(),
+            dependencies: vec![BeadDependency {
+                target_id: "rt-0".into(),
+                dep_type: "blocks".into(),
+            }],
+            external_ref: Some("https://example.com".into()),
+            labels: vec!["label1".into()],
+            assignee: None,
+        };
+        let json = serde_json::to_string(&bead).unwrap();
+        let parsed: Bead = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, bead.id);
+        assert_eq!(parsed.dependencies.len(), 1);
+        assert_eq!(parsed.dependencies[0].target_id, "rt-0");
+    }
+
+    #[test]
+    fn bead_dependency_defaults() {
+        let json = r#"{"target_id": "dep-1"}"#;
+        let dep: BeadDependency = serde_json::from_str(json).unwrap();
+        assert_eq!(dep.target_id, "dep-1");
+        assert_eq!(dep.dep_type, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // list_parsed / ready_parsed tests (using shell script as mock bd)
+    // -----------------------------------------------------------------------
+
+    /// Create a temporary shell script that echoes the given JSON to stdout.
+    fn mock_bd_script(dir: &std::path::Path, json: &str) -> PathBuf {
+        let script = dir.join("mock_bd");
+        let content = format!("#!/bin/sh\nprintf '%s' '{}'\n", json.replace('\'', "'\\''"));
+        std::fs::write(&script, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
+    }
+
+    #[tokio::test]
+    async fn list_parsed_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let json =
+            r#"[{"id":"t1","title":"Task One"},{"id":"t2","title":"Task Two","priority":0}]"#;
+        let script = mock_bd_script(dir.path(), json);
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let beads = client.list_parsed().await.unwrap();
+        assert_eq!(beads.len(), 2);
+        assert_eq!(beads[0].id, "t1");
+        assert_eq!(beads[1].priority, 0);
+    }
+
+    #[tokio::test]
+    async fn list_parsed_empty_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = mock_bd_script(dir.path(), "[]");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let beads = client.list_parsed().await.unwrap();
+        assert!(beads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_parsed_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = mock_bd_script(dir.path(), "not json at all");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let result = client.list_parsed().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, MemoryError::Beads(_)));
+        assert!(err.to_string().contains("failed to parse bd list"));
+    }
+
+    #[tokio::test]
+    async fn ready_parsed_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"[{"id":"r1","title":"Ready task"}]"#;
+        let script = mock_bd_script(dir.path(), json);
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let beads = client.ready_parsed().await.unwrap();
+        assert_eq!(beads.len(), 1);
+        assert_eq!(beads[0].id, "r1");
+    }
+
+    #[tokio::test]
+    async fn ready_parsed_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = mock_bd_script(dir.path(), "{bad");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let result = client.ready_parsed().await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("failed to parse bd ready")
+        );
     }
 }
