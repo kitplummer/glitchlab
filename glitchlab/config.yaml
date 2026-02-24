@@ -80,3 +80,20 @@ boundaries:
   # Example for Zephyr:
   # - "crates/zephyr-core"
   # - "crates/zephyr-envelope"
+
+# Agent pipeline definition
+pipeline:
+  stages:
+    - monitor
+    - act
+    - report
+
+# External tool configuration
+tools:
+  allowlist:
+    - "fly.io deploy"
+    - "health checks"
+
+# Governance settings
+governance:
+  strict_mode: true
