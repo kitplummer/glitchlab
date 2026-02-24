@@ -738,4 +738,39 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(result.content, "no files matched");
     }
+
+    #[tokio::test]
+    async fn read_file_start_line_only() {
+        let dir = TempDir::new().unwrap();
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("lines.txt"), &content).unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+        let call = make_call("read_file", json!({"path": "lines.txt", "start_line": 8}));
+        let result = dispatcher.dispatch(&call).await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("line 8"));
+        assert!(result.content.contains("line 10"));
+        assert!(!result.content.contains("line 7"));
+        assert!(result.content.contains("[lines 8-10 of 10]"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_not_found_with_hint() {
+        let dir = TempDir::new().unwrap();
+        let content = "fn main() {\n    println!(\"hello\");\n    return;\n}\n";
+        std::fs::write(dir.path().join("code.rs"), content).unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+        // First line matches but full string doesn't → hint shown.
+        let call = make_call(
+            "edit_file",
+            json!({"path": "code.rs", "old_string": "fn main() {\n    DIFFERENT", "new_string": "x"}),
+        );
+        let result = dispatcher.dispatch(&call).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("old_string not found"));
+        assert!(result.content.contains("Hint: line"));
+    }
 }

@@ -239,6 +239,7 @@ fn sample_entry(task_id: &str, status: &str) -> HistoryEntry {
         events_summary: EventsSummary::default(),
         stage_outputs: None,
         events: None,
+        outcome_context: None,
     }
 }
 
@@ -271,7 +272,13 @@ async fn pipeline_records_history_to_composite() {
 
     // Run pipeline for "task-1".
     let _result = pipeline
-        .run("task-1", "Add a feature", repo_dir.path(), &base_branch)
+        .run(
+            "task-1",
+            "Add a feature",
+            repo_dir.path(),
+            &base_branch,
+            &[],
+        )
         .await;
 
     // Assert: both JSONL backends have an entry for "task-1" (proves fanout).
@@ -343,6 +350,7 @@ async fn failure_context_flows_across_runs() {
             "Fix the broken tests",
             repo_dir.path(),
             &base_branch,
+            &[],
         )
         .await;
 
@@ -399,7 +407,13 @@ async fn failure_context_flows_across_runs() {
     let pipeline2 = EngineeringPipeline::new(router2, config2, handler2, composite.clone());
 
     let _result2 = pipeline2
-        .run("task-2", "Add a feature", repo_dir.path(), &base_branch)
+        .run(
+            "task-2",
+            "Add a feature",
+            repo_dir.path(),
+            &base_branch,
+            &[],
+        )
         .await;
 
     // Assert: history now has >= 2 entries.
@@ -463,6 +477,7 @@ async fn history_persists_across_pipeline_instances() {
                 "Add a feature",
                 repo_dir.path(),
                 &base_branch,
+                &[],
             )
             .await;
     }

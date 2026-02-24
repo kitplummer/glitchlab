@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use glitchlab_kernel::agent::AgentOutput;
 use glitchlab_kernel::budget::BudgetTracker;
 use glitchlab_kernel::error::{Error, Result};
+use glitchlab_kernel::outcome::OutcomeContext;
 use glitchlab_kernel::pipeline::PipelineStatus;
 use glitchlab_memory::history::HistoryBackend;
 use glitchlab_router::Router;
@@ -249,6 +250,8 @@ pub struct TaskRunResult {
     pub tokens: u64,
     pub pr_url: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_context: Option<OutcomeContext>,
 }
 
 /// Result of the full orchestrator run.
@@ -257,6 +260,8 @@ pub struct OrchestratorResult {
     pub tasks_attempted: u32,
     pub tasks_succeeded: u32,
     pub tasks_failed: u32,
+    #[serde(default)]
+    pub tasks_deferred: u32,
     pub total_cost: f64,
     pub total_tokens: u64,
     pub duration: Duration,
@@ -274,6 +279,77 @@ pub struct OrchestratorParams {
     pub base_branch: String,
     pub quality_gate_command: Option<String>,
     pub stop_on_failure: bool,
+}
+
+// ---------------------------------------------------------------------------
+// OutcomeRouting — result of route_outcome()
+// ---------------------------------------------------------------------------
+
+/// What the orchestrator should do after routing a pipeline outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutcomeRouting {
+    /// Task status to set in the queue.
+    pub task_status: TaskStatus,
+    /// Which result counter to increment.
+    pub counter: OutcomeCounter,
+    /// Whether to save the OutcomeContext on the task and queue.
+    pub save_context: bool,
+    /// Whether to record the attempt in the AttemptTracker.
+    pub track_attempt: bool,
+}
+
+/// Which result counter to increment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeCounter {
+    Succeeded,
+    Failed,
+    Deferred,
+    None,
+}
+
+// ---------------------------------------------------------------------------
+// AttemptTracker — records per-task outcome history
+// ---------------------------------------------------------------------------
+
+/// Tracks outcome contexts across multiple attempts for the same task.
+///
+/// Used by the orchestrator to (a) enforce a max-attempt limit and
+/// (b) inject structured failure context into the planner so it can
+/// learn from prior failures.
+pub struct AttemptTracker {
+    history: HashMap<String, Vec<OutcomeContext>>,
+}
+
+impl AttemptTracker {
+    pub fn new() -> Self {
+        Self {
+            history: HashMap::new(),
+        }
+    }
+
+    /// Record an outcome context for a task attempt.
+    pub fn record(&mut self, task_id: &str, ctx: OutcomeContext) {
+        self.history
+            .entry(task_id.to_string())
+            .or_default()
+            .push(ctx);
+    }
+
+    /// How many attempts have been recorded for a task.
+    pub fn count(&self, task_id: &str) -> usize {
+        self.history.get(task_id).map_or(0, |v| v.len())
+    }
+
+    /// Get the history of outcome contexts for a task.
+    pub fn contexts(&self, task_id: &str) -> &[OutcomeContext] {
+        self.history.get(task_id).map_or(&[], |v| v.as_slice())
+    }
+}
+
+impl Default for AttemptTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,11 +391,14 @@ impl Orchestrator {
         params: &OrchestratorParams,
     ) -> OrchestratorResult {
         let start_time = Instant::now();
+        let mut tracker = AttemptTracker::new();
+        let max_attempts = self.config.limits.max_fix_attempts as usize;
 
         let mut result = OrchestratorResult {
             tasks_attempted: 0,
             tasks_succeeded: 0,
             tasks_failed: 0,
+            tasks_deferred: 0,
             total_cost: 0.0,
             total_tokens: 0,
             duration: Duration::from_secs(0), // Will be updated before return
@@ -355,6 +434,31 @@ impl Orchestrator {
                 }
             }
 
+            // --- Check attempt limit ---
+            if tracker.count(&task_id) >= max_attempts {
+                info!(
+                    task_id = %task_id,
+                    attempts = tracker.count(&task_id),
+                    max = max_attempts,
+                    "max attempts exceeded, marking failed"
+                );
+                queue.update_status(&task_id, TaskStatus::Failed);
+                queue.set_error(&task_id, format!("exceeded max attempts ({max_attempts})"));
+                let _ = queue.save();
+                result.tasks_attempted += 1;
+                result.tasks_failed += 1;
+                result.run_results.push(TaskRunResult {
+                    task_id: task_id.clone(),
+                    status: "max_attempts_exceeded".into(),
+                    cost: 0.0,
+                    tokens: 0,
+                    pr_url: None,
+                    error: Some(format!("exceeded max attempts ({max_attempts})")),
+                    outcome_context: None,
+                });
+                continue;
+            }
+
             // --- Mark in progress ---
             queue.update_status(&task_id, TaskStatus::InProgress);
             let _ = queue.save();
@@ -362,8 +466,9 @@ impl Orchestrator {
             info!(task_id = %task_id, "starting task");
 
             // --- Create fresh router + pipeline for this task ---
+            let attempt_contexts = tracker.contexts(&task_id);
             let pipeline_result = match self
-                .create_and_run_pipeline(&task_id, &objective, params)
+                .create_and_run_pipeline(&task_id, &objective, params, attempt_contexts)
                 .await
             {
                 Ok(pr) => pr,
@@ -382,6 +487,7 @@ impl Orchestrator {
                         tokens: 0,
                         pr_url: None,
                         error: Some(e.to_string()),
+                        outcome_context: None,
                     });
 
                     if params.stop_on_failure {
@@ -401,12 +507,6 @@ impl Orchestrator {
             result.total_cost += cost;
             result.total_tokens += tokens;
 
-            let decomposed = pipeline_result.status == PipelineStatus::Decomposed;
-            let succeeded = matches!(
-                pipeline_result.status,
-                PipelineStatus::PrCreated | PipelineStatus::Committed
-            );
-
             let run_result = TaskRunResult {
                 task_id: task_id.clone(),
                 status: status_str,
@@ -414,11 +514,14 @@ impl Orchestrator {
                 tokens,
                 pr_url: pipeline_result.pr_url.clone(),
                 error: pipeline_result.error.clone(),
+                outcome_context: pipeline_result.outcome_context.clone(),
             };
             result.run_results.push(run_result);
 
-            // --- Handle decomposition ---
-            if decomposed {
+            // --- Outcome-aware status routing ---
+
+            // Handle decomposition specially (needs sub-task extraction).
+            if pipeline_result.status == PipelineStatus::Decomposed {
                 if let Some(sub_tasks) =
                     Self::extract_sub_tasks(&task_id, &pipeline_result.stage_outputs)
                 {
@@ -439,21 +542,43 @@ impl Orchestrator {
                 continue;
             }
 
-            // --- Update task status ---
-            if succeeded {
-                result.tasks_succeeded += 1;
-                queue.update_status(&task_id, TaskStatus::Completed);
-                if let Some(ref url) = pipeline_result.pr_url {
-                    queue.set_pr_url(&task_id, url.clone());
+            let routing = Self::route_outcome(&pipeline_result);
+            queue.update_status(&task_id, routing.task_status.clone());
+
+            match routing.counter {
+                OutcomeCounter::Succeeded => result.tasks_succeeded += 1,
+                OutcomeCounter::Failed => result.tasks_failed += 1,
+                OutcomeCounter::Deferred => result.tasks_deferred += 1,
+                OutcomeCounter::None => {}
+            }
+
+            if let Some(ref url) = pipeline_result.pr_url {
+                queue.set_pr_url(&task_id, url.clone());
+            }
+            if let Some(ref err) = pipeline_result.error {
+                queue.set_error(&task_id, err.clone());
+            }
+            if let Some(ctx) = pipeline_result.outcome_context.clone() {
+                if routing.save_context {
+                    queue.set_outcome_context(&task_id, ctx.clone());
                 }
-            } else {
-                result.tasks_failed += 1;
-                queue.update_status(&task_id, TaskStatus::Failed);
-                if let Some(ref err) = pipeline_result.error {
-                    queue.set_error(&task_id, err.clone());
+                if routing.track_attempt {
+                    tracker.record(&task_id, ctx);
                 }
             }
+
+            if routing.task_status == TaskStatus::Deferred {
+                let _ = queue.save();
+                info!(task_id = %task_id, "task deferred, will retry later");
+                continue;
+            }
+
             let _ = queue.save();
+
+            let succeeded = matches!(
+                pipeline_result.status,
+                PipelineStatus::PrCreated | PipelineStatus::Committed
+            );
 
             info!(
                 task_id = %task_id,
@@ -491,6 +616,7 @@ impl Orchestrator {
             tasks_attempted = result.tasks_attempted,
             tasks_succeeded = result.tasks_succeeded,
             tasks_failed = result.tasks_failed,
+            tasks_deferred = result.tasks_deferred,
             total_cost = result.total_cost,
             total_tokens = result.total_tokens,
             duration_ms = result.duration.as_millis(),
@@ -507,6 +633,7 @@ impl Orchestrator {
         task_id: &str,
         objective: &str,
         params: &OrchestratorParams,
+        previous_attempts: &[OutcomeContext],
     ) -> Result<glitchlab_kernel::pipeline::PipelineResult> {
         let budget_tracker = BudgetTracker::new(
             self.config.limits.max_tokens_per_task,
@@ -540,8 +667,61 @@ impl Orchestrator {
         );
 
         Ok(pipeline
-            .run(task_id, objective, &params.repo_path, &params.base_branch)
+            .run(
+                task_id,
+                objective,
+                &params.repo_path,
+                &params.base_branch,
+                previous_attempts,
+            )
             .await)
+    }
+
+    /// Route a pipeline result to the appropriate queue/tracker updates.
+    ///
+    /// Returns the `TaskStatus` to set, the `OutcomeContext` (if any),
+    /// and counters to update.
+    fn route_outcome(
+        pipeline_result: &glitchlab_kernel::pipeline::PipelineResult,
+    ) -> OutcomeRouting {
+        match pipeline_result.status {
+            PipelineStatus::PrCreated | PipelineStatus::Committed => OutcomeRouting {
+                task_status: TaskStatus::Completed,
+                counter: OutcomeCounter::Succeeded,
+                save_context: false,
+                track_attempt: false,
+            },
+            PipelineStatus::Decomposed => OutcomeRouting {
+                task_status: TaskStatus::Completed,
+                counter: OutcomeCounter::None,
+                save_context: false,
+                track_attempt: false,
+            },
+            PipelineStatus::Deferred => OutcomeRouting {
+                task_status: TaskStatus::Deferred,
+                counter: OutcomeCounter::Deferred,
+                save_context: true,
+                track_attempt: true,
+            },
+            PipelineStatus::Blocked => OutcomeRouting {
+                task_status: TaskStatus::Skipped,
+                counter: OutcomeCounter::Failed,
+                save_context: true,
+                track_attempt: false,
+            },
+            PipelineStatus::Retryable => OutcomeRouting {
+                task_status: TaskStatus::Failed,
+                counter: OutcomeCounter::Failed,
+                save_context: true,
+                track_attempt: true,
+            },
+            _ => OutcomeRouting {
+                task_status: TaskStatus::Failed,
+                counter: OutcomeCounter::Failed,
+                save_context: false,
+                track_attempt: false,
+            },
+        }
     }
 
     /// Extract sub-tasks from a decomposed pipeline result.
@@ -595,6 +775,7 @@ impl Orchestrator {
                 depends_on,
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             });
         }
 
@@ -821,6 +1002,7 @@ mod tests {
             depends_on: vec![],
             error: None,
             pr_url: None,
+            outcome_context: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(0.10); // less than per-task $0.50
@@ -855,6 +1037,7 @@ mod tests {
                 depends_on: vec![],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
             Task {
                 id: "b".into(),
@@ -864,6 +1047,7 @@ mod tests {
                 depends_on: vec!["a".into()],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
         ];
         let mut queue = TaskQueue::from_tasks(tasks);
@@ -890,6 +1074,7 @@ mod tests {
             tasks_attempted: 3,
             tasks_succeeded: 2,
             tasks_failed: 1,
+            tasks_deferred: 0,
             total_cost: 12.50,
             total_tokens: 150000,
             duration: Duration::from_millis(5000),
@@ -901,6 +1086,7 @@ mod tests {
                 tokens: 50000,
                 pr_url: Some("https://example.com/pr/1".into()),
                 error: None,
+                outcome_context: None,
             }],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -932,6 +1118,7 @@ mod tests {
             depends_on: vec![],
             error: None,
             pr_url: None,
+            outcome_context: None,
         }
     }
 
@@ -1121,6 +1308,7 @@ mod tests {
             tokens: 25000,
             pr_url: Some("https://example.com/pr/1".into()),
             error: None,
+            outcome_context: None,
         };
         let json = serde_json::to_string(&trr).unwrap();
         let parsed: TaskRunResult = serde_json::from_str(&json).unwrap();
@@ -1284,5 +1472,239 @@ mod tests {
         stage_outputs.insert("plan".into(), plan_output);
 
         assert!(Orchestrator::extract_sub_tasks("x", &stage_outputs).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // AttemptTracker tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attempt_tracker_empty() {
+        let tracker = AttemptTracker::new();
+        assert_eq!(tracker.count("task-1"), 0);
+        assert!(tracker.contexts("task-1").is_empty());
+    }
+
+    #[test]
+    fn attempt_tracker_records_and_counts() {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+        let mut tracker = AttemptTracker::new();
+        let ctx = OutcomeContext {
+            approach: "first try".into(),
+            obstacle: ObstacleKind::Unknown {
+                detail: "failed".into(),
+            },
+            discoveries: vec![],
+            recommendation: None,
+            files_explored: vec![],
+        };
+        tracker.record("task-1", ctx.clone());
+        assert_eq!(tracker.count("task-1"), 1);
+        assert_eq!(tracker.count("task-2"), 0);
+
+        tracker.record("task-1", ctx);
+        assert_eq!(tracker.count("task-1"), 2);
+    }
+
+    #[test]
+    fn attempt_tracker_contexts_returns_history() {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+        let mut tracker = AttemptTracker::new();
+        tracker.record(
+            "t1",
+            OutcomeContext {
+                approach: "attempt 1".into(),
+                obstacle: ObstacleKind::TestFailure {
+                    attempts: 1,
+                    last_error: "err".into(),
+                },
+                discoveries: vec!["found X".into()],
+                recommendation: None,
+                files_explored: vec![],
+            },
+        );
+        tracker.record(
+            "t1",
+            OutcomeContext {
+                approach: "attempt 2".into(),
+                obstacle: ObstacleKind::TestFailure {
+                    attempts: 2,
+                    last_error: "still err".into(),
+                },
+                discoveries: vec![],
+                recommendation: Some("try Y".into()),
+                files_explored: vec![],
+            },
+        );
+
+        let contexts = tracker.contexts("t1");
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].approach, "attempt 1");
+        assert_eq!(contexts[1].approach, "attempt 2");
+    }
+
+    #[test]
+    fn attempt_tracker_default() {
+        let tracker = AttemptTracker::default();
+        assert_eq!(tracker.count("x"), 0);
+    }
+
+    #[test]
+    fn task_run_result_with_outcome_context_serde() {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+        let trr = TaskRunResult {
+            task_id: "t1".into(),
+            status: "Deferred".into(),
+            cost: 0.5,
+            tokens: 5000,
+            pr_url: None,
+            error: Some("deferred".into()),
+            outcome_context: Some(OutcomeContext {
+                approach: "tried X".into(),
+                obstacle: ObstacleKind::MissingPrerequisite {
+                    task_id: "dep-1".into(),
+                    reason: "not ready".into(),
+                },
+                discoveries: vec![],
+                recommendation: None,
+                files_explored: vec![],
+            }),
+        };
+        let json = serde_json::to_string(&trr).unwrap();
+        assert!(json.contains("outcome_context"));
+        let parsed: TaskRunResult = serde_json::from_str(&json).unwrap();
+        assert!(parsed.outcome_context.is_some());
+    }
+
+    #[test]
+    fn orchestrator_result_with_deferred_serde() {
+        let result = OrchestratorResult {
+            tasks_attempted: 5,
+            tasks_succeeded: 2,
+            tasks_failed: 1,
+            tasks_deferred: 2,
+            total_cost: 5.0,
+            total_tokens: 50000,
+            duration: Duration::from_millis(1000),
+            cease_reason: CeaseReason::AllTasksDone,
+            run_results: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tasks_deferred, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // route_outcome tests
+    // -----------------------------------------------------------------------
+
+    fn make_pipeline_result(status: PipelineStatus) -> glitchlab_kernel::pipeline::PipelineResult {
+        glitchlab_kernel::pipeline::PipelineResult {
+            status,
+            stage_outputs: HashMap::new(),
+            events: vec![],
+            budget: glitchlab_kernel::budget::BudgetSummary::default(),
+            pr_url: None,
+            branch: None,
+            error: None,
+            outcome_context: None,
+        }
+    }
+
+    #[test]
+    fn route_outcome_pr_created() {
+        let pr = make_pipeline_result(PipelineStatus::PrCreated);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Completed);
+        assert_eq!(routing.counter, OutcomeCounter::Succeeded);
+        assert!(!routing.save_context);
+        assert!(!routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_committed() {
+        let pr = make_pipeline_result(PipelineStatus::Committed);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Completed);
+        assert_eq!(routing.counter, OutcomeCounter::Succeeded);
+    }
+
+    #[test]
+    fn route_outcome_deferred() {
+        let pr = make_pipeline_result(PipelineStatus::Deferred);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Deferred);
+        assert_eq!(routing.counter, OutcomeCounter::Deferred);
+        assert!(routing.save_context);
+        assert!(routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_blocked() {
+        let pr = make_pipeline_result(PipelineStatus::Blocked);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Skipped);
+        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert!(routing.save_context);
+        assert!(!routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_retryable() {
+        let pr = make_pipeline_result(PipelineStatus::Retryable);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Failed);
+        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert!(routing.save_context);
+        assert!(routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_implementation_failed() {
+        let pr = make_pipeline_result(PipelineStatus::ImplementationFailed);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Failed);
+        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert!(!routing.save_context);
+        assert!(!routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_decomposed() {
+        let pr = make_pipeline_result(PipelineStatus::Decomposed);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Completed);
+        assert_eq!(routing.counter, OutcomeCounter::None);
+    }
+
+    #[test]
+    fn route_outcome_tests_failed() {
+        let pr = make_pipeline_result(PipelineStatus::TestsFailed);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Failed);
+        assert_eq!(routing.counter, OutcomeCounter::Failed);
+    }
+
+    #[test]
+    fn route_outcome_error() {
+        let pr = make_pipeline_result(PipelineStatus::Error);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Failed);
+        assert_eq!(routing.counter, OutcomeCounter::Failed);
+    }
+
+    #[test]
+    fn outcome_routing_eq() {
+        let a = OutcomeRouting {
+            task_status: TaskStatus::Deferred,
+            counter: OutcomeCounter::Deferred,
+            save_context: true,
+            track_attempt: true,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
     }
 }

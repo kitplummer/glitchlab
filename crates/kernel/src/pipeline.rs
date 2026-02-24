@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{AgentContext, AgentOutput};
 use crate::budget::BudgetSummary;
 use crate::error;
+use crate::outcome::OutcomeContext;
 
 // ---------------------------------------------------------------------------
 // Pipeline trait
@@ -128,6 +129,10 @@ pub struct PipelineResult {
 
     /// Error message if the pipeline failed.
     pub error: Option<String>,
+
+    /// Structured context from a failed/deferred run (for learning).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_context: Option<OutcomeContext>,
 }
 
 /// Possible pipeline outcomes.
@@ -156,6 +161,12 @@ pub enum PipelineStatus {
     TimedOut,
     /// Task was decomposed into sub-tasks (not a failure).
     Decomposed,
+    /// Agent couldn't proceed — re-queue with context for a later attempt.
+    Deferred,
+    /// External dependency or human decision needed — not retryable automatically.
+    Blocked,
+    /// Transient failure — safe to retry with backoff.
+    Retryable,
     /// Unrecoverable error.
     Error,
 }
@@ -285,5 +296,91 @@ mod tests {
         let stage: PipelineStage = serde_json::from_str(json).unwrap();
         assert!(!stage.optional);
         assert!(stage.condition.is_none());
+    }
+
+    #[test]
+    fn pipeline_status_deferred_serde() {
+        let status = PipelineStatus::Deferred;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"deferred\"");
+        let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PipelineStatus::Deferred);
+    }
+
+    #[test]
+    fn pipeline_status_blocked_serde() {
+        let status = PipelineStatus::Blocked;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"blocked\"");
+        let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PipelineStatus::Blocked);
+    }
+
+    #[test]
+    fn pipeline_status_retryable_serde() {
+        let status = PipelineStatus::Retryable;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"retryable\"");
+        let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PipelineStatus::Retryable);
+    }
+
+    #[test]
+    fn pipeline_result_with_outcome_context() {
+        use crate::outcome::{ObstacleKind, OutcomeContext};
+
+        let result = PipelineResult {
+            status: PipelineStatus::Deferred,
+            stage_outputs: HashMap::new(),
+            events: vec![],
+            budget: crate::budget::BudgetSummary {
+                total_tokens: 100,
+                estimated_cost: 0.01,
+                call_count: 1,
+                tokens_remaining: 99900,
+                dollars_remaining: 9.99,
+            },
+            pr_url: None,
+            branch: None,
+            error: Some("deferred: missing prerequisite".into()),
+            outcome_context: Some(OutcomeContext {
+                approach: "tried to implement".into(),
+                obstacle: ObstacleKind::MissingPrerequisite {
+                    task_id: "dep-1".into(),
+                    reason: "schema not ready".into(),
+                },
+                discoveries: vec!["found existing migration".into()],
+                recommendation: Some("wait for dep-1".into()),
+                files_explored: vec!["src/db.rs".into()],
+            }),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("outcome_context"));
+        assert!(json.contains("missing_prerequisite"));
+        let parsed: PipelineResult = serde_json::from_str(&json).unwrap();
+        assert!(parsed.outcome_context.is_some());
+    }
+
+    #[test]
+    fn pipeline_result_without_outcome_context() {
+        let result = PipelineResult {
+            status: PipelineStatus::PrCreated,
+            stage_outputs: HashMap::new(),
+            events: vec![],
+            budget: crate::budget::BudgetSummary {
+                total_tokens: 100,
+                estimated_cost: 0.01,
+                call_count: 1,
+                tokens_remaining: 99900,
+                dollars_remaining: 9.99,
+            },
+            pr_url: Some("https://example.com/pr/1".into()),
+            branch: Some("feature/x".into()),
+            error: None,
+            outcome_context: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        // outcome_context should be skipped when None
+        assert!(!json.contains("outcome_context"));
     }
 }

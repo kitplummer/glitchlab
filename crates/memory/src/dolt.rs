@@ -119,6 +119,7 @@ impl DoltHistory {
             },
             stage_outputs,
             events,
+            outcome_context: None,
         }
     }
 }
@@ -434,6 +435,7 @@ mod tests {
             events_summary: EventsSummary::default(),
             stage_outputs: None,
             events: None,
+            outcome_context: None,
         };
         dh.record(&entry).await.expect("record failed");
 
@@ -463,6 +465,7 @@ mod tests {
                 serde_json::json!({"steps": [1, 2, 3]}),
             )])),
             events: Some(vec![serde_json::json!({"kind": "test"})]),
+            outcome_context: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

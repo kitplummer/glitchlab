@@ -4,5 +4,6 @@ pub mod context;
 pub mod error;
 pub mod governance;
 pub mod org;
+pub mod outcome;
 pub mod pipeline;
 pub mod tool;

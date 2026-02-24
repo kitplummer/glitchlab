@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use glitchlab_kernel::error::{Error, Result};
+use glitchlab_kernel::outcome::OutcomeContext;
 use glitchlab_memory::beads::{Bead, BeadsClient};
 
 // ---------------------------------------------------------------------------
@@ -19,6 +20,7 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Skipped,
+    Deferred,
 }
 
 /// A single task in the backlog.
@@ -36,6 +38,8 @@ pub struct Task {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_context: Option<OutcomeContext>,
 }
 
 fn default_priority() -> u32 {
@@ -114,7 +118,7 @@ impl TaskQueue {
 
         self.tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Pending)
+            .filter(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Deferred))
             .filter(|t| {
                 t.depends_on
                     .iter()
@@ -170,6 +174,7 @@ impl TaskQueue {
                 TaskStatus::Completed => s.completed += 1,
                 TaskStatus::Failed => s.failed += 1,
                 TaskStatus::Skipped => s.skipped += 1,
+                TaskStatus::Deferred => s.deferred += 1,
             }
         }
         s.total = self.tasks.len() as u32;
@@ -190,7 +195,22 @@ impl TaskQueue {
         &self.tasks
     }
 
-    /// Count of remaining actionable tasks (pending with satisfied deps).
+    /// Set the outcome context on a task (for deferred/failed tasks).
+    pub fn set_outcome_context(&mut self, task_id: &str, ctx: OutcomeContext) {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+            task.outcome_context = Some(ctx);
+        }
+    }
+
+    /// Get the outcome context for a task.
+    pub fn outcome_context(&self, task_id: &str) -> Option<&OutcomeContext> {
+        self.tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .and_then(|t| t.outcome_context.as_ref())
+    }
+
+    /// Count of remaining actionable tasks (pending or deferred with satisfied deps).
     pub fn actionable_count(&self) -> usize {
         let completed_ids: std::collections::HashSet<&str> = self
             .tasks
@@ -201,7 +221,7 @@ impl TaskQueue {
 
         self.tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Pending)
+            .filter(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Deferred))
             .filter(|t| {
                 t.depends_on
                     .iter()
@@ -220,6 +240,7 @@ pub struct TaskQueueSummary {
     pub completed: u32,
     pub failed: u32,
     pub skipped: u32,
+    pub deferred: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +267,8 @@ fn bead_to_task(bead: Bead) -> Task {
         "open" => TaskStatus::Pending,
         "in_progress" => TaskStatus::InProgress,
         "closed" => TaskStatus::Completed,
-        "blocked" | "deferred" => TaskStatus::Skipped,
+        "blocked" => TaskStatus::Skipped,
+        "deferred" => TaskStatus::Deferred,
         _ => TaskStatus::Pending,
     };
 
@@ -270,6 +292,7 @@ fn bead_to_task(bead: Bead) -> Task {
         depends_on,
         error: None,
         pr_url,
+        outcome_context: None,
     }
 }
 
@@ -291,6 +314,7 @@ mod tests {
                 depends_on: vec![],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
             Task {
                 id: "task-2".into(),
@@ -300,6 +324,7 @@ mod tests {
                 depends_on: vec!["task-1".into()],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
             Task {
                 id: "task-3".into(),
@@ -309,6 +334,7 @@ mod tests {
                 depends_on: vec![],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
         ]
     }
@@ -360,6 +386,7 @@ mod tests {
                 depends_on: vec![],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
             Task {
                 id: "b".into(),
@@ -369,6 +396,7 @@ mod tests {
                 depends_on: vec!["a".into()],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -490,6 +518,7 @@ mod tests {
             TaskStatus::Completed,
             TaskStatus::Failed,
             TaskStatus::Skipped,
+            TaskStatus::Deferred,
         ];
         for status in statuses {
             let json = serde_json::to_string(&status).unwrap();
@@ -508,6 +537,7 @@ mod tests {
             depends_on: vec!["dep-1".into()],
             error: Some("oops".into()),
             pr_url: Some("https://example.com/pr/1".into()),
+            outcome_context: None,
         };
         let yaml = serde_yaml::to_string(&task).unwrap();
         let parsed: Task = serde_yaml::from_str(&yaml).unwrap();
@@ -529,6 +559,7 @@ mod tests {
                 depends_on: vec![],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
             Task {
                 id: "b".into(),
@@ -538,6 +569,7 @@ mod tests {
                 depends_on: vec![],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
             Task {
                 id: "c".into(),
@@ -547,6 +579,7 @@ mod tests {
                 depends_on: vec!["a".into(), "b".into()],
                 error: None,
                 pr_url: None,
+                outcome_context: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -569,6 +602,7 @@ mod tests {
             depends_on: vec![],
             error: None,
             pr_url: None,
+            outcome_context: None,
         }];
         queue.inject_tasks(new_tasks);
         assert_eq!(queue.tasks().len(), 4);
@@ -650,7 +684,7 @@ mod tests {
             ("in_progress", TaskStatus::InProgress),
             ("closed", TaskStatus::Completed),
             ("blocked", TaskStatus::Skipped),
-            ("deferred", TaskStatus::Skipped),
+            ("deferred", TaskStatus::Deferred),
             ("unknown_status", TaskStatus::Pending),
         ];
         for (bead_status, expected) in statuses {
@@ -785,5 +819,144 @@ mod tests {
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         script
+    }
+
+    // -----------------------------------------------------------------------
+    // Deferred + outcome_context tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deferred_tasks_are_picked() {
+        let tasks = vec![
+            Task {
+                id: "d1".into(),
+                objective: "Deferred task".into(),
+                priority: 1,
+                status: TaskStatus::Deferred,
+                depends_on: vec![],
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+            },
+            Task {
+                id: "p1".into(),
+                objective: "Pending task".into(),
+                priority: 2,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+            },
+        ];
+        let queue = TaskQueue::from_tasks(tasks);
+        // Deferred d1 (priority 1) should be picked before p1 (priority 2).
+        let next = queue.pick_next().unwrap();
+        assert_eq!(next.id, "d1");
+    }
+
+    #[test]
+    fn deferred_counted_in_actionable() {
+        let tasks = vec![Task {
+            id: "d1".into(),
+            objective: "Deferred".into(),
+            priority: 1,
+            status: TaskStatus::Deferred,
+            depends_on: vec![],
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        }];
+        let queue = TaskQueue::from_tasks(tasks);
+        assert_eq!(queue.actionable_count(), 1);
+    }
+
+    #[test]
+    fn deferred_counted_in_summary() {
+        let tasks = vec![Task {
+            id: "d1".into(),
+            objective: "Deferred".into(),
+            priority: 1,
+            status: TaskStatus::Deferred,
+            depends_on: vec![],
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        }];
+        let queue = TaskQueue::from_tasks(tasks);
+        let s = queue.summary();
+        assert_eq!(s.deferred, 1);
+        assert_eq!(s.pending, 0);
+    }
+
+    #[test]
+    fn set_and_get_outcome_context() {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+        let mut queue = TaskQueue::from_tasks(sample_tasks());
+        assert!(queue.outcome_context("task-1").is_none());
+
+        let ctx = OutcomeContext {
+            approach: "tried X".into(),
+            obstacle: ObstacleKind::Unknown {
+                detail: "failed".into(),
+            },
+            discoveries: vec!["found Y".into()],
+            recommendation: None,
+            files_explored: vec![],
+        };
+        queue.set_outcome_context("task-1", ctx);
+
+        let stored = queue.outcome_context("task-1").unwrap();
+        assert_eq!(stored.approach, "tried X");
+        assert_eq!(stored.discoveries.len(), 1);
+    }
+
+    #[test]
+    fn outcome_context_survives_serde() {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+        let task = Task {
+            id: "oc".into(),
+            objective: "Test".into(),
+            priority: 1,
+            status: TaskStatus::Deferred,
+            depends_on: vec![],
+            error: None,
+            pr_url: None,
+            outcome_context: Some(OutcomeContext {
+                approach: "approach A".into(),
+                obstacle: ObstacleKind::TestFailure {
+                    attempts: 2,
+                    last_error: "panic".into(),
+                },
+                discoveries: vec![],
+                recommendation: Some("try B".into()),
+                files_explored: vec!["a.rs".into()],
+            }),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains("outcome_context"));
+        let parsed: Task = serde_json::from_str(&json).unwrap();
+        let oc = parsed.outcome_context.unwrap();
+        assert_eq!(oc.approach, "approach A");
+        assert_eq!(oc.recommendation.as_deref(), Some("try B"));
+    }
+
+    #[test]
+    fn task_without_outcome_context_backward_compat() {
+        // Tasks serialised before outcome_context was added.
+        let json = r#"{"id":"old","objective":"old task","priority":1,"status":"pending"}"#;
+        let parsed: Task = serde_json::from_str(json).unwrap();
+        assert!(parsed.outcome_context.is_none());
+    }
+
+    #[test]
+    fn task_status_deferred_serde() {
+        let status = TaskStatus::Deferred;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"deferred\"");
+        let parsed: TaskStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, TaskStatus::Deferred);
     }
 }

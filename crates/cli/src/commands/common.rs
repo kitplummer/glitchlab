@@ -116,7 +116,9 @@ pub async fn run_pipeline(
 
     // --- Run ---
     eprintln!("starting pipeline (base branch: {base_branch})...");
-    let result = pipeline.run(task_id, objective, repo, &base_branch).await;
+    let result = pipeline
+        .run(task_id, objective, repo, &base_branch, &[])
+        .await;
 
     // --- Display results ---
     print_result(&result);

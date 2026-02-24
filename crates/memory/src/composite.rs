@@ -179,6 +179,7 @@ mod tests {
             events_summary: crate::history::EventsSummary::default(),
             stage_outputs: None,
             events: None,
+            outcome_context: None,
         }
     }
 

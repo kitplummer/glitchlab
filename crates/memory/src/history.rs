@@ -33,6 +33,8 @@ pub struct HistoryEntry {
     pub stage_outputs: Option<std::collections::HashMap<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_context: Option<glitchlab_kernel::outcome::OutcomeContext>,
 }
 
 /// Backward-compatible timestamp deserializer: accepts both `DateTime<Utc>`
@@ -357,6 +359,7 @@ mod tests {
             events_summary: EventsSummary::default(),
             stage_outputs: None,
             events: None,
+            outcome_context: None,
         }
     }
 
@@ -572,5 +575,37 @@ mod tests {
         let parsed: HistoryEntry = serde_json::from_str(&json).unwrap();
         assert!(parsed.stage_outputs.is_some());
         assert!(parsed.events.is_some());
+    }
+
+    #[test]
+    fn entry_with_outcome_context_roundtrip() {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+        let mut entry = sample_entry("ctx-task", "implementation_failed");
+        entry.outcome_context = Some(OutcomeContext {
+            approach: "added greet fn".into(),
+            obstacle: ObstacleKind::TestFailure {
+                attempts: 3,
+                last_error: "assertion failed".into(),
+            },
+            discoveries: vec!["uses no_std".into()],
+            recommendation: Some("use core::fmt".into()),
+            files_explored: vec!["src/lib.rs".into()],
+        });
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("outcome_context"));
+        let parsed: HistoryEntry = serde_json::from_str(&json).unwrap();
+        let oc = parsed.outcome_context.unwrap();
+        assert_eq!(oc.approach, "added greet fn");
+        assert_eq!(oc.discoveries.len(), 1);
+    }
+
+    #[test]
+    fn entry_without_outcome_context_backward_compat() {
+        // Old history entries won't have outcome_context — should deserialize fine.
+        let json = r#"{"timestamp":"2026-02-21T14:30:00Z","task_id":"old","status":"error","budget":{},"events_summary":{}}"#;
+        let entry: HistoryEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.outcome_context.is_none());
     }
 }

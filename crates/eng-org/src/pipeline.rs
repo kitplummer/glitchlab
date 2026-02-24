@@ -8,6 +8,7 @@ use chrono::Utc;
 use glitchlab_kernel::agent::{Agent, AgentContext, AgentMetadata, AgentOutput};
 use glitchlab_kernel::budget::BudgetSummary;
 use glitchlab_kernel::governance::BoundaryEnforcer;
+use glitchlab_kernel::outcome::OutcomeContext;
 use glitchlab_kernel::pipeline::{
     EventKind, PipelineContext, PipelineEvent, PipelineResult, PipelineStatus,
 };
@@ -97,6 +98,7 @@ impl EngineeringPipeline {
         objective: &str,
         repo_path: &Path,
         base_branch: &str,
+        previous_attempts: &[OutcomeContext],
     ) -> PipelineResult {
         info!(task_id, "pipeline starting");
 
@@ -106,7 +108,14 @@ impl EngineeringPipeline {
 
         let result = match tokio::time::timeout(
             timeout,
-            self.run_stages(task_id, objective, repo_path, base_branch, &mut workspace),
+            self.run_stages(
+                task_id,
+                objective,
+                repo_path,
+                base_branch,
+                &mut workspace,
+                previous_attempts,
+            ),
         )
         .await
         {
@@ -128,6 +137,7 @@ impl EngineeringPipeline {
                         "pipeline exceeded wall-clock timeout of {}s",
                         timeout.as_secs()
                     )),
+                    outcome_context: None,
                 }
             }
         };
@@ -154,6 +164,7 @@ impl EngineeringPipeline {
         repo_path: &Path,
         base_branch: &str,
         workspace: &mut Workspace,
+        previous_attempts: &[OutcomeContext],
     ) -> PipelineResult {
         let mut ctx = PipelineContext::new(AgentContext {
             task_id: task_id.into(),
@@ -211,6 +222,16 @@ impl EngineeringPipeline {
             );
         }
 
+        // Inject structured previous attempt contexts from the AttemptTracker
+        // so the planner can learn from prior failures on this same task.
+        if !previous_attempts.is_empty()
+            && let Ok(val) = serde_json::to_value(previous_attempts)
+        {
+            ctx.agent_context
+                .extra
+                .insert("previous_attempts".into(), val);
+        }
+
         // Feed relevant source files into agent context.
         ctx.agent_context.file_context =
             read_relevant_files(repo_path, objective, &indexed_files).await;
@@ -247,6 +268,7 @@ impl EngineeringPipeline {
                 pr_url: None,
                 branch: None,
                 error: None,
+                outcome_context: None,
             };
         }
 
@@ -634,6 +656,7 @@ impl EngineeringPipeline {
                     pr_url: None,
                     branch: Some(workspace.branch_name().into()),
                     error: None,
+                    outcome_context: None,
                 };
             }
         }
@@ -651,6 +674,7 @@ impl EngineeringPipeline {
                 pr_url: None,
                 branch: Some(workspace.branch_name().into()),
                 error: Some(format!("push failed: {e}")),
+                outcome_context: None,
             };
         }
 
@@ -676,6 +700,7 @@ impl EngineeringPipeline {
                     pr_url: None,
                     branch: Some(workspace.branch_name().into()),
                     error: Some(format!("PR creation failed: {e}")),
+                    outcome_context: None,
                 };
             }
         };
@@ -695,6 +720,7 @@ impl EngineeringPipeline {
             pr_url: Some(pr_url),
             branch: Some(workspace.branch_name().into()),
             error: None,
+            outcome_context: None,
         }
     }
 
@@ -713,6 +739,16 @@ impl EngineeringPipeline {
         status: PipelineStatus,
         error: String,
     ) -> PipelineResult {
+        self.fail_with_context(ctx, status, error, None).await
+    }
+
+    async fn fail_with_context(
+        &self,
+        ctx: PipelineContext,
+        status: PipelineStatus,
+        error: String,
+        outcome_context: Option<OutcomeContext>,
+    ) -> PipelineResult {
         let budget = self.router.budget_summary().await;
         PipelineResult {
             status,
@@ -722,6 +758,7 @@ impl EngineeringPipeline {
             pr_url: None,
             branch: None,
             error: Some(error),
+            outcome_context,
         }
     }
 }
@@ -1013,6 +1050,7 @@ fn build_history_entry(task_id: &str, result: &PipelineResult) -> HistoryEntry {
         events_summary: build_events_summary(&result.stage_outputs),
         stage_outputs: None,
         events: None,
+        outcome_context: result.outcome_context.clone(),
     }
 }
 
@@ -1313,6 +1351,7 @@ mod tests {
             pr_url: Some("https://github.com/test/repo/pull/1".into()),
             branch: Some("glitchlab/test-1".into()),
             error: None,
+            outcome_context: None,
         };
 
         let entry = build_history_entry("test-1", &result);
@@ -1323,6 +1362,44 @@ mod tests {
         assert!(entry.error.is_none());
         assert_eq!(entry.budget.total_tokens, 500);
         assert_eq!(entry.budget.call_count, 3);
+        assert!(entry.outcome_context.is_none());
+    }
+
+    #[test]
+    fn build_history_entry_with_outcome_context() {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+        let result = PipelineResult {
+            status: PipelineStatus::ImplementationFailed,
+            stage_outputs: HashMap::new(),
+            events: vec![],
+            budget: BudgetSummary {
+                total_tokens: 200,
+                estimated_cost: 0.02,
+                call_count: 1,
+                tokens_remaining: 99_800,
+                dollars_remaining: 9.98,
+            },
+            pr_url: None,
+            branch: None,
+            error: Some("implementer failed".into()),
+            outcome_context: Some(OutcomeContext {
+                approach: "tried adding function".into(),
+                obstacle: ObstacleKind::ModelLimitation {
+                    model: "test-model".into(),
+                    error_class: "parse_error".into(),
+                },
+                discoveries: vec!["file uses macros".into()],
+                recommendation: None,
+                files_explored: vec!["src/lib.rs".into()],
+            }),
+        };
+
+        let entry = build_history_entry("fail-ctx", &result);
+        assert_eq!(entry.status, "implementation_failed");
+        let oc = entry.outcome_context.unwrap();
+        assert_eq!(oc.approach, "tried adding function");
+        assert_eq!(oc.discoveries.len(), 1);
     }
 
     #[test]
@@ -1422,6 +1499,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipeline_with_previous_attempts_injects_context() {
+        let dir = tempfile::tempdir().unwrap();
+        // Init git repo.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let output = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let base_branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+
+        let prev = vec![glitchlab_kernel::outcome::OutcomeContext {
+            approach: "tried direct edit".into(),
+            obstacle: glitchlab_kernel::outcome::ObstacleKind::TestFailure {
+                attempts: 2,
+                last_error: "assertion failed".into(),
+            },
+            discoveries: vec!["module uses trait objects".into()],
+            recommendation: Some("mock the trait".into()),
+            files_explored: vec!["src/lib.rs".into()],
+        }];
+
+        let result = pipeline
+            .run(
+                "test-with-ctx",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &prev,
+            )
+            .await;
+
+        // The pipeline should still complete (previous_attempts is informational).
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+    }
+
+    #[tokio::test]
     async fn pipeline_integration_with_git_repo() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -1470,7 +1609,7 @@ mod tests {
         let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
-            .run("test-task-1", "Fix a bug", dir.path(), &base_branch)
+            .run("test-task-1", "Fix a bug", dir.path(), &base_branch, &[])
             .await;
 
         // Pipeline runs through all stages. Push fails (no remote),
@@ -1550,7 +1689,13 @@ mod tests {
         let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
-            .run("test-reject", "Fix something", dir.path(), &base_branch)
+            .run(
+                "test-reject",
+                "Fix something",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
             .await;
 
         assert_eq!(result.status, PipelineStatus::Interrupted);
@@ -1628,7 +1773,13 @@ mod tests {
         let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
-            .run("test-with-tests", "Fix a bug", dir.path(), &base_branch)
+            .run(
+                "test-with-tests",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
             .await;
 
         // Tests should pass, then push fails (no remote) → Committed.
@@ -1679,7 +1830,13 @@ mod tests {
         let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
-            .run("test-pr-reject", "Fix something", dir.path(), &base_branch)
+            .run(
+                "test-pr-reject",
+                "Fix something",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
             .await;
 
         // Pipeline should commit but stop before PR.
@@ -1741,7 +1898,13 @@ mod tests {
         let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
-            .run("test-fail-debug", "Fix a bug", dir.path(), &base_branch)
+            .run(
+                "test-fail-debug",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
             .await;
 
         // Mock debugger returns should_retry: false, so pipeline stops.
@@ -1941,6 +2104,7 @@ mod tests {
                 "Add a subtract function to crates/mylib/src/lib.rs",
                 dir.path(),
                 &base_branch,
+                &[],
             )
             .await;
 
@@ -2046,7 +2210,7 @@ mod tests {
         let pipeline = EngineeringPipeline::new(router, config, handler, history);
 
         let result = pipeline
-            .run("timeout-task", "do stuff", dir.path(), &base_branch)
+            .run("timeout-task", "do stuff", dir.path(), &base_branch, &[])
             .await;
         assert!(
             result.status == PipelineStatus::TimedOut || result.status == PipelineStatus::Error,

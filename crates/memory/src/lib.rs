@@ -102,6 +102,7 @@ mod tests {
             events_summary: history::EventsSummary::default(),
             stage_outputs: None,
             events: None,
+            outcome_context: None,
         };
         backend.record(&entry).await.unwrap();
 

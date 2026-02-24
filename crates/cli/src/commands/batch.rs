@@ -207,8 +207,12 @@ pub async fn execute(args: BatchArgs<'_>) -> Result<()> {
     eprintln!();
     eprintln!("=== Task Queue ===");
     eprintln!(
-        "completed: {}, failed: {}, pending: {}, skipped: {}",
-        final_summary.completed, final_summary.failed, final_summary.pending, final_summary.skipped
+        "completed: {}, failed: {}, pending: {}, deferred: {}, skipped: {}",
+        final_summary.completed,
+        final_summary.failed,
+        final_summary.pending,
+        final_summary.deferred,
+        final_summary.skipped
     );
 
     if result.tasks_failed > 0 {
@@ -226,8 +230,8 @@ fn print_result(result: &OrchestratorResult) {
     eprintln!("=== Orchestrator Result ===");
     eprintln!("cease reason: {:?}", result.cease_reason);
     eprintln!(
-        "tasks: {} attempted, {} succeeded, {} failed",
-        result.tasks_attempted, result.tasks_succeeded, result.tasks_failed
+        "tasks: {} attempted, {} succeeded, {} failed, {} deferred",
+        result.tasks_attempted, result.tasks_succeeded, result.tasks_failed, result.tasks_deferred
     );
     eprintln!(
         "budget: {} tokens, ${:.4}",
