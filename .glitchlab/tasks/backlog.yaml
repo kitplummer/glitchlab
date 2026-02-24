@@ -29,5 +29,6 @@ tasks:
     The enum is defined around line 234. Use `read_file` with `start_line`
     and `end_line` to read only the relevant section (~lines 220-250).
   priority: 30
-  status: pending
+  status: completed
   depends_on: []
+  pr_url: https://github.com/kitplummer/glitchlab/pull/20
