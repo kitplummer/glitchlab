@@ -53,6 +53,12 @@ routing:
       min_tier: economy
     archivist:
       min_tier: economy
+    architect_triage:
+      min_tier: economy
+      requires: [code]
+    architect_review:
+      min_tier: economy
+      requires: [code]
 
   cost_quality_threshold: 0.7
 
