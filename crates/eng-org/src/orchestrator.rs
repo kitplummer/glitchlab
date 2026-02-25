@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -240,6 +240,8 @@ pub enum CeaseReason {
     BudgetExhausted,
     /// Quality gate failed — halting to prevent further damage.
     QualityGateFailed,
+    /// Too many failures in a short window — likely a systemic issue.
+    SystemicFailure,
 }
 
 impl fmt::Display for CeaseReason {
@@ -248,6 +250,7 @@ impl fmt::Display for CeaseReason {
             CeaseReason::AllTasksDone => write!(f, "all tasks done"),
             CeaseReason::BudgetExhausted => write!(f, "budget exhausted"),
             CeaseReason::QualityGateFailed => write!(f, "quality gate failed"),
+            CeaseReason::SystemicFailure => write!(f, "systemic failure"),
         }
     }
 }
@@ -364,6 +367,44 @@ impl Default for AttemptTracker {
 }
 
 // ---------------------------------------------------------------------------
+// RestartIntensityMonitor — sliding-window failure tracker
+// ---------------------------------------------------------------------------
+
+/// Tracks failure timestamps in a sliding window. When the number of failures
+/// within the window exceeds a threshold, signals that the orchestrator should
+/// halt (likely a systemic issue such as a provider outage or broken base branch).
+struct RestartIntensityMonitor {
+    failure_times: VecDeque<Instant>,
+    max_failures: u32,
+    window: Duration,
+}
+
+impl RestartIntensityMonitor {
+    fn new(max_failures: u32, window_secs: u64) -> Self {
+        Self {
+            failure_times: VecDeque::new(),
+            max_failures,
+            window: Duration::from_secs(window_secs),
+        }
+    }
+
+    /// Record a failure. Returns `true` if the failure threshold is exceeded.
+    fn record_failure(&mut self) -> bool {
+        let now = Instant::now();
+        self.failure_times.push_back(now);
+        // Drain entries older than the window.
+        while let Some(&front) = self.failure_times.front() {
+            if now.duration_since(front) > self.window {
+                self.failure_times.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.failure_times.len() as u32 >= self.max_failures
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
 
@@ -403,6 +444,10 @@ impl Orchestrator {
     ) -> OrchestratorResult {
         let start_time = Instant::now();
         let mut tracker = AttemptTracker::new();
+        let mut intensity_monitor = RestartIntensityMonitor::new(
+            self.config.limits.restart_intensity_max_failures,
+            self.config.limits.restart_intensity_window_secs,
+        );
         let max_attempts = self.config.limits.max_fix_attempts as usize;
 
         let mut result = OrchestratorResult {
@@ -469,6 +514,11 @@ impl Orchestrator {
                     error: Some(format!("exceeded max attempts ({max_attempts})")),
                     outcome_context: None,
                 });
+                if intensity_monitor.record_failure() {
+                    warn!("restart intensity exceeded");
+                    result.cease_reason = CeaseReason::SystemicFailure;
+                    break;
+                }
                 continue;
             }
 
@@ -503,6 +553,11 @@ impl Orchestrator {
                         outcome_context: None,
                     });
 
+                    if intensity_monitor.record_failure() {
+                        warn!("restart intensity exceeded");
+                        result.cease_reason = CeaseReason::SystemicFailure;
+                        break;
+                    }
                     if params.stop_on_failure {
                         break;
                     }
@@ -552,7 +607,13 @@ impl Orchestrator {
 
             match routing.counter {
                 OutcomeCounter::Succeeded => result.tasks_succeeded += 1,
-                OutcomeCounter::Failed => result.tasks_failed += 1,
+                OutcomeCounter::Failed => {
+                    result.tasks_failed += 1;
+                    if intensity_monitor.record_failure() {
+                        warn!("restart intensity exceeded");
+                        result.cease_reason = CeaseReason::SystemicFailure;
+                    }
+                }
                 OutcomeCounter::Deferred => result.tasks_deferred += 1,
                 OutcomeCounter::None => {}
             }
@@ -579,6 +640,10 @@ impl Orchestrator {
             }
 
             let _ = queue.save();
+
+            if result.cease_reason == CeaseReason::SystemicFailure {
+                break;
+            }
 
             let succeeded = matches!(
                 pipeline_result.status,
@@ -1172,6 +1237,7 @@ mod tests {
             CeaseReason::AllTasksDone,
             CeaseReason::BudgetExhausted,
             CeaseReason::QualityGateFailed,
+            CeaseReason::SystemicFailure,
         ] {
             let json = serde_json::to_string(&reason).unwrap();
             let parsed: CeaseReason = serde_json::from_str(&json).unwrap();
@@ -2016,5 +2082,109 @@ mod tests {
             .unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
         assert!(task.error.as_ref().unwrap().contains("no sub-tasks"));
+    }
+
+    // -----------------------------------------------------------------------
+    // RestartIntensityMonitor tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restart_intensity_monitor_below_threshold() {
+        let mut monitor = RestartIntensityMonitor::new(5, 300);
+        // 4 failures should not trigger.
+        for _ in 0..4 {
+            assert!(!monitor.record_failure());
+        }
+    }
+
+    #[test]
+    fn restart_intensity_monitor_at_threshold() {
+        let mut monitor = RestartIntensityMonitor::new(5, 300);
+        for _ in 0..4 {
+            assert!(!monitor.record_failure());
+        }
+        // 5th failure triggers.
+        assert!(monitor.record_failure());
+    }
+
+    #[test]
+    fn restart_intensity_monitor_window_expiry() {
+        let mut monitor = RestartIntensityMonitor::new(3, 1);
+        // Record 2 failures.
+        assert!(!monitor.record_failure());
+        assert!(!monitor.record_failure());
+        // Sleep past the window.
+        std::thread::sleep(Duration::from_millis(1100));
+        // Old failures should have expired; this is only the 1st in the new window.
+        assert!(!monitor.record_failure());
+    }
+
+    #[test]
+    fn restart_intensity_monitor_single_failure_threshold() {
+        let mut monitor = RestartIntensityMonitor::new(1, 300);
+        // First failure immediately triggers.
+        assert!(monitor.record_failure());
+    }
+
+    // -----------------------------------------------------------------------
+    // CeaseReason::SystemicFailure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cease_reason_systemic_failure_display() {
+        assert_eq!(CeaseReason::SystemicFailure.to_string(), "systemic failure");
+    }
+
+    #[test]
+    fn cease_reason_systemic_failure_serde() {
+        let json = serde_json::to_string(&CeaseReason::SystemicFailure).unwrap();
+        let parsed: CeaseReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, CeaseReason::SystemicFailure);
+    }
+
+    // -----------------------------------------------------------------------
+    // Orchestrator systemic failure integration test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn orchestrator_systemic_failure_halts() {
+        let mut config = EngConfig::default();
+        // Set intensity threshold to 3 failures in 300s.
+        config.limits.restart_intensity_max_failures = 3;
+        config.limits.restart_intensity_window_secs = 300;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        // 5 tasks — but orchestrator should halt after 3 failures.
+        let tasks = vec![
+            pending_task("sf1", "task 1"),
+            pending_task("sf2", "task 2"),
+            pending_task("sf3", "task 3"),
+            pending_task("sf4", "task 4"),
+            pending_task("sf5", "task 5"),
+        ];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut budget = CumulativeBudget::new(100.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: false,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+        assert_eq!(result.cease_reason, CeaseReason::SystemicFailure);
+        // Should have attempted exactly 3 tasks (the threshold).
+        assert_eq!(result.tasks_attempted, 3);
+        assert_eq!(result.tasks_failed, 3);
+        // Remaining tasks should still be pending.
+        let t4 = queue.tasks().iter().find(|t| t.id == "sf4").unwrap();
+        assert_eq!(t4.status, TaskStatus::Pending);
+        let t5 = queue.tasks().iter().find(|t| t.id == "sf5").unwrap();
+        assert_eq!(t5.status, TaskStatus::Pending);
     }
 }
