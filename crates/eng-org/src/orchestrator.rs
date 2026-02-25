@@ -276,11 +276,16 @@ pub struct OrchestratorResult {
     pub tasks_failed: u32,
     #[serde(default)]
     pub tasks_deferred: u32,
+    #[serde(default)]
+    pub tasks_escalated: u32,
     pub total_cost: f64,
     pub total_tokens: u64,
     pub duration: Duration,
     pub cease_reason: CeaseReason,
     pub run_results: Vec<TaskRunResult>,
+    /// The dominant failure pattern when systemic failure is detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dominant_failure_pattern: Option<FailureCategory>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +323,7 @@ pub enum OutcomeCounter {
     Succeeded,
     Failed,
     Deferred,
+    Escalated,
     None,
 }
 
@@ -367,14 +373,66 @@ impl Default for AttemptTracker {
 }
 
 // ---------------------------------------------------------------------------
+// FailureCategory — categorises failures for diagnostics
+// ---------------------------------------------------------------------------
+
+/// Categorises a pipeline failure for restart intensity diagnostics.
+///
+/// When `RestartIntensityMonitor` triggers, the dominant category tells the
+/// operator *what* is failing systemically (e.g. all tests, or provider outage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    SetupError,
+    PlanFailed,
+    ImplementationFailed,
+    TestsFailed,
+    ArchitectRejected,
+    MaxAttemptsExceeded,
+    BudgetExceeded,
+    Timeout,
+    Other,
+}
+
+impl fmt::Display for FailureCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FailureCategory::SetupError => write!(f, "setup error"),
+            FailureCategory::PlanFailed => write!(f, "plan failed"),
+            FailureCategory::ImplementationFailed => write!(f, "implementation failed"),
+            FailureCategory::TestsFailed => write!(f, "tests failed"),
+            FailureCategory::ArchitectRejected => write!(f, "architect rejected"),
+            FailureCategory::MaxAttemptsExceeded => write!(f, "max attempts exceeded"),
+            FailureCategory::BudgetExceeded => write!(f, "budget exceeded"),
+            FailureCategory::Timeout => write!(f, "timeout"),
+            FailureCategory::Other => write!(f, "other"),
+        }
+    }
+}
+
+/// Map a `PipelineStatus` to the appropriate `FailureCategory`.
+pub fn pipeline_status_to_failure_category(status: PipelineStatus) -> FailureCategory {
+    match status {
+        PipelineStatus::PlanFailed => FailureCategory::PlanFailed,
+        PipelineStatus::ImplementationFailed => FailureCategory::ImplementationFailed,
+        PipelineStatus::TestsFailed => FailureCategory::TestsFailed,
+        PipelineStatus::ArchitectRejected => FailureCategory::ArchitectRejected,
+        PipelineStatus::BudgetExceeded => FailureCategory::BudgetExceeded,
+        PipelineStatus::TimedOut => FailureCategory::Timeout,
+        _ => FailureCategory::Other,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RestartIntensityMonitor — sliding-window failure tracker
 // ---------------------------------------------------------------------------
 
-/// Tracks failure timestamps in a sliding window. When the number of failures
-/// within the window exceeds a threshold, signals that the orchestrator should
-/// halt (likely a systemic issue such as a provider outage or broken base branch).
+/// Tracks failure timestamps and categories in a sliding window. When the
+/// number of failures within the window exceeds a threshold, signals that the
+/// orchestrator should halt (likely a systemic issue such as a provider outage
+/// or broken base branch). Returns the dominant failure category on trigger.
 struct RestartIntensityMonitor {
-    failure_times: VecDeque<Instant>,
+    failures: VecDeque<(Instant, FailureCategory)>,
     max_failures: u32,
     window: Duration,
 }
@@ -382,25 +440,45 @@ struct RestartIntensityMonitor {
 impl RestartIntensityMonitor {
     fn new(max_failures: u32, window_secs: u64) -> Self {
         Self {
-            failure_times: VecDeque::new(),
+            failures: VecDeque::new(),
             max_failures,
             window: Duration::from_secs(window_secs),
         }
     }
 
-    /// Record a failure. Returns `true` if the failure threshold is exceeded.
-    fn record_failure(&mut self) -> bool {
+    /// Record a failure with its category.
+    ///
+    /// Returns `Some(dominant_category)` if the failure threshold is exceeded,
+    /// where `dominant_category` is the most frequent category in the window.
+    fn record_failure(&mut self, category: FailureCategory) -> Option<FailureCategory> {
         let now = Instant::now();
-        self.failure_times.push_back(now);
+        self.failures.push_back((now, category));
         // Drain entries older than the window.
-        while let Some(&front) = self.failure_times.front() {
-            if now.duration_since(front) > self.window {
-                self.failure_times.pop_front();
+        while let Some(&(front_time, _)) = self.failures.front() {
+            if now.duration_since(front_time) > self.window {
+                self.failures.pop_front();
             } else {
                 break;
             }
         }
-        self.failure_times.len() as u32 >= self.max_failures
+        if self.failures.len() as u32 >= self.max_failures {
+            Some(self.dominant_category())
+        } else {
+            None
+        }
+    }
+
+    /// Find the most frequent category in the current window.
+    fn dominant_category(&self) -> FailureCategory {
+        let mut counts: HashMap<FailureCategory, u32> = HashMap::new();
+        for &(_, cat) in &self.failures {
+            *counts.entry(cat).or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(_, count)| count)
+            .map(|(cat, _)| cat)
+            .unwrap_or(FailureCategory::Other)
     }
 }
 
@@ -455,11 +533,13 @@ impl Orchestrator {
             tasks_succeeded: 0,
             tasks_failed: 0,
             tasks_deferred: 0,
+            tasks_escalated: 0,
             total_cost: 0.0,
             total_tokens: 0,
             duration: Duration::from_secs(0), // Will be updated before return
             cease_reason: CeaseReason::AllTasksDone,
             run_results: Vec::new(),
+            dominant_failure_pattern: None,
         };
 
         loop {
@@ -514,9 +594,12 @@ impl Orchestrator {
                     error: Some(format!("exceeded max attempts ({max_attempts})")),
                     outcome_context: None,
                 });
-                if intensity_monitor.record_failure() {
-                    warn!("restart intensity exceeded");
+                if let Some(dominant) =
+                    intensity_monitor.record_failure(FailureCategory::MaxAttemptsExceeded)
+                {
+                    warn!(?dominant, "restart intensity exceeded");
                     result.cease_reason = CeaseReason::SystemicFailure;
+                    result.dominant_failure_pattern = Some(dominant);
                     break;
                 }
                 continue;
@@ -553,9 +636,12 @@ impl Orchestrator {
                         outcome_context: None,
                     });
 
-                    if intensity_monitor.record_failure() {
-                        warn!("restart intensity exceeded");
+                    if let Some(dominant) =
+                        intensity_monitor.record_failure(FailureCategory::SetupError)
+                    {
+                        warn!(?dominant, "restart intensity exceeded");
                         result.cease_reason = CeaseReason::SystemicFailure;
+                        result.dominant_failure_pattern = Some(dominant);
                         break;
                     }
                     if params.stop_on_failure {
@@ -609,12 +695,15 @@ impl Orchestrator {
                 OutcomeCounter::Succeeded => result.tasks_succeeded += 1,
                 OutcomeCounter::Failed => {
                     result.tasks_failed += 1;
-                    if intensity_monitor.record_failure() {
-                        warn!("restart intensity exceeded");
+                    let category = pipeline_status_to_failure_category(pipeline_result.status);
+                    if let Some(dominant) = intensity_monitor.record_failure(category) {
+                        warn!(?dominant, "restart intensity exceeded");
                         result.cease_reason = CeaseReason::SystemicFailure;
+                        result.dominant_failure_pattern = Some(dominant);
                     }
                 }
                 OutcomeCounter::Deferred => result.tasks_deferred += 1,
+                OutcomeCounter::Escalated => result.tasks_escalated += 1,
                 OutcomeCounter::None => {}
             }
 
@@ -685,15 +774,40 @@ impl Orchestrator {
 
         result.duration = start_time.elapsed();
 
+        // --- TQM post-run analysis ---
+        let tqm_patterns = crate::tqm::analyze(&result, &crate::tqm::TQMConfig::default());
+        for pattern in &tqm_patterns {
+            match pattern.severity.as_str() {
+                "critical" => warn!(
+                    kind = ?pattern.kind,
+                    occurrences = pattern.occurrences,
+                    affected = ?pattern.affected_tasks,
+                    "{}", pattern.description
+                ),
+                "warning" => warn!(
+                    kind = ?pattern.kind,
+                    occurrences = pattern.occurrences,
+                    "{}", pattern.description
+                ),
+                _ => info!(
+                    kind = ?pattern.kind,
+                    occurrences = pattern.occurrences,
+                    "{}", pattern.description
+                ),
+            }
+        }
+
         info!(
             tasks_attempted = result.tasks_attempted,
             tasks_succeeded = result.tasks_succeeded,
             tasks_failed = result.tasks_failed,
             tasks_deferred = result.tasks_deferred,
+            tasks_escalated = result.tasks_escalated,
             total_cost = result.total_cost,
             total_tokens = result.total_tokens,
             duration_ms = result.duration.as_millis(),
             cease_reason = ?result.cease_reason,
+            tqm_patterns = tqm_patterns.len(),
             "orchestrator run complete"
         );
 
@@ -787,16 +901,22 @@ impl Orchestrator {
                 track_attempt: false,
             },
             PipelineStatus::Retryable => OutcomeRouting {
-                task_status: TaskStatus::Failed,
-                counter: OutcomeCounter::Failed,
+                task_status: TaskStatus::Deferred,
+                counter: OutcomeCounter::Deferred,
                 save_context: true,
                 track_attempt: true,
             },
             PipelineStatus::ArchitectRejected => OutcomeRouting {
-                task_status: TaskStatus::Failed,
-                counter: OutcomeCounter::Failed,
+                task_status: TaskStatus::Deferred,
+                counter: OutcomeCounter::Deferred,
                 save_context: true,
                 track_attempt: true,
+            },
+            PipelineStatus::Escalated => OutcomeRouting {
+                task_status: TaskStatus::Skipped,
+                counter: OutcomeCounter::Escalated,
+                save_context: true,
+                track_attempt: false,
             },
             _ => OutcomeRouting {
                 task_status: TaskStatus::Failed,
@@ -1212,6 +1332,7 @@ mod tests {
             tasks_succeeded: 2,
             tasks_failed: 1,
             tasks_deferred: 0,
+            tasks_escalated: 0,
             total_cost: 12.50,
             total_tokens: 150000,
             duration: Duration::from_millis(5000),
@@ -1225,6 +1346,7 @@ mod tests {
                 error: None,
                 outcome_context: None,
             }],
+            dominant_failure_pattern: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
@@ -1725,11 +1847,13 @@ mod tests {
             tasks_succeeded: 2,
             tasks_failed: 1,
             tasks_deferred: 2,
+            tasks_escalated: 0,
             total_cost: 5.0,
             total_tokens: 50000,
             duration: Duration::from_millis(1000),
             cease_reason: CeaseReason::AllTasksDone,
             run_results: vec![],
+            dominant_failure_pattern: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
@@ -1795,8 +1919,8 @@ mod tests {
     fn route_outcome_retryable() {
         let pr = make_pipeline_result(PipelineStatus::Retryable);
         let routing = Orchestrator::route_outcome(&pr);
-        assert_eq!(routing.task_status, TaskStatus::Failed);
-        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert_eq!(routing.task_status, TaskStatus::Deferred);
+        assert_eq!(routing.counter, OutcomeCounter::Deferred);
         assert!(routing.save_context);
         assert!(routing.track_attempt);
     }
@@ -1849,8 +1973,8 @@ mod tests {
     fn route_outcome_architect_rejected() {
         let pr = make_pipeline_result(PipelineStatus::ArchitectRejected);
         let routing = Orchestrator::route_outcome(&pr);
-        assert_eq!(routing.task_status, TaskStatus::Failed);
-        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert_eq!(routing.task_status, TaskStatus::Deferred);
+        assert_eq!(routing.counter, OutcomeCounter::Deferred);
         assert!(routing.save_context);
         assert!(routing.track_attempt);
     }
@@ -1863,6 +1987,54 @@ mod tests {
         assert_eq!(routing.counter, OutcomeCounter::Succeeded);
         assert!(!routing.save_context);
         assert!(!routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_escalated() {
+        let pr = make_pipeline_result(PipelineStatus::Escalated);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Skipped);
+        assert_eq!(routing.counter, OutcomeCounter::Escalated);
+        assert!(routing.save_context);
+        assert!(!routing.track_attempt);
+    }
+
+    #[test]
+    fn orchestrator_result_escalated_serde() {
+        let result = OrchestratorResult {
+            tasks_attempted: 4,
+            tasks_succeeded: 1,
+            tasks_failed: 1,
+            tasks_deferred: 1,
+            tasks_escalated: 1,
+            total_cost: 8.0,
+            total_tokens: 80000,
+            duration: Duration::from_millis(2000),
+            cease_reason: CeaseReason::AllTasksDone,
+            run_results: vec![],
+            dominant_failure_pattern: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tasks_escalated, 1);
+    }
+
+    #[test]
+    fn orchestrator_result_backward_compat_without_escalated() {
+        // Simulate deserializing old JSON without tasks_escalated field.
+        let json = r#"{
+            "tasks_attempted": 2,
+            "tasks_succeeded": 1,
+            "tasks_failed": 1,
+            "total_cost": 3.0,
+            "total_tokens": 30000,
+            "duration": {"secs": 1, "nanos": 0},
+            "cease_reason": "all_tasks_done",
+            "run_results": []
+        }"#;
+        let parsed: OrchestratorResult = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.tasks_deferred, 0);
+        assert_eq!(parsed.tasks_escalated, 0);
     }
 
     #[test]
@@ -1889,6 +2061,35 @@ mod tests {
             CeaseReason::QualityGateFailed.to_string(),
             "quality gate failed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // FailureCategory Display tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn failure_category_display() {
+        assert_eq!(FailureCategory::SetupError.to_string(), "setup error");
+        assert_eq!(FailureCategory::PlanFailed.to_string(), "plan failed");
+        assert_eq!(
+            FailureCategory::ImplementationFailed.to_string(),
+            "implementation failed"
+        );
+        assert_eq!(FailureCategory::TestsFailed.to_string(), "tests failed");
+        assert_eq!(
+            FailureCategory::ArchitectRejected.to_string(),
+            "architect rejected"
+        );
+        assert_eq!(
+            FailureCategory::MaxAttemptsExceeded.to_string(),
+            "max attempts exceeded"
+        );
+        assert_eq!(
+            FailureCategory::BudgetExceeded.to_string(),
+            "budget exceeded"
+        );
+        assert_eq!(FailureCategory::Timeout.to_string(), "timeout");
+        assert_eq!(FailureCategory::Other.to_string(), "other");
     }
 
     // -----------------------------------------------------------------------
@@ -1963,11 +2164,13 @@ mod tests {
             tasks_succeeded: 0,
             tasks_failed: 0,
             tasks_deferred: 0,
+            tasks_escalated: 0,
             total_cost: 0.0,
             total_tokens: 0,
             duration: Duration::from_secs(0),
             cease_reason: CeaseReason::AllTasksDone,
             run_results: Vec::new(),
+            dominant_failure_pattern: None,
         }
     }
 
@@ -2094,7 +2297,11 @@ mod tests {
         let mut monitor = RestartIntensityMonitor::new(5, 300);
         // 4 failures should not trigger.
         for _ in 0..4 {
-            assert!(!monitor.record_failure());
+            assert!(
+                monitor
+                    .record_failure(FailureCategory::TestsFailed)
+                    .is_none()
+            );
         }
     }
 
@@ -2102,29 +2309,149 @@ mod tests {
     fn restart_intensity_monitor_at_threshold() {
         let mut monitor = RestartIntensityMonitor::new(5, 300);
         for _ in 0..4 {
-            assert!(!monitor.record_failure());
+            assert!(
+                monitor
+                    .record_failure(FailureCategory::TestsFailed)
+                    .is_none()
+            );
         }
-        // 5th failure triggers.
-        assert!(monitor.record_failure());
+        // 5th failure triggers and returns dominant category.
+        let dominant = monitor.record_failure(FailureCategory::TestsFailed);
+        assert_eq!(dominant, Some(FailureCategory::TestsFailed));
     }
 
     #[test]
     fn restart_intensity_monitor_window_expiry() {
         let mut monitor = RestartIntensityMonitor::new(3, 1);
         // Record 2 failures.
-        assert!(!monitor.record_failure());
-        assert!(!monitor.record_failure());
+        assert!(
+            monitor
+                .record_failure(FailureCategory::SetupError)
+                .is_none()
+        );
+        assert!(
+            monitor
+                .record_failure(FailureCategory::SetupError)
+                .is_none()
+        );
         // Sleep past the window.
         std::thread::sleep(Duration::from_millis(1100));
         // Old failures should have expired; this is only the 1st in the new window.
-        assert!(!monitor.record_failure());
+        assert!(
+            monitor
+                .record_failure(FailureCategory::SetupError)
+                .is_none()
+        );
     }
 
     #[test]
     fn restart_intensity_monitor_single_failure_threshold() {
         let mut monitor = RestartIntensityMonitor::new(1, 300);
         // First failure immediately triggers.
-        assert!(monitor.record_failure());
+        let dominant = monitor.record_failure(FailureCategory::PlanFailed);
+        assert_eq!(dominant, Some(FailureCategory::PlanFailed));
+    }
+
+    #[test]
+    fn restart_intensity_monitor_dominant_category() {
+        let mut monitor = RestartIntensityMonitor::new(5, 300);
+        // Mix of categories: 3 tests, 2 setup
+        monitor.record_failure(FailureCategory::TestsFailed);
+        monitor.record_failure(FailureCategory::SetupError);
+        monitor.record_failure(FailureCategory::TestsFailed);
+        monitor.record_failure(FailureCategory::SetupError);
+        let dominant = monitor.record_failure(FailureCategory::TestsFailed);
+        assert_eq!(dominant, Some(FailureCategory::TestsFailed));
+    }
+
+    #[test]
+    fn restart_intensity_monitor_mixed_categories_window_eviction() {
+        let mut monitor = RestartIntensityMonitor::new(3, 1);
+        // Record 2 setup errors, sleep, then record 3 test failures.
+        monitor.record_failure(FailureCategory::SetupError);
+        monitor.record_failure(FailureCategory::SetupError);
+        std::thread::sleep(Duration::from_millis(1100));
+        monitor.record_failure(FailureCategory::TestsFailed);
+        monitor.record_failure(FailureCategory::TestsFailed);
+        let dominant = monitor.record_failure(FailureCategory::TestsFailed);
+        // Old setup errors should have expired — dominant is now TestsFailed.
+        assert_eq!(dominant, Some(FailureCategory::TestsFailed));
+    }
+
+    #[test]
+    fn failure_category_serde() {
+        for cat in [
+            FailureCategory::SetupError,
+            FailureCategory::PlanFailed,
+            FailureCategory::ImplementationFailed,
+            FailureCategory::TestsFailed,
+            FailureCategory::ArchitectRejected,
+            FailureCategory::MaxAttemptsExceeded,
+            FailureCategory::BudgetExceeded,
+            FailureCategory::Timeout,
+            FailureCategory::Other,
+        ] {
+            let json = serde_json::to_string(&cat).unwrap();
+            let parsed: FailureCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, cat);
+        }
+    }
+
+    #[test]
+    fn pipeline_status_to_failure_category_mapping() {
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::PlanFailed),
+            FailureCategory::PlanFailed
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::ImplementationFailed),
+            FailureCategory::ImplementationFailed
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::TestsFailed),
+            FailureCategory::TestsFailed
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::ArchitectRejected),
+            FailureCategory::ArchitectRejected
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::BudgetExceeded),
+            FailureCategory::BudgetExceeded
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::TimedOut),
+            FailureCategory::Timeout
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::Error),
+            FailureCategory::Other
+        );
+    }
+
+    #[test]
+    fn orchestrator_result_with_dominant_failure_pattern_serde() {
+        let result = OrchestratorResult {
+            tasks_attempted: 3,
+            tasks_succeeded: 0,
+            tasks_failed: 3,
+            tasks_deferred: 0,
+            tasks_escalated: 0,
+            total_cost: 3.0,
+            total_tokens: 30000,
+            duration: Duration::from_millis(500),
+            cease_reason: CeaseReason::SystemicFailure,
+            run_results: vec![],
+            dominant_failure_pattern: Some(FailureCategory::SetupError),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("dominant_failure_pattern"));
+        assert!(json.contains("setup_error"));
+        let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.dominant_failure_pattern,
+            Some(FailureCategory::SetupError)
+        );
     }
 
     // -----------------------------------------------------------------------

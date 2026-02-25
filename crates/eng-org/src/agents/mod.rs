@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use glitchlab_kernel::agent::{AgentContext, ContentBlock, Message, MessageContent, MessageRole};
 use glitchlab_kernel::error;
+use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
 use glitchlab_kernel::tool::{ToolCall, ToolCallResult, ToolDefinition};
 use glitchlab_router::RouterResponse;
 use tracing::{info, warn};
@@ -291,6 +292,69 @@ pub(crate) async fn tool_use_loop(
     }
 }
 
+/// Render an `ObstacleKind` as a human-readable one-liner.
+pub(crate) fn render_obstacle_kind(obstacle: &ObstacleKind) -> String {
+    match obstacle {
+        ObstacleKind::MissingPrerequisite { task_id, reason } => {
+            format!("Missing prerequisite: task `{task_id}` — {reason}")
+        }
+        ObstacleKind::ArchitecturalGap { description } => {
+            format!("Architectural gap: {description}")
+        }
+        ObstacleKind::ModelLimitation { model, error_class } => {
+            format!("Model limitation ({model}): {error_class}")
+        }
+        ObstacleKind::ExternalDependency { service } => {
+            format!("External dependency unavailable: {service}")
+        }
+        ObstacleKind::ScopeTooLarge {
+            estimated_files,
+            max_files,
+        } => {
+            format!("Scope too large: {estimated_files} files (max {max_files})")
+        }
+        ObstacleKind::TestFailure {
+            attempts,
+            last_error,
+        } => {
+            format!("Test failure after {attempts} attempts: {last_error}")
+        }
+        ObstacleKind::ParseFailure { model, raw_snippet } => {
+            format!("Parse failure ({model}): {raw_snippet}")
+        }
+        ObstacleKind::Unknown { detail } => {
+            format!("Unknown obstacle: {detail}")
+        }
+    }
+}
+
+/// Render a list of previous attempts as a numbered markdown section.
+///
+/// Each attempt is rendered with its approach, obstacle, discoveries, and
+/// recommendation so that subsequent pipeline runs can learn from failures.
+pub(crate) fn render_previous_attempts(attempts: &[OutcomeContext]) -> String {
+    let mut out = String::new();
+    for (i, attempt) in attempts.iter().enumerate() {
+        out.push_str(&format!("### Attempt {}\n", i + 1));
+        out.push_str(&format!("- **Approach:** {}\n", attempt.approach));
+        out.push_str(&format!(
+            "- **Obstacle:** {}\n",
+            render_obstacle_kind(&attempt.obstacle)
+        ));
+        if !attempt.discoveries.is_empty() {
+            out.push_str("- **Discoveries:**\n");
+            for d in &attempt.discoveries {
+                out.push_str(&format!("  - {d}\n"));
+            }
+        }
+        if let Some(ref rec) = attempt.recommendation {
+            out.push_str(&format!("- **Recommendation:** {rec}\n"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Build the full user message from agent context, incorporating previous
 /// stage output, file contents, and constraints alongside the objective.
 ///
@@ -326,6 +390,19 @@ pub(crate) fn build_user_message(ctx: &AgentContext) -> String {
     {
         msg.push_str("\n\n## Failure History\n\n");
         msg.push_str(fh);
+    }
+
+    // Structured previous attempts (injected by the orchestrator via AttemptTracker).
+    if let Some(attempts_val) = ctx.extra.get("previous_attempts")
+        && let Ok(attempts) = serde_json::from_value::<Vec<OutcomeContext>>(attempts_val.clone())
+        && !attempts.is_empty()
+    {
+        msg.push_str("\n\n## Previous Attempts\n\n");
+        msg.push_str(
+            "The following previous attempts failed. \
+             Do NOT repeat the same approach — use a different strategy.\n\n",
+        );
+        msg.push_str(&render_previous_attempts(&attempts));
     }
 
     // Task constraints.
@@ -636,6 +713,207 @@ mod tests {
         );
         let msg = build_user_message(&ctx);
         assert!(!msg.contains("## Failure History"));
+    }
+
+    // --- previous attempts / negative context injection tests ---
+
+    use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+    #[test]
+    fn build_user_message_with_previous_attempts() {
+        let mut ctx = base_ctx();
+        let attempts = vec![OutcomeContext {
+            approach: "tried adding uuid crate".into(),
+            obstacle: ObstacleKind::TestFailure {
+                attempts: 2,
+                last_error: "compilation error".into(),
+            },
+            discoveries: vec!["workspace uses no_std".into()],
+            recommendation: Some("use uuid without default features".into()),
+            files_explored: vec!["Cargo.toml".into()],
+        }];
+        ctx.extra.insert(
+            "previous_attempts".into(),
+            serde_json::to_value(&attempts).unwrap(),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(msg.contains("## Previous Attempts"));
+        assert!(msg.contains("Do NOT repeat the same approach"));
+        assert!(msg.contains("### Attempt 1"));
+        assert!(msg.contains("tried adding uuid crate"));
+        assert!(msg.contains("Test failure after 2 attempts"));
+        assert!(msg.contains("workspace uses no_std"));
+        assert!(msg.contains("use uuid without default features"));
+    }
+
+    #[test]
+    fn build_user_message_empty_previous_attempts_omitted() {
+        let mut ctx = base_ctx();
+        let attempts: Vec<OutcomeContext> = vec![];
+        ctx.extra.insert(
+            "previous_attempts".into(),
+            serde_json::to_value(&attempts).unwrap(),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(!msg.contains("## Previous Attempts"));
+    }
+
+    #[test]
+    fn build_user_message_previous_attempts_ordering() {
+        let mut ctx = base_ctx();
+        let attempts = vec![
+            OutcomeContext {
+                approach: "first approach".into(),
+                obstacle: ObstacleKind::Unknown {
+                    detail: "unknown".into(),
+                },
+                discoveries: vec![],
+                recommendation: None,
+                files_explored: vec![],
+            },
+            OutcomeContext {
+                approach: "second approach".into(),
+                obstacle: ObstacleKind::ArchitecturalGap {
+                    description: "missing trait".into(),
+                },
+                discoveries: vec![],
+                recommendation: None,
+                files_explored: vec![],
+            },
+        ];
+        ctx.extra.insert(
+            "previous_attempts".into(),
+            serde_json::to_value(&attempts).unwrap(),
+        );
+        let msg = build_user_message(&ctx);
+        let pos1 = msg.find("### Attempt 1").unwrap();
+        let pos2 = msg.find("### Attempt 2").unwrap();
+        assert!(pos1 < pos2);
+        assert!(msg.contains("first approach"));
+        assert!(msg.contains("second approach"));
+    }
+
+    #[test]
+    fn build_user_message_previous_attempts_minimal_entry() {
+        let mut ctx = base_ctx();
+        let attempts = vec![OutcomeContext {
+            approach: "tried it".into(),
+            obstacle: ObstacleKind::Unknown {
+                detail: "shrug".into(),
+            },
+            discoveries: vec![],
+            recommendation: None,
+            files_explored: vec![],
+        }];
+        ctx.extra.insert(
+            "previous_attempts".into(),
+            serde_json::to_value(&attempts).unwrap(),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(msg.contains("tried it"));
+        assert!(msg.contains("Unknown obstacle: shrug"));
+        // No discoveries or recommendation sections.
+        assert!(!msg.contains("Discoveries"));
+        assert!(!msg.contains("Recommendation"));
+    }
+
+    #[test]
+    fn render_obstacle_kind_all_variants() {
+        let cases: Vec<(ObstacleKind, &str)> = vec![
+            (
+                ObstacleKind::MissingPrerequisite {
+                    task_id: "t1".into(),
+                    reason: "not ready".into(),
+                },
+                "Missing prerequisite: task `t1`",
+            ),
+            (
+                ObstacleKind::ArchitecturalGap {
+                    description: "no plugin".into(),
+                },
+                "Architectural gap: no plugin",
+            ),
+            (
+                ObstacleKind::ModelLimitation {
+                    model: "gpt-4".into(),
+                    error_class: "overflow".into(),
+                },
+                "Model limitation (gpt-4): overflow",
+            ),
+            (
+                ObstacleKind::ExternalDependency {
+                    service: "npm".into(),
+                },
+                "External dependency unavailable: npm",
+            ),
+            (
+                ObstacleKind::ScopeTooLarge {
+                    estimated_files: 50,
+                    max_files: 20,
+                },
+                "Scope too large: 50 files (max 20)",
+            ),
+            (
+                ObstacleKind::TestFailure {
+                    attempts: 3,
+                    last_error: "assert failed".into(),
+                },
+                "Test failure after 3 attempts: assert failed",
+            ),
+            (
+                ObstacleKind::ParseFailure {
+                    model: "claude".into(),
+                    raw_snippet: "{bad".into(),
+                },
+                "Parse failure (claude): {bad",
+            ),
+            (
+                ObstacleKind::Unknown {
+                    detail: "mystery".into(),
+                },
+                "Unknown obstacle: mystery",
+            ),
+        ];
+        for (obstacle, expected_substr) in cases {
+            let rendered = render_obstacle_kind(&obstacle);
+            assert!(
+                rendered.contains(expected_substr),
+                "expected '{expected_substr}' in '{rendered}'"
+            );
+        }
+    }
+
+    #[test]
+    fn render_previous_attempts_multiple_entries() {
+        let attempts = vec![
+            OutcomeContext {
+                approach: "approach A".into(),
+                obstacle: ObstacleKind::TestFailure {
+                    attempts: 1,
+                    last_error: "err1".into(),
+                },
+                discoveries: vec!["found X".into(), "found Y".into()],
+                recommendation: Some("try Z".into()),
+                files_explored: vec![],
+            },
+            OutcomeContext {
+                approach: "approach B".into(),
+                obstacle: ObstacleKind::Unknown {
+                    detail: "dunno".into(),
+                },
+                discoveries: vec![],
+                recommendation: None,
+                files_explored: vec![],
+            },
+        ];
+        let rendered = render_previous_attempts(&attempts);
+        assert!(rendered.contains("### Attempt 1"));
+        assert!(rendered.contains("### Attempt 2"));
+        assert!(rendered.contains("approach A"));
+        assert!(rendered.contains("approach B"));
+        assert!(rendered.contains("found X"));
+        assert!(rendered.contains("found Y"));
+        assert!(rendered.contains("try Z"));
     }
 
     // --- tool_use_loop tests ---

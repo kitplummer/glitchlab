@@ -173,6 +173,8 @@ pub enum PipelineStatus {
     ArchitectRejected,
     /// PR was created and merged automatically.
     PrMerged,
+    /// Human decision or external input required — not retryable automatically.
+    Escalated,
     /// Unrecoverable error.
     Error,
 }
@@ -359,6 +361,15 @@ mod tests {
         assert_eq!(json, "\"pr_merged\"");
         let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, PipelineStatus::PrMerged);
+    }
+
+    #[test]
+    fn pipeline_status_escalated_serde() {
+        let status = PipelineStatus::Escalated;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"escalated\"");
+        let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PipelineStatus::Escalated);
     }
 
     #[test]

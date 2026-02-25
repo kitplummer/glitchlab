@@ -1000,6 +1000,48 @@ boundaries:
     }
 
     #[test]
+    fn build_chooser_includes_architect_roles() {
+        let mut config = EngConfig::default();
+        config.routing.models = vec![
+            ModelProfileConfig {
+                model: "cheap/no-code".into(),
+                tier: "economy".into(),
+                capabilities: vec!["tool_use".into()],
+                input_cost_per_m: None,
+                output_cost_per_m: None,
+            },
+            ModelProfileConfig {
+                model: "cheap/with-code".into(),
+                tier: "economy".into(),
+                capabilities: vec!["tool_use".into(), "code".into()],
+                input_cost_per_m: None,
+                output_cost_per_m: None,
+            },
+        ];
+        config.routing.roles.insert(
+            "architect_triage".into(),
+            RolePreferenceConfig {
+                min_tier: "economy".into(),
+                requires: vec!["code".into()],
+            },
+        );
+        config.routing.roles.insert(
+            "architect_review".into(),
+            RolePreferenceConfig {
+                min_tier: "economy".into(),
+                requires: vec!["code".into()],
+            },
+        );
+
+        let chooser = config.build_chooser().unwrap();
+        // Both architect roles should select the model with 'code' capability.
+        let triage = chooser.select("architect_triage", 10.0, 10.0);
+        assert_eq!(triage, Some("cheap/with-code"));
+        let review = chooser.select("architect_review", 10.0, 10.0);
+        assert_eq!(review, Some("cheap/with-code"));
+    }
+
+    #[test]
     fn default_cost_inference() {
         let (i, o) = default_cost("gemini/gemini-2.5-flash-lite");
         assert!((i - 0.075).abs() < f64::EPSILON);
