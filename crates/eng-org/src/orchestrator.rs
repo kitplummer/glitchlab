@@ -276,6 +276,8 @@ pub struct OrchestratorResult {
     pub tasks_failed: u32,
     #[serde(default)]
     pub tasks_deferred: u32,
+    #[serde(default)]
+    pub tasks_escalated: u32,
     pub total_cost: f64,
     pub total_tokens: u64,
     pub duration: Duration,
@@ -318,6 +320,7 @@ pub enum OutcomeCounter {
     Succeeded,
     Failed,
     Deferred,
+    Escalated,
     None,
 }
 
@@ -455,6 +458,7 @@ impl Orchestrator {
             tasks_succeeded: 0,
             tasks_failed: 0,
             tasks_deferred: 0,
+            tasks_escalated: 0,
             total_cost: 0.0,
             total_tokens: 0,
             duration: Duration::from_secs(0), // Will be updated before return
@@ -615,6 +619,7 @@ impl Orchestrator {
                     }
                 }
                 OutcomeCounter::Deferred => result.tasks_deferred += 1,
+                OutcomeCounter::Escalated => result.tasks_escalated += 1,
                 OutcomeCounter::None => {}
             }
 
@@ -690,6 +695,7 @@ impl Orchestrator {
             tasks_succeeded = result.tasks_succeeded,
             tasks_failed = result.tasks_failed,
             tasks_deferred = result.tasks_deferred,
+            tasks_escalated = result.tasks_escalated,
             total_cost = result.total_cost,
             total_tokens = result.total_tokens,
             duration_ms = result.duration.as_millis(),
@@ -787,16 +793,22 @@ impl Orchestrator {
                 track_attempt: false,
             },
             PipelineStatus::Retryable => OutcomeRouting {
-                task_status: TaskStatus::Failed,
-                counter: OutcomeCounter::Failed,
+                task_status: TaskStatus::Deferred,
+                counter: OutcomeCounter::Deferred,
                 save_context: true,
                 track_attempt: true,
             },
             PipelineStatus::ArchitectRejected => OutcomeRouting {
-                task_status: TaskStatus::Failed,
-                counter: OutcomeCounter::Failed,
+                task_status: TaskStatus::Deferred,
+                counter: OutcomeCounter::Deferred,
                 save_context: true,
                 track_attempt: true,
+            },
+            PipelineStatus::Escalated => OutcomeRouting {
+                task_status: TaskStatus::Skipped,
+                counter: OutcomeCounter::Escalated,
+                save_context: true,
+                track_attempt: false,
             },
             _ => OutcomeRouting {
                 task_status: TaskStatus::Failed,
@@ -1212,6 +1224,7 @@ mod tests {
             tasks_succeeded: 2,
             tasks_failed: 1,
             tasks_deferred: 0,
+            tasks_escalated: 0,
             total_cost: 12.50,
             total_tokens: 150000,
             duration: Duration::from_millis(5000),
@@ -1725,6 +1738,7 @@ mod tests {
             tasks_succeeded: 2,
             tasks_failed: 1,
             tasks_deferred: 2,
+            tasks_escalated: 0,
             total_cost: 5.0,
             total_tokens: 50000,
             duration: Duration::from_millis(1000),
@@ -1795,8 +1809,8 @@ mod tests {
     fn route_outcome_retryable() {
         let pr = make_pipeline_result(PipelineStatus::Retryable);
         let routing = Orchestrator::route_outcome(&pr);
-        assert_eq!(routing.task_status, TaskStatus::Failed);
-        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert_eq!(routing.task_status, TaskStatus::Deferred);
+        assert_eq!(routing.counter, OutcomeCounter::Deferred);
         assert!(routing.save_context);
         assert!(routing.track_attempt);
     }
@@ -1849,8 +1863,8 @@ mod tests {
     fn route_outcome_architect_rejected() {
         let pr = make_pipeline_result(PipelineStatus::ArchitectRejected);
         let routing = Orchestrator::route_outcome(&pr);
-        assert_eq!(routing.task_status, TaskStatus::Failed);
-        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert_eq!(routing.task_status, TaskStatus::Deferred);
+        assert_eq!(routing.counter, OutcomeCounter::Deferred);
         assert!(routing.save_context);
         assert!(routing.track_attempt);
     }
@@ -1863,6 +1877,53 @@ mod tests {
         assert_eq!(routing.counter, OutcomeCounter::Succeeded);
         assert!(!routing.save_context);
         assert!(!routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_escalated() {
+        let pr = make_pipeline_result(PipelineStatus::Escalated);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Skipped);
+        assert_eq!(routing.counter, OutcomeCounter::Escalated);
+        assert!(routing.save_context);
+        assert!(!routing.track_attempt);
+    }
+
+    #[test]
+    fn orchestrator_result_escalated_serde() {
+        let result = OrchestratorResult {
+            tasks_attempted: 4,
+            tasks_succeeded: 1,
+            tasks_failed: 1,
+            tasks_deferred: 1,
+            tasks_escalated: 1,
+            total_cost: 8.0,
+            total_tokens: 80000,
+            duration: Duration::from_millis(2000),
+            cease_reason: CeaseReason::AllTasksDone,
+            run_results: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tasks_escalated, 1);
+    }
+
+    #[test]
+    fn orchestrator_result_backward_compat_without_escalated() {
+        // Simulate deserializing old JSON without tasks_escalated field.
+        let json = r#"{
+            "tasks_attempted": 2,
+            "tasks_succeeded": 1,
+            "tasks_failed": 1,
+            "total_cost": 3.0,
+            "total_tokens": 30000,
+            "duration": {"secs": 1, "nanos": 0},
+            "cease_reason": "all_tasks_done",
+            "run_results": []
+        }"#;
+        let parsed: OrchestratorResult = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.tasks_deferred, 0);
+        assert_eq!(parsed.tasks_escalated, 0);
     }
 
     #[test]
@@ -1963,6 +2024,7 @@ mod tests {
             tasks_succeeded: 0,
             tasks_failed: 0,
             tasks_deferred: 0,
+            tasks_escalated: 0,
             total_cost: 0.0,
             total_tokens: 0,
             duration: Duration::from_secs(0),
