@@ -5,4 +5,5 @@ pub mod orchestrator;
 pub mod pipeline;
 pub mod taskqueue;
 pub mod tools;
+pub mod tqm;
 pub mod workspace;

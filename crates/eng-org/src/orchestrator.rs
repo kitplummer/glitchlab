@@ -758,6 +758,29 @@ impl Orchestrator {
 
         result.duration = start_time.elapsed();
 
+        // --- TQM post-run analysis ---
+        let tqm_patterns = crate::tqm::analyze(&result, &crate::tqm::TQMConfig::default());
+        for pattern in &tqm_patterns {
+            match pattern.severity.as_str() {
+                "critical" => warn!(
+                    kind = ?pattern.kind,
+                    occurrences = pattern.occurrences,
+                    affected = ?pattern.affected_tasks,
+                    "{}", pattern.description
+                ),
+                "warning" => warn!(
+                    kind = ?pattern.kind,
+                    occurrences = pattern.occurrences,
+                    "{}", pattern.description
+                ),
+                _ => info!(
+                    kind = ?pattern.kind,
+                    occurrences = pattern.occurrences,
+                    "{}", pattern.description
+                ),
+            }
+        }
+
         info!(
             tasks_attempted = result.tasks_attempted,
             tasks_succeeded = result.tasks_succeeded,
@@ -768,6 +791,7 @@ impl Orchestrator {
             total_tokens = result.total_tokens,
             duration_ms = result.duration.as_millis(),
             cease_reason = ?result.cease_reason,
+            tqm_patterns = tqm_patterns.len(),
             "orchestrator run complete"
         );
 
