@@ -394,6 +394,22 @@ pub enum FailureCategory {
     Other,
 }
 
+impl fmt::Display for FailureCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FailureCategory::SetupError => write!(f, "setup error"),
+            FailureCategory::PlanFailed => write!(f, "plan failed"),
+            FailureCategory::ImplementationFailed => write!(f, "implementation failed"),
+            FailureCategory::TestsFailed => write!(f, "tests failed"),
+            FailureCategory::ArchitectRejected => write!(f, "architect rejected"),
+            FailureCategory::MaxAttemptsExceeded => write!(f, "max attempts exceeded"),
+            FailureCategory::BudgetExceeded => write!(f, "budget exceeded"),
+            FailureCategory::Timeout => write!(f, "timeout"),
+            FailureCategory::Other => write!(f, "other"),
+        }
+    }
+}
+
 /// Map a `PipelineStatus` to the appropriate `FailureCategory`.
 pub fn pipeline_status_to_failure_category(status: PipelineStatus) -> FailureCategory {
     match status {
@@ -2045,6 +2061,35 @@ mod tests {
             CeaseReason::QualityGateFailed.to_string(),
             "quality gate failed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // FailureCategory Display tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn failure_category_display() {
+        assert_eq!(FailureCategory::SetupError.to_string(), "setup error");
+        assert_eq!(FailureCategory::PlanFailed.to_string(), "plan failed");
+        assert_eq!(
+            FailureCategory::ImplementationFailed.to_string(),
+            "implementation failed"
+        );
+        assert_eq!(FailureCategory::TestsFailed.to_string(), "tests failed");
+        assert_eq!(
+            FailureCategory::ArchitectRejected.to_string(),
+            "architect rejected"
+        );
+        assert_eq!(
+            FailureCategory::MaxAttemptsExceeded.to_string(),
+            "max attempts exceeded"
+        );
+        assert_eq!(
+            FailureCategory::BudgetExceeded.to_string(),
+            "budget exceeded"
+        );
+        assert_eq!(FailureCategory::Timeout.to_string(), "timeout");
+        assert_eq!(FailureCategory::Other.to_string(), "other");
     }
 
     // -----------------------------------------------------------------------
