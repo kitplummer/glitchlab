@@ -49,6 +49,9 @@ pub struct Task {
     pub status: TaskStatus,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Decomposition depth: 0 for root tasks, incremented per decomposition level.
+    #[serde(default)]
+    pub decomposition_depth: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,7 +119,7 @@ impl TaskQueue {
             .map_err(|e| Error::Config(format!("failed to load from beads: {e}")))?;
         let tasks: Vec<Task> = beads
             .into_iter()
-            .filter(|b| is_actionable_type(&b.issue_type))
+            .filter(|b| is_actionable_type(&b.issue_type) && b.status != "closed")
             .map(bead_to_task)
             .collect();
         Ok(Self { tasks, path: None })
@@ -305,6 +308,7 @@ fn bead_to_task(bead: Bead) -> Task {
         priority,
         status,
         depends_on,
+        decomposition_depth: 0,
         error: None,
         pr_url,
         outcome_context: None,
@@ -327,6 +331,7 @@ mod tests {
                 priority: 1,
                 status: TaskStatus::Pending,
                 depends_on: vec![],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -337,6 +342,7 @@ mod tests {
                 priority: 2,
                 status: TaskStatus::Pending,
                 depends_on: vec!["task-1".into()],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -347,6 +353,7 @@ mod tests {
                 priority: 10,
                 status: TaskStatus::Pending,
                 depends_on: vec![],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -399,6 +406,7 @@ mod tests {
                 priority: 1,
                 status: TaskStatus::InProgress,
                 depends_on: vec![],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -409,6 +417,7 @@ mod tests {
                 priority: 2,
                 status: TaskStatus::Pending,
                 depends_on: vec!["a".into()],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -550,6 +559,7 @@ mod tests {
             priority: 5,
             status: TaskStatus::Completed,
             depends_on: vec!["dep-1".into()],
+            decomposition_depth: 0,
             error: Some("oops".into()),
             pr_url: Some("https://example.com/pr/1".into()),
             outcome_context: None,
@@ -572,6 +582,7 @@ mod tests {
                 priority: 1,
                 status: TaskStatus::Completed,
                 depends_on: vec![],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -582,6 +593,7 @@ mod tests {
                 priority: 1,
                 status: TaskStatus::Pending,
                 depends_on: vec![],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -592,6 +604,7 @@ mod tests {
                 priority: 1,
                 status: TaskStatus::Pending,
                 depends_on: vec!["a".into(), "b".into()],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -615,6 +628,7 @@ mod tests {
             priority: 0, // highest priority
             status: TaskStatus::Pending,
             depends_on: vec![],
+            decomposition_depth: 0,
             error: None,
             pr_url: None,
             outcome_context: None,
@@ -793,13 +807,14 @@ mod tests {
         let json = r#"[
             {"id":"t1","title":"A task","issue_type":"task","priority":1},
             {"id":"t2","title":"An epic","issue_type":"epic","priority":0},
-            {"id":"t3","title":"A bug","issue_type":"bug","priority":2,"status":"in_progress"}
+            {"id":"t3","title":"A bug","issue_type":"bug","priority":2,"status":"in_progress"},
+            {"id":"t4","title":"Done task","issue_type":"task","priority":1,"status":"closed"}
         ]"#;
         let script = mock_bd_script(dir.path(), json);
         let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
 
         let queue = TaskQueue::load_from_beads(&client).await.unwrap();
-        // "epic" should be filtered out
+        // "epic" and "closed" should be filtered out
         assert_eq!(queue.tasks().len(), 2);
         assert_eq!(queue.tasks()[0].id, "t1");
         assert_eq!(queue.tasks()[1].id, "t3");
@@ -849,6 +864,7 @@ mod tests {
                 priority: 1,
                 status: TaskStatus::Deferred,
                 depends_on: vec![],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -859,6 +875,7 @@ mod tests {
                 priority: 2,
                 status: TaskStatus::Pending,
                 depends_on: vec![],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -878,6 +895,7 @@ mod tests {
             priority: 1,
             status: TaskStatus::Deferred,
             depends_on: vec![],
+            decomposition_depth: 0,
             error: None,
             pr_url: None,
             outcome_context: None,
@@ -894,6 +912,7 @@ mod tests {
             priority: 1,
             status: TaskStatus::Deferred,
             depends_on: vec![],
+            decomposition_depth: 0,
             error: None,
             pr_url: None,
             outcome_context: None,
@@ -937,6 +956,7 @@ mod tests {
             priority: 1,
             status: TaskStatus::Deferred,
             depends_on: vec![],
+            decomposition_depth: 0,
             error: None,
             pr_url: None,
             outcome_context: Some(OutcomeContext {
@@ -983,5 +1003,40 @@ mod tests {
         assert_eq!(TaskStatus::Failed.to_string(), "failed");
         assert_eq!(TaskStatus::Skipped.to_string(), "skipped");
         assert_eq!(TaskStatus::Deferred.to_string(), "deferred");
+    }
+
+    // -----------------------------------------------------------------------
+    // Decomposition depth tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_serde_with_decomposition_depth() {
+        let task = Task {
+            id: "depth-test".into(),
+            objective: "Test depth".into(),
+            priority: 1,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 2,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        let parsed: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.decomposition_depth, 2);
+
+        // YAML roundtrip too.
+        let yaml = serde_yaml::to_string(&task).unwrap();
+        let parsed_yaml: Task = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed_yaml.decomposition_depth, 2);
+    }
+
+    #[test]
+    fn task_decomposition_depth_defaults_to_zero() {
+        // Tasks serialised before decomposition_depth existed.
+        let json = r#"{"id":"old","objective":"old task","priority":1,"status":"pending"}"#;
+        let parsed: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.decomposition_depth, 0);
     }
 }

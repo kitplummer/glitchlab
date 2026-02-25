@@ -92,6 +92,10 @@ fn default_max_stuck_turns() -> u32 {
     3
 }
 
+fn default_max_decomposition_depth() -> u32 {
+    3
+}
+
 /// Configuration for a model in the cost-aware pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfileConfig {
@@ -132,6 +136,10 @@ pub struct LimitsConfig {
     /// tool-use loop terminates early.
     #[serde(default = "default_max_stuck_turns")]
     pub max_stuck_turns: u32,
+    /// Maximum decomposition depth. Tasks at this depth will not be decomposed
+    /// further; instead they are marked as failed. Prevents infinite decomposition loops.
+    #[serde(default = "default_max_decomposition_depth")]
+    pub max_decomposition_depth: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +205,7 @@ impl Default for EngConfig {
                 max_tool_turns: 15,
                 max_pipeline_duration_secs: 600,
                 max_stuck_turns: 3,
+                max_decomposition_depth: 3,
             },
             intervention: InterventionConfig {
                 pause_after_plan: true,
@@ -1226,6 +1235,26 @@ base_url: http://localhost:8080
         .unwrap();
         let config = EngConfig::load(Some(dir.path())).unwrap();
         assert_eq!(config.limits.max_stuck_turns, 5);
+    }
+
+    #[test]
+    fn max_decomposition_depth_default() {
+        let config = EngConfig::default();
+        assert_eq!(config.limits.max_decomposition_depth, 3);
+    }
+
+    #[test]
+    fn max_decomposition_depth_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "limits:\n  max_decomposition_depth: 5\n",
+        )
+        .unwrap();
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(config.limits.max_decomposition_depth, 5);
     }
 
     #[test]

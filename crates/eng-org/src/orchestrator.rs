@@ -433,10 +433,12 @@ impl Orchestrator {
             // --- Pick next task ---
             let task_id;
             let objective;
+            let task_depth;
             match queue.pick_next() {
                 Some(task) => {
                     task_id = task.id.clone();
                     objective = task.objective.clone();
+                    task_depth = task.decomposition_depth;
                 }
                 None => {
                     info!("no more actionable tasks");
@@ -533,23 +535,15 @@ impl Orchestrator {
 
             // Handle decomposition specially (needs sub-task extraction).
             if pipeline_result.status == PipelineStatus::Decomposed {
-                if let Some(sub_tasks) =
-                    Self::extract_sub_tasks(&task_id, &pipeline_result.stage_outputs)
-                {
-                    let count = sub_tasks.len();
-                    info!(task_id = %task_id, count, "decomposed into sub-tasks");
-                    queue.inject_tasks(sub_tasks);
-                    queue.update_status(&task_id, TaskStatus::Completed);
-                } else {
-                    warn!(
-                        task_id = %task_id,
-                        "decomposition flagged but no sub-tasks found"
-                    );
-                    result.tasks_failed += 1;
-                    queue.update_status(&task_id, TaskStatus::Failed);
-                    queue.set_error(&task_id, "decomposition produced no sub-tasks".into());
-                }
-                let _ = queue.save();
+                let max_depth = self.config.limits.max_decomposition_depth;
+                Self::handle_decomposition(
+                    queue,
+                    &mut result,
+                    &task_id,
+                    task_depth,
+                    max_depth,
+                    &pipeline_result.stage_outputs,
+                );
                 continue;
             }
 
@@ -747,9 +741,59 @@ impl Orchestrator {
         }
     }
 
+    /// Handle a decomposed pipeline result: check depth, extract sub-tasks, update queue.
+    ///
+    /// Returns `true` if decomposition succeeded (sub-tasks injected),
+    /// `false` if it failed (depth exceeded or no sub-tasks found).
+    fn handle_decomposition(
+        queue: &mut TaskQueue,
+        result: &mut OrchestratorResult,
+        task_id: &str,
+        task_depth: u32,
+        max_depth: u32,
+        stage_outputs: &HashMap<String, AgentOutput>,
+    ) -> bool {
+        if task_depth >= max_depth {
+            warn!(
+                task_id = %task_id,
+                depth = task_depth,
+                max = max_depth,
+                "decomposition depth exceeded, marking failed"
+            );
+            queue.update_status(task_id, TaskStatus::Failed);
+            queue.set_error(
+                task_id,
+                format!("decomposition depth {task_depth} exceeds max {max_depth}"),
+            );
+            result.tasks_failed += 1;
+            let _ = queue.save();
+            return false;
+        }
+
+        if let Some(sub_tasks) = Self::extract_sub_tasks(task_id, task_depth, stage_outputs) {
+            let count = sub_tasks.len();
+            info!(task_id = %task_id, count, "decomposed into sub-tasks");
+            queue.inject_tasks(sub_tasks);
+            queue.update_status(task_id, TaskStatus::Completed);
+            let _ = queue.save();
+            true
+        } else {
+            warn!(
+                task_id = %task_id,
+                "decomposition flagged but no sub-tasks found"
+            );
+            result.tasks_failed += 1;
+            queue.update_status(task_id, TaskStatus::Failed);
+            queue.set_error(task_id, "decomposition produced no sub-tasks".into());
+            let _ = queue.save();
+            false
+        }
+    }
+
     /// Extract sub-tasks from a decomposed pipeline result.
     fn extract_sub_tasks(
         parent_id: &str,
+        parent_depth: u32,
         stage_outputs: &HashMap<String, AgentOutput>,
     ) -> Option<Vec<crate::taskqueue::Task>> {
         let plan = stage_outputs.get("plan")?;
@@ -796,6 +840,7 @@ impl Orchestrator {
                 priority: 50, // default priority for sub-tasks
                 status: crate::taskqueue::TaskStatus::Pending,
                 depends_on,
+                decomposition_depth: parent_depth + 1,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -1023,6 +1068,7 @@ mod tests {
             priority: 1,
             status: TaskStatus::Pending,
             depends_on: vec![],
+            decomposition_depth: 0,
             error: None,
             pr_url: None,
             outcome_context: None,
@@ -1058,6 +1104,7 @@ mod tests {
                 priority: 1,
                 status: TaskStatus::Failed,
                 depends_on: vec![],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -1068,6 +1115,7 @@ mod tests {
                 priority: 2,
                 status: TaskStatus::Pending,
                 depends_on: vec!["a".into()],
+                decomposition_depth: 0,
                 error: None,
                 pr_url: None,
                 outcome_context: None,
@@ -1139,6 +1187,7 @@ mod tests {
             priority: 1,
             status: TaskStatus::Pending,
             depends_on: vec![],
+            decomposition_depth: 0,
             error: None,
             pr_url: None,
             outcome_context: None,
@@ -1457,7 +1506,7 @@ mod tests {
         let mut stage_outputs = HashMap::new();
         stage_outputs.insert("plan".into(), plan_output);
 
-        let sub_tasks = Orchestrator::extract_sub_tasks("parent", &stage_outputs).unwrap();
+        let sub_tasks = Orchestrator::extract_sub_tasks("parent", 0, &stage_outputs).unwrap();
         assert_eq!(sub_tasks.len(), 2);
         assert_eq!(sub_tasks[0].id, "parent-part1");
         assert_eq!(sub_tasks[0].objective, "Add uuid to Cargo.toml");
@@ -1469,7 +1518,7 @@ mod tests {
     #[test]
     fn extract_sub_tasks_none_when_no_decomposition() {
         let stage_outputs = HashMap::new();
-        assert!(Orchestrator::extract_sub_tasks("x", &stage_outputs).is_none());
+        assert!(Orchestrator::extract_sub_tasks("x", 0, &stage_outputs).is_none());
     }
 
     #[test]
@@ -1494,7 +1543,7 @@ mod tests {
         let mut stage_outputs = HashMap::new();
         stage_outputs.insert("plan".into(), plan_output);
 
-        assert!(Orchestrator::extract_sub_tasks("x", &stage_outputs).is_none());
+        assert!(Orchestrator::extract_sub_tasks("x", 0, &stage_outputs).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1773,5 +1822,199 @@ mod tests {
             CeaseReason::QualityGateFailed.to_string(),
             "quality gate failed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Decomposition depth tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_sub_tasks_propagates_depth() {
+        use glitchlab_kernel::agent::AgentMetadata;
+
+        let plan_data = serde_json::json!({
+            "decomposition": [
+                { "id": "child-1", "objective": "Do A", "depends_on": [] },
+                { "id": "child-2", "objective": "Do B", "depends_on": ["child-1"] }
+            ]
+        });
+        let plan_output = AgentOutput {
+            data: plan_data,
+            metadata: AgentMetadata {
+                agent: "planner".into(),
+                model: "test".into(),
+                tokens: 100,
+                cost: 0.01,
+                latency_ms: 50,
+            },
+            parse_error: false,
+        };
+        let mut stage_outputs = HashMap::new();
+        stage_outputs.insert("plan".into(), plan_output);
+
+        // Parent at depth 2 → children should be depth 3.
+        let sub_tasks = Orchestrator::extract_sub_tasks("parent", 2, &stage_outputs).unwrap();
+        assert_eq!(sub_tasks.len(), 2);
+        assert_eq!(sub_tasks[0].decomposition_depth, 3);
+        assert_eq!(sub_tasks[1].decomposition_depth, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_decomposition tests
+    // -----------------------------------------------------------------------
+
+    fn decomposition_stage_outputs() -> HashMap<String, AgentOutput> {
+        use glitchlab_kernel::agent::AgentMetadata;
+
+        let plan_data = serde_json::json!({
+            "decomposition": [
+                { "id": "sub-1", "objective": "Sub task A", "depends_on": [] },
+                { "id": "sub-2", "objective": "Sub task B", "depends_on": ["sub-1"] }
+            ]
+        });
+        let mut stage_outputs = HashMap::new();
+        stage_outputs.insert(
+            "plan".into(),
+            AgentOutput {
+                data: plan_data,
+                metadata: AgentMetadata {
+                    agent: "planner".into(),
+                    model: "test".into(),
+                    tokens: 100,
+                    cost: 0.01,
+                    latency_ms: 50,
+                },
+                parse_error: false,
+            },
+        );
+        stage_outputs
+    }
+
+    fn empty_orchestrator_result() -> OrchestratorResult {
+        OrchestratorResult {
+            tasks_attempted: 0,
+            tasks_succeeded: 0,
+            tasks_failed: 0,
+            tasks_deferred: 0,
+            total_cost: 0.0,
+            total_tokens: 0,
+            duration: Duration::from_secs(0),
+            cease_reason: CeaseReason::AllTasksDone,
+            run_results: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn handle_decomposition_depth_exceeded_marks_failed() {
+        let tasks = vec![Task {
+            id: "deep-task".into(),
+            objective: "Too deep".into(),
+            priority: 1,
+            status: TaskStatus::InProgress,
+            depends_on: vec![],
+            decomposition_depth: 3,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        }];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut result = empty_orchestrator_result();
+        let stage_outputs = decomposition_stage_outputs();
+
+        let ok = Orchestrator::handle_decomposition(
+            &mut queue,
+            &mut result,
+            "deep-task",
+            3, // task_depth
+            3, // max_depth — at limit
+            &stage_outputs,
+        );
+
+        assert!(!ok);
+        assert_eq!(result.tasks_failed, 1);
+        let task = queue.tasks().iter().find(|t| t.id == "deep-task").unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(task.error.as_ref().unwrap().contains("decomposition depth"));
+    }
+
+    #[test]
+    fn handle_decomposition_success_injects_sub_tasks() {
+        let tasks = vec![Task {
+            id: "parent-task".into(),
+            objective: "Decomposable".into(),
+            priority: 1,
+            status: TaskStatus::InProgress,
+            depends_on: vec![],
+            decomposition_depth: 1,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        }];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut result = empty_orchestrator_result();
+        let stage_outputs = decomposition_stage_outputs();
+
+        let ok = Orchestrator::handle_decomposition(
+            &mut queue,
+            &mut result,
+            "parent-task",
+            1, // task_depth
+            3, // max_depth — under limit
+            &stage_outputs,
+        );
+
+        assert!(ok);
+        assert_eq!(result.tasks_failed, 0);
+        // Parent should be completed.
+        let parent = queue
+            .tasks()
+            .iter()
+            .find(|t| t.id == "parent-task")
+            .unwrap();
+        assert_eq!(parent.status, TaskStatus::Completed);
+        // Sub-tasks should be injected with depth = 2.
+        let sub1 = queue.tasks().iter().find(|t| t.id == "sub-1").unwrap();
+        assert_eq!(sub1.decomposition_depth, 2);
+        assert_eq!(sub1.status, TaskStatus::Pending);
+        let sub2 = queue.tasks().iter().find(|t| t.id == "sub-2").unwrap();
+        assert_eq!(sub2.decomposition_depth, 2);
+        assert_eq!(sub2.depends_on, vec!["sub-1"]);
+    }
+
+    #[test]
+    fn handle_decomposition_no_sub_tasks_marks_failed() {
+        let tasks = vec![Task {
+            id: "empty-decomp".into(),
+            objective: "No subs".into(),
+            priority: 1,
+            status: TaskStatus::InProgress,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        }];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut result = empty_orchestrator_result();
+        let empty_outputs = HashMap::new(); // no "plan" stage → no sub-tasks
+
+        let ok = Orchestrator::handle_decomposition(
+            &mut queue,
+            &mut result,
+            "empty-decomp",
+            0,
+            3,
+            &empty_outputs,
+        );
+
+        assert!(!ok);
+        assert_eq!(result.tasks_failed, 1);
+        let task = queue
+            .tasks()
+            .iter()
+            .find(|t| t.id == "empty-decomp")
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(task.error.as_ref().unwrap().contains("no sub-tasks"));
     }
 }
