@@ -283,6 +283,9 @@ pub struct OrchestratorResult {
     pub duration: Duration,
     pub cease_reason: CeaseReason,
     pub run_results: Vec<TaskRunResult>,
+    /// The dominant failure pattern when systemic failure is detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dominant_failure_pattern: Option<FailureCategory>,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,14 +373,50 @@ impl Default for AttemptTracker {
 }
 
 // ---------------------------------------------------------------------------
+// FailureCategory — categorises failures for diagnostics
+// ---------------------------------------------------------------------------
+
+/// Categorises a pipeline failure for restart intensity diagnostics.
+///
+/// When `RestartIntensityMonitor` triggers, the dominant category tells the
+/// operator *what* is failing systemically (e.g. all tests, or provider outage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    SetupError,
+    PlanFailed,
+    ImplementationFailed,
+    TestsFailed,
+    ArchitectRejected,
+    MaxAttemptsExceeded,
+    BudgetExceeded,
+    Timeout,
+    Other,
+}
+
+/// Map a `PipelineStatus` to the appropriate `FailureCategory`.
+pub fn pipeline_status_to_failure_category(status: PipelineStatus) -> FailureCategory {
+    match status {
+        PipelineStatus::PlanFailed => FailureCategory::PlanFailed,
+        PipelineStatus::ImplementationFailed => FailureCategory::ImplementationFailed,
+        PipelineStatus::TestsFailed => FailureCategory::TestsFailed,
+        PipelineStatus::ArchitectRejected => FailureCategory::ArchitectRejected,
+        PipelineStatus::BudgetExceeded => FailureCategory::BudgetExceeded,
+        PipelineStatus::TimedOut => FailureCategory::Timeout,
+        _ => FailureCategory::Other,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RestartIntensityMonitor — sliding-window failure tracker
 // ---------------------------------------------------------------------------
 
-/// Tracks failure timestamps in a sliding window. When the number of failures
-/// within the window exceeds a threshold, signals that the orchestrator should
-/// halt (likely a systemic issue such as a provider outage or broken base branch).
+/// Tracks failure timestamps and categories in a sliding window. When the
+/// number of failures within the window exceeds a threshold, signals that the
+/// orchestrator should halt (likely a systemic issue such as a provider outage
+/// or broken base branch). Returns the dominant failure category on trigger.
 struct RestartIntensityMonitor {
-    failure_times: VecDeque<Instant>,
+    failures: VecDeque<(Instant, FailureCategory)>,
     max_failures: u32,
     window: Duration,
 }
@@ -385,25 +424,45 @@ struct RestartIntensityMonitor {
 impl RestartIntensityMonitor {
     fn new(max_failures: u32, window_secs: u64) -> Self {
         Self {
-            failure_times: VecDeque::new(),
+            failures: VecDeque::new(),
             max_failures,
             window: Duration::from_secs(window_secs),
         }
     }
 
-    /// Record a failure. Returns `true` if the failure threshold is exceeded.
-    fn record_failure(&mut self) -> bool {
+    /// Record a failure with its category.
+    ///
+    /// Returns `Some(dominant_category)` if the failure threshold is exceeded,
+    /// where `dominant_category` is the most frequent category in the window.
+    fn record_failure(&mut self, category: FailureCategory) -> Option<FailureCategory> {
         let now = Instant::now();
-        self.failure_times.push_back(now);
+        self.failures.push_back((now, category));
         // Drain entries older than the window.
-        while let Some(&front) = self.failure_times.front() {
-            if now.duration_since(front) > self.window {
-                self.failure_times.pop_front();
+        while let Some(&(front_time, _)) = self.failures.front() {
+            if now.duration_since(front_time) > self.window {
+                self.failures.pop_front();
             } else {
                 break;
             }
         }
-        self.failure_times.len() as u32 >= self.max_failures
+        if self.failures.len() as u32 >= self.max_failures {
+            Some(self.dominant_category())
+        } else {
+            None
+        }
+    }
+
+    /// Find the most frequent category in the current window.
+    fn dominant_category(&self) -> FailureCategory {
+        let mut counts: HashMap<FailureCategory, u32> = HashMap::new();
+        for &(_, cat) in &self.failures {
+            *counts.entry(cat).or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(_, count)| count)
+            .map(|(cat, _)| cat)
+            .unwrap_or(FailureCategory::Other)
     }
 }
 
@@ -464,6 +523,7 @@ impl Orchestrator {
             duration: Duration::from_secs(0), // Will be updated before return
             cease_reason: CeaseReason::AllTasksDone,
             run_results: Vec::new(),
+            dominant_failure_pattern: None,
         };
 
         loop {
@@ -518,9 +578,12 @@ impl Orchestrator {
                     error: Some(format!("exceeded max attempts ({max_attempts})")),
                     outcome_context: None,
                 });
-                if intensity_monitor.record_failure() {
-                    warn!("restart intensity exceeded");
+                if let Some(dominant) =
+                    intensity_monitor.record_failure(FailureCategory::MaxAttemptsExceeded)
+                {
+                    warn!(?dominant, "restart intensity exceeded");
                     result.cease_reason = CeaseReason::SystemicFailure;
+                    result.dominant_failure_pattern = Some(dominant);
                     break;
                 }
                 continue;
@@ -557,9 +620,12 @@ impl Orchestrator {
                         outcome_context: None,
                     });
 
-                    if intensity_monitor.record_failure() {
-                        warn!("restart intensity exceeded");
+                    if let Some(dominant) =
+                        intensity_monitor.record_failure(FailureCategory::SetupError)
+                    {
+                        warn!(?dominant, "restart intensity exceeded");
                         result.cease_reason = CeaseReason::SystemicFailure;
+                        result.dominant_failure_pattern = Some(dominant);
                         break;
                     }
                     if params.stop_on_failure {
@@ -613,9 +679,11 @@ impl Orchestrator {
                 OutcomeCounter::Succeeded => result.tasks_succeeded += 1,
                 OutcomeCounter::Failed => {
                     result.tasks_failed += 1;
-                    if intensity_monitor.record_failure() {
-                        warn!("restart intensity exceeded");
+                    let category = pipeline_status_to_failure_category(pipeline_result.status);
+                    if let Some(dominant) = intensity_monitor.record_failure(category) {
+                        warn!(?dominant, "restart intensity exceeded");
                         result.cease_reason = CeaseReason::SystemicFailure;
+                        result.dominant_failure_pattern = Some(dominant);
                     }
                 }
                 OutcomeCounter::Deferred => result.tasks_deferred += 1,
@@ -1238,6 +1306,7 @@ mod tests {
                 error: None,
                 outcome_context: None,
             }],
+            dominant_failure_pattern: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
@@ -1744,6 +1813,7 @@ mod tests {
             duration: Duration::from_millis(1000),
             cease_reason: CeaseReason::AllTasksDone,
             run_results: vec![],
+            dominant_failure_pattern: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
@@ -1902,6 +1972,7 @@ mod tests {
             duration: Duration::from_millis(2000),
             cease_reason: CeaseReason::AllTasksDone,
             run_results: vec![],
+            dominant_failure_pattern: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
@@ -2030,6 +2101,7 @@ mod tests {
             duration: Duration::from_secs(0),
             cease_reason: CeaseReason::AllTasksDone,
             run_results: Vec::new(),
+            dominant_failure_pattern: None,
         }
     }
 
@@ -2156,7 +2228,11 @@ mod tests {
         let mut monitor = RestartIntensityMonitor::new(5, 300);
         // 4 failures should not trigger.
         for _ in 0..4 {
-            assert!(!monitor.record_failure());
+            assert!(
+                monitor
+                    .record_failure(FailureCategory::TestsFailed)
+                    .is_none()
+            );
         }
     }
 
@@ -2164,29 +2240,149 @@ mod tests {
     fn restart_intensity_monitor_at_threshold() {
         let mut monitor = RestartIntensityMonitor::new(5, 300);
         for _ in 0..4 {
-            assert!(!monitor.record_failure());
+            assert!(
+                monitor
+                    .record_failure(FailureCategory::TestsFailed)
+                    .is_none()
+            );
         }
-        // 5th failure triggers.
-        assert!(monitor.record_failure());
+        // 5th failure triggers and returns dominant category.
+        let dominant = monitor.record_failure(FailureCategory::TestsFailed);
+        assert_eq!(dominant, Some(FailureCategory::TestsFailed));
     }
 
     #[test]
     fn restart_intensity_monitor_window_expiry() {
         let mut monitor = RestartIntensityMonitor::new(3, 1);
         // Record 2 failures.
-        assert!(!monitor.record_failure());
-        assert!(!monitor.record_failure());
+        assert!(
+            monitor
+                .record_failure(FailureCategory::SetupError)
+                .is_none()
+        );
+        assert!(
+            monitor
+                .record_failure(FailureCategory::SetupError)
+                .is_none()
+        );
         // Sleep past the window.
         std::thread::sleep(Duration::from_millis(1100));
         // Old failures should have expired; this is only the 1st in the new window.
-        assert!(!monitor.record_failure());
+        assert!(
+            monitor
+                .record_failure(FailureCategory::SetupError)
+                .is_none()
+        );
     }
 
     #[test]
     fn restart_intensity_monitor_single_failure_threshold() {
         let mut monitor = RestartIntensityMonitor::new(1, 300);
         // First failure immediately triggers.
-        assert!(monitor.record_failure());
+        let dominant = monitor.record_failure(FailureCategory::PlanFailed);
+        assert_eq!(dominant, Some(FailureCategory::PlanFailed));
+    }
+
+    #[test]
+    fn restart_intensity_monitor_dominant_category() {
+        let mut monitor = RestartIntensityMonitor::new(5, 300);
+        // Mix of categories: 3 tests, 2 setup
+        monitor.record_failure(FailureCategory::TestsFailed);
+        monitor.record_failure(FailureCategory::SetupError);
+        monitor.record_failure(FailureCategory::TestsFailed);
+        monitor.record_failure(FailureCategory::SetupError);
+        let dominant = monitor.record_failure(FailureCategory::TestsFailed);
+        assert_eq!(dominant, Some(FailureCategory::TestsFailed));
+    }
+
+    #[test]
+    fn restart_intensity_monitor_mixed_categories_window_eviction() {
+        let mut monitor = RestartIntensityMonitor::new(3, 1);
+        // Record 2 setup errors, sleep, then record 3 test failures.
+        monitor.record_failure(FailureCategory::SetupError);
+        monitor.record_failure(FailureCategory::SetupError);
+        std::thread::sleep(Duration::from_millis(1100));
+        monitor.record_failure(FailureCategory::TestsFailed);
+        monitor.record_failure(FailureCategory::TestsFailed);
+        let dominant = monitor.record_failure(FailureCategory::TestsFailed);
+        // Old setup errors should have expired — dominant is now TestsFailed.
+        assert_eq!(dominant, Some(FailureCategory::TestsFailed));
+    }
+
+    #[test]
+    fn failure_category_serde() {
+        for cat in [
+            FailureCategory::SetupError,
+            FailureCategory::PlanFailed,
+            FailureCategory::ImplementationFailed,
+            FailureCategory::TestsFailed,
+            FailureCategory::ArchitectRejected,
+            FailureCategory::MaxAttemptsExceeded,
+            FailureCategory::BudgetExceeded,
+            FailureCategory::Timeout,
+            FailureCategory::Other,
+        ] {
+            let json = serde_json::to_string(&cat).unwrap();
+            let parsed: FailureCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, cat);
+        }
+    }
+
+    #[test]
+    fn pipeline_status_to_failure_category_mapping() {
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::PlanFailed),
+            FailureCategory::PlanFailed
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::ImplementationFailed),
+            FailureCategory::ImplementationFailed
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::TestsFailed),
+            FailureCategory::TestsFailed
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::ArchitectRejected),
+            FailureCategory::ArchitectRejected
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::BudgetExceeded),
+            FailureCategory::BudgetExceeded
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::TimedOut),
+            FailureCategory::Timeout
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::Error),
+            FailureCategory::Other
+        );
+    }
+
+    #[test]
+    fn orchestrator_result_with_dominant_failure_pattern_serde() {
+        let result = OrchestratorResult {
+            tasks_attempted: 3,
+            tasks_succeeded: 0,
+            tasks_failed: 3,
+            tasks_deferred: 0,
+            tasks_escalated: 0,
+            total_cost: 3.0,
+            total_tokens: 30000,
+            duration: Duration::from_millis(500),
+            cease_reason: CeaseReason::SystemicFailure,
+            run_results: vec![],
+            dominant_failure_pattern: Some(FailureCategory::SetupError),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("dominant_failure_pattern"));
+        assert!(json.contains("setup_error"));
+        let parsed: OrchestratorResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.dominant_failure_pattern,
+            Some(FailureCategory::SetupError)
+        );
     }
 
     // -----------------------------------------------------------------------
