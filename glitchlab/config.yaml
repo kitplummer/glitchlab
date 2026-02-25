@@ -6,7 +6,7 @@
 # Model routing — agents never know which vendor backs them.
 # Names here map to LiteLLM model aliases.
 routing:
-  planner: "gemini/gemini-2.5-flash-lite"
+  planner: "ollama/llama3"
   implementer: "anthropic/claude-sonnet-4-20250514"
   debugger: "anthropic/claude-sonnet-4-20250514"
   security: "gemini/gemini-2.5-flash-lite"
