@@ -360,6 +360,99 @@ mod tests {
         assert!(ctx.is_empty());
     }
 
+    /// A backend that reports as available but fails on all operations.
+    /// Used to test composite fallback paths.
+    struct FailingBackend;
+
+    impl HistoryBackend for FailingBackend {
+        fn record<'a>(
+            &'a self,
+            _entry: &'a HistoryEntry,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async { Err(MemoryError::Unavailable("failing backend".into())) })
+        }
+
+        fn query<'a>(
+            &'a self,
+            _query: &'a HistoryQuery,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<HistoryEntry>>> + Send + 'a>>
+        {
+            Box::pin(async { Err(MemoryError::Unavailable("failing backend".into())) })
+        }
+
+        fn stats(
+            &self,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<HistoryStats>> + Send + '_>> {
+            Box::pin(async { Err(MemoryError::Unavailable("failing backend".into())) })
+        }
+
+        fn failure_context(
+            &self,
+            _max_entries: usize,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
+            Box::pin(async { Err(MemoryError::Unavailable("failing backend".into())) })
+        }
+
+        fn backend_name(&self) -> &str {
+            "failing"
+        }
+
+        fn is_available(&self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(async { true })
+        }
+    }
+
+    #[tokio::test]
+    async fn query_falls_through_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let good: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+
+        // Write an entry to the good backend.
+        good.record(&sample_entry("t1", "ok")).await.unwrap();
+
+        let composite = CompositeHistory::new(vec![failing, good]);
+        let query = HistoryQuery {
+            limit: 10,
+            ..Default::default()
+        };
+        // First backend fails, falls through to second.
+        let entries = composite.query(&query).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].task_id, "t1");
+    }
+
+    #[tokio::test]
+    async fn stats_falls_through_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let good: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+
+        good.record(&sample_entry("t1", "pr_created"))
+            .await
+            .unwrap();
+        good.record(&sample_entry("t2", "error")).await.unwrap();
+
+        let composite = CompositeHistory::new(vec![failing, good]);
+        let stats = composite.stats().await.unwrap();
+        assert_eq!(stats.total_runs, 2);
+        assert_eq!(stats.successes, 1);
+        assert_eq!(stats.failures, 1);
+    }
+
+    #[tokio::test]
+    async fn failure_context_falls_through_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let good: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+
+        good.record(&sample_entry("t-fail", "error")).await.unwrap();
+
+        let composite = CompositeHistory::new(vec![failing, good]);
+        let ctx = composite.failure_context(5).await.unwrap();
+        assert!(ctx.contains("t-fail"));
+    }
+
     #[tokio::test]
     async fn all_backends_fail_record_returns_error() {
         let dir = tempfile::tempdir().unwrap();

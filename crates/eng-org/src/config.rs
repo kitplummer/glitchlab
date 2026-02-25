@@ -96,6 +96,14 @@ fn default_max_decomposition_depth() -> u32 {
     3
 }
 
+fn default_restart_intensity_max_failures() -> u32 {
+    5
+}
+
+fn default_restart_intensity_window_secs() -> u64 {
+    300
+}
+
 /// Configuration for a model in the cost-aware pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfileConfig {
@@ -140,6 +148,12 @@ pub struct LimitsConfig {
     /// further; instead they are marked as failed. Prevents infinite decomposition loops.
     #[serde(default = "default_max_decomposition_depth")]
     pub max_decomposition_depth: u32,
+    /// Number of task failures within the window that triggers a systemic halt.
+    #[serde(default = "default_restart_intensity_max_failures")]
+    pub restart_intensity_max_failures: u32,
+    /// Time window in seconds for restart intensity tracking.
+    #[serde(default = "default_restart_intensity_window_secs")]
+    pub restart_intensity_window_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +220,8 @@ impl Default for EngConfig {
                 max_pipeline_duration_secs: 600,
                 max_stuck_turns: 3,
                 max_decomposition_depth: 3,
+                restart_intensity_max_failures: 5,
+                restart_intensity_window_secs: 300,
             },
             intervention: InterventionConfig {
                 pause_after_plan: true,
@@ -1255,6 +1271,28 @@ base_url: http://localhost:8080
         .unwrap();
         let config = EngConfig::load(Some(dir.path())).unwrap();
         assert_eq!(config.limits.max_decomposition_depth, 5);
+    }
+
+    #[test]
+    fn restart_intensity_defaults() {
+        let config = EngConfig::default();
+        assert_eq!(config.limits.restart_intensity_max_failures, 5);
+        assert_eq!(config.limits.restart_intensity_window_secs, 300);
+    }
+
+    #[test]
+    fn restart_intensity_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "limits:\n  restart_intensity_max_failures: 10\n  restart_intensity_window_secs: 600\n",
+        )
+        .unwrap();
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(config.limits.restart_intensity_max_failures, 10);
+        assert_eq!(config.limits.restart_intensity_window_secs, 600);
     }
 
     #[test]
