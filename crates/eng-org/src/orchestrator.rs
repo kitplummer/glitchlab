@@ -17,7 +17,7 @@ use glitchlab_memory::history::HistoryBackend;
 use glitchlab_router::Router;
 
 use crate::config::EngConfig;
-use crate::pipeline::{EngineeringPipeline, InterventionHandler};
+use crate::pipeline::{EngineeringPipeline, InterventionHandler, RealExternalOps};
 use crate::taskqueue::{TaskQueue, TaskStatus};
 
 // ---------------------------------------------------------------------------
@@ -737,6 +737,7 @@ impl Orchestrator {
             self.config.clone(),
             Arc::clone(&self.handler),
             Arc::clone(&self.history),
+            Arc::new(RealExternalOps),
         );
 
         Ok(pipeline

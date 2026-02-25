@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use glitchlab_eng_org::config::EngConfig;
-use glitchlab_eng_org::pipeline::{AutoApproveHandler, EngineeringPipeline, InterventionHandler};
+use glitchlab_eng_org::pipeline::{
+    AutoApproveHandler, EngineeringPipeline, InterventionHandler, RealExternalOps,
+};
 use glitchlab_kernel::budget::BudgetTracker;
 use glitchlab_kernel::pipeline::{PipelineResult, PipelineStatus};
 use glitchlab_memory::history::HistoryBackend;
@@ -89,7 +91,13 @@ pub async fn setup_pipeline(
         Arc::new(CliApprovalHandler)
     };
 
-    let pipeline = EngineeringPipeline::new(Arc::clone(&router), config.clone(), handler, history);
+    let pipeline = EngineeringPipeline::new(
+        Arc::clone(&router),
+        config.clone(),
+        handler,
+        history,
+        Arc::new(RealExternalOps),
+    );
 
     Ok((router, pipeline))
 }

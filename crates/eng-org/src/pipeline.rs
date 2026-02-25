@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +66,221 @@ impl InterventionHandler for AutoApproveHandler {
 }
 
 // ---------------------------------------------------------------------------
+// ExternalOps — abstraction over shell-out calls
+// ---------------------------------------------------------------------------
+
+/// Abstraction over external tool invocations (gh, bd, cargo fmt, test runner).
+///
+/// Production uses real subprocesses via [`RealExternalOps`]; tests inject
+/// mock implementations to cover all post-commit branches without requiring
+/// a real GitHub remote or `bd` binary.
+pub trait ExternalOps: Send + Sync {
+    /// Run `cargo fmt --all` in the given directory.
+    fn cargo_fmt<'a>(
+        &'a self,
+        worktree: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// Run the project test command. Returns `Ok(())` on pass, `Err(output)` on fail.
+    fn run_tests<'a>(
+        &'a self,
+        cmd: &'a str,
+        worktree: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// Create a PR via `gh pr create`. Returns the PR URL.
+    fn create_pr<'a>(
+        &'a self,
+        worktree: &'a Path,
+        branch: &'a str,
+        base: &'a str,
+        title: &'a str,
+        body: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+
+    /// Look up an existing PR for a branch. Returns the PR URL.
+    fn view_existing_pr<'a>(
+        &'a self,
+        worktree: &'a Path,
+        branch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+
+    /// Auto-merge a PR via `gh pr merge --squash --delete-branch`.
+    fn merge_pr<'a>(
+        &'a self,
+        worktree: &'a Path,
+        pr_url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// Close a bead via `bd close <task_id>`.
+    fn close_bead<'a>(
+        &'a self,
+        repo_path: &'a Path,
+        bd_path: &'a str,
+        task_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+/// Production implementation — wraps real subprocess calls.
+pub struct RealExternalOps;
+
+impl ExternalOps for RealExternalOps {
+    fn cargo_fmt<'a>(
+        &'a self,
+        worktree: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = Command::new("cargo")
+                .args(["fmt", "--all"])
+                .current_dir(worktree)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+            Ok(())
+        })
+    }
+
+    fn run_tests<'a>(
+        &'a self,
+        cmd: &'a str,
+        worktree: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let parts: Vec<&str> = cmd.split_whitespace().collect();
+            if parts.is_empty() {
+                return Ok(());
+            }
+
+            let output = Command::new(parts[0])
+                .args(&parts[1..])
+                .current_dir(worktree)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| format!("failed to run tests: {e}"))?;
+
+            if output.status.success() {
+                Ok(())
+            } else {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!("{stdout}\n{stderr}"))
+            }
+        })
+    }
+
+    fn create_pr<'a>(
+        &'a self,
+        worktree: &'a Path,
+        branch: &'a str,
+        base: &'a str,
+        title: &'a str,
+        body: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let output = Command::new("gh")
+                .args([
+                    "pr", "create", "--title", title, "--body", body, "--base", base, "--head",
+                    branch,
+                ])
+                .current_dir(worktree)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| format!("gh pr create: {e}"))?;
+
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!("gh pr create failed: {stderr}"))
+            }
+        })
+    }
+
+    fn view_existing_pr<'a>(
+        &'a self,
+        worktree: &'a Path,
+        branch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let output = Command::new("gh")
+                .args(["pr", "view", branch, "--json", "url", "-q", ".url"])
+                .current_dir(worktree)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| format!("gh pr view: {e}"))?;
+
+            if output.status.success() {
+                let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if url.is_empty() {
+                    Err("gh pr view returned empty URL".to_string())
+                } else {
+                    Ok(url)
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!("gh pr view failed: {stderr}"))
+            }
+        })
+    }
+
+    fn merge_pr<'a>(
+        &'a self,
+        worktree: &'a Path,
+        pr_url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let output = Command::new("gh")
+                .args(["pr", "merge", pr_url, "--squash", "--delete-branch"])
+                .current_dir(worktree)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| format!("failed to run gh pr merge: {e}"))?;
+
+            if output.status.success() {
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!("gh pr merge failed: {stderr}"))
+            }
+        })
+    }
+
+    fn close_bead<'a>(
+        &'a self,
+        repo_path: &'a Path,
+        bd_path: &'a str,
+        task_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let output = Command::new(bd_path)
+                .args(["close", task_id])
+                .current_dir(repo_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| format!("failed to run bd close: {e}"))?;
+
+            if output.status.success() {
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!("bd close failed: {stderr}"))
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EngineeringPipeline
 // ---------------------------------------------------------------------------
 
@@ -74,6 +291,7 @@ pub struct EngineeringPipeline {
     config: EngConfig,
     handler: Arc<dyn InterventionHandler>,
     history: Arc<dyn HistoryBackend>,
+    ops: Arc<dyn ExternalOps>,
 }
 
 impl EngineeringPipeline {
@@ -82,12 +300,14 @@ impl EngineeringPipeline {
         config: EngConfig,
         handler: Arc<dyn InterventionHandler>,
         history: Arc<dyn HistoryBackend>,
+        ops: Arc<dyn ExternalOps>,
     ) -> Self {
         Self {
             router,
             config,
             handler,
             history,
+            ops,
         }
     }
 
@@ -472,7 +692,7 @@ impl EngineeringPipeline {
 
         if let Some(ref cmd) = test_cmd {
             loop {
-                match run_tests(cmd, &wt_path).await {
+                match self.ops.run_tests(cmd, &wt_path).await {
                     Ok(()) => {
                         self.emit(
                             &mut ctx,
@@ -669,13 +889,7 @@ impl EngineeringPipeline {
         if workspace.is_created() {
             let wt = workspace.worktree_path();
             if wt.join("Cargo.toml").exists() {
-                let _ = Command::new("cargo")
-                    .args(["fmt", "--all"])
-                    .current_dir(wt)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
+                let _ = self.ops.cargo_fmt(wt).await;
             }
         }
 
@@ -824,17 +1038,51 @@ impl EngineeringPipeline {
             };
         }
 
-        let pr_url = match create_pr(
-            &wt_path,
-            workspace.branch_name(),
-            base_branch,
-            objective,
-            &plan_output,
-            &security_output,
-        )
-        .await
-        {
+        let pr_body = build_pr_body(&plan_output, &security_output);
+        let pr_title = truncate_head(objective, 70);
+        let create_result = self
+            .ops
+            .create_pr(
+                &wt_path,
+                workspace.branch_name(),
+                base_branch,
+                &pr_title,
+                &pr_body,
+            )
+            .await;
+
+        let pr_url = match create_result {
             Ok(url) => url,
+            Err(ref e) if e.contains("already exists") => {
+                match self
+                    .ops
+                    .view_existing_pr(&wt_path, workspace.branch_name())
+                    .await
+                {
+                    Ok(url) => {
+                        info!(
+                            branch = workspace.branch_name(),
+                            url = %url,
+                            "PR already exists, reusing"
+                        );
+                        url
+                    }
+                    Err(_) => {
+                        warn!(task_id, error = %e, "PR creation failed");
+                        let budget = self.router.budget_summary().await;
+                        return PipelineResult {
+                            status: PipelineStatus::Committed,
+                            stage_outputs: ctx.stage_outputs,
+                            events: ctx.events,
+                            budget,
+                            pr_url: None,
+                            branch: Some(workspace.branch_name().into()),
+                            error: Some(format!("PR creation failed: {e}")),
+                            outcome_context: None,
+                        };
+                    }
+                }
+            }
             Err(e) => {
                 warn!(task_id, error = %e, "PR creation failed");
                 let budget = self.router.budget_summary().await;
@@ -859,16 +1107,8 @@ impl EngineeringPipeline {
 
         // --- Stage 15b: Auto-merge PR ---
         let mut final_status = PipelineStatus::PrCreated;
-        let merge_result = Command::new("gh")
-            .args(["pr", "merge", &pr_url, "--squash", "--delete-branch"])
-            .current_dir(&wt_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
-
-        match merge_result {
-            Ok(output) if output.status.success() => {
+        match self.ops.merge_pr(&wt_path, &pr_url).await {
+            Ok(()) => {
                 info!(task_id, "PR auto-merged successfully");
                 self.emit(
                     &mut ctx,
@@ -877,36 +1117,20 @@ impl EngineeringPipeline {
                 );
                 final_status = PipelineStatus::PrMerged;
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!(task_id, error = %stderr, "PR auto-merge failed, PR still open");
-            }
             Err(e) => {
-                warn!(task_id, error = %e, "failed to run gh pr merge");
+                warn!(task_id, error = %e, "PR auto-merge failed, PR still open");
             }
         }
 
         // --- Stage 15c: Close bead ---
         if self.config.memory.beads_enabled {
             let bd_path = self.config.memory.beads_bd_path.as_deref().unwrap_or("bd");
-            let close_result = Command::new(bd_path)
-                .args(["close", task_id])
-                .current_dir(repo_path)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await;
-
-            match close_result {
-                Ok(output) if output.status.success() => {
+            match self.ops.close_bead(repo_path, bd_path, task_id).await {
+                Ok(()) => {
                     info!(task_id, "bead closed successfully");
                 }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!(task_id, error = %stderr, "bead close failed");
-                }
                 Err(e) => {
-                    warn!(task_id, error = %e, "failed to run bd close");
+                    warn!(task_id, error = %e, "bead close failed");
                 }
             }
         }
@@ -1029,112 +1253,6 @@ async fn read_relevant_files(
     }
 
     result
-}
-
-// ---------------------------------------------------------------------------
-// Test runner
-// ---------------------------------------------------------------------------
-
-/// Run the project's test command in the worktree.
-/// Returns Ok(()) on success, Err(combined output) on failure.
-async fn run_tests(cmd: &str, worktree: &Path) -> Result<(), String> {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-    if parts.is_empty() {
-        return Ok(());
-    }
-
-    let output = Command::new(parts[0])
-        .args(&parts[1..])
-        .current_dir(worktree)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("failed to run tests: {e}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("{stdout}\n{stderr}"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PR creation
-// ---------------------------------------------------------------------------
-
-/// Create a pull request via `gh pr create`.
-async fn create_pr(
-    worktree: &Path,
-    branch: &str,
-    base: &str,
-    title: &str,
-    plan: &AgentOutput,
-    security: &AgentOutput,
-) -> Result<String, String> {
-    let body = build_pr_body(plan, security);
-
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "create",
-            "--title",
-            &truncate_head(title, 70),
-            "--body",
-            &body,
-            "--base",
-            base,
-            "--head",
-            branch,
-        ])
-        .current_dir(worktree)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("gh pr create: {e}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // If a PR already exists for this branch, look it up via `gh pr view`.
-        if stderr.contains("already exists")
-            && let Ok(url) = view_existing_pr(worktree, branch).await
-        {
-            info!(branch, url, "PR already exists, reusing");
-            return Ok(url);
-        }
-
-        Err(format!("gh pr create failed: {stderr}"))
-    }
-}
-
-/// Look up an existing PR for the given branch via `gh pr view`.
-async fn view_existing_pr(worktree: &Path, branch: &str) -> Result<String, String> {
-    let output = Command::new("gh")
-        .args(["pr", "view", branch, "--json", "url", "-q", ".url"])
-        .current_dir(worktree)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("gh pr view: {e}"))?;
-
-    if output.status.success() {
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if url.is_empty() {
-            Err("gh pr view returned empty URL".to_string())
-        } else {
-            Ok(url)
-        }
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("gh pr view failed: {stderr}"))
-    }
 }
 
 fn build_pr_body(plan: &AgentOutput, security: &AgentOutput) -> String {
@@ -1314,6 +1432,129 @@ mod tests {
     use glitchlab_kernel::budget::BudgetSummary;
     use glitchlab_kernel::tool::ToolCall;
     use glitchlab_memory::history::JsonlHistory;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    // -----------------------------------------------------------------------
+    // MockExternalOps — test double for ExternalOps
+    // -----------------------------------------------------------------------
+
+    /// Configurable mock for [`ExternalOps`]. Each operation has a queue of
+    /// results; when the queue is empty the default (success) is returned.
+    struct MockExternalOps {
+        fmt_results: Mutex<VecDeque<Result<(), String>>>,
+        test_results: Mutex<VecDeque<Result<(), String>>>,
+        create_pr_results: Mutex<VecDeque<Result<String, String>>>,
+        view_pr_results: Mutex<VecDeque<Result<String, String>>>,
+        merge_results: Mutex<VecDeque<Result<(), String>>>,
+        close_bead_results: Mutex<VecDeque<Result<(), String>>>,
+    }
+
+    impl Default for MockExternalOps {
+        fn default() -> Self {
+            Self {
+                fmt_results: Mutex::new(VecDeque::new()),
+                test_results: Mutex::new(VecDeque::new()),
+                create_pr_results: Mutex::new(VecDeque::new()),
+                view_pr_results: Mutex::new(VecDeque::new()),
+                merge_results: Mutex::new(VecDeque::new()),
+                close_bead_results: Mutex::new(VecDeque::new()),
+            }
+        }
+    }
+
+    impl ExternalOps for MockExternalOps {
+        fn cargo_fmt<'a>(
+            &'a self,
+            _worktree: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.fmt_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Ok(()))
+            })
+        }
+
+        fn run_tests<'a>(
+            &'a self,
+            _cmd: &'a str,
+            _worktree: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.test_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Ok(()))
+            })
+        }
+
+        fn create_pr<'a>(
+            &'a self,
+            _worktree: &'a Path,
+            _branch: &'a str,
+            _base: &'a str,
+            _title: &'a str,
+            _body: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.create_pr_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| Ok("https://github.com/test/repo/pull/1".into()))
+            })
+        }
+
+        fn view_existing_pr<'a>(
+            &'a self,
+            _worktree: &'a Path,
+            _branch: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.view_pr_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| Ok("https://github.com/test/repo/pull/1".into()))
+            })
+        }
+
+        fn merge_pr<'a>(
+            &'a self,
+            _worktree: &'a Path,
+            _pr_url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.merge_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Ok(()))
+            })
+        }
+
+        fn close_bead<'a>(
+            &'a self,
+            _repo_path: &'a Path,
+            _bd_path: &'a str,
+            _task_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.close_bead_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Ok(()))
+            })
+        }
+    }
+
+    fn default_mock_ops() -> Arc<dyn ExternalOps> {
+        Arc::new(MockExternalOps::default())
+    }
 
     /// Build the scripted sequence of LLM responses for a full pipeline run.
     ///
@@ -1372,21 +1613,24 @@ mod tests {
         let config = EngConfig::default();
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let _pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let _pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
     }
 
     #[tokio::test]
-    async fn run_tests_success() {
+    async fn real_ops_run_tests_success() {
         let dir = tempfile::tempdir().unwrap();
+        let ops = RealExternalOps;
         // `true` always succeeds on Unix.
-        run_tests("true", dir.path()).await.unwrap();
+        ops.run_tests("true", dir.path()).await.unwrap();
     }
 
     #[tokio::test]
-    async fn run_tests_failure() {
+    async fn real_ops_run_tests_failure() {
         let dir = tempfile::tempdir().unwrap();
+        let ops = RealExternalOps;
         // `false` always fails on Unix.
-        let result = run_tests("false", dir.path()).await;
+        let result = ops.run_tests("false", dir.path()).await;
         assert!(result.is_err());
     }
 
@@ -1718,7 +1962,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let prev = vec![glitchlab_kernel::outcome::OutcomeContext {
             approach: "tried direct edit".into(),
@@ -1797,7 +2042,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run("test-task-1", "Fix a bug", dir.path(), &base_branch, &[])
@@ -1877,7 +2123,8 @@ mod tests {
 
         let handler = Arc::new(RejectHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -1931,9 +2178,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tests_empty_command() {
+    async fn real_ops_run_tests_empty_command() {
         let dir = tempfile::tempdir().unwrap();
-        run_tests("", dir.path()).await.unwrap();
+        let ops = RealExternalOps;
+        ops.run_tests("", dir.path()).await.unwrap();
     }
 
     #[tokio::test]
@@ -1961,7 +2209,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2018,7 +2267,8 @@ mod tests {
 
         let handler = Arc::new(PrRejectHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2088,9 +2338,17 @@ mod tests {
         config.intervention.pause_after_plan = false;
         config.intervention.pause_before_pr = false;
 
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .test_results
+            .lock()
+            .unwrap()
+            .push_back(Err("FAIL\n".into()));
+
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
 
         let result = pipeline
             .run(
@@ -2123,43 +2381,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_pr_without_gh() {
+    async fn real_ops_create_pr_without_gh() {
         let dir = tempfile::tempdir().unwrap();
-        let plan = fallback_output(
-            "planner",
-            serde_json::json!({
-                "steps": [{"description": "step 1"}],
-                "risk_level": "low"
-            }),
-        );
-        let security = fallback_output("security", serde_json::json!({"verdict": "pass"}));
-
+        let ops = RealExternalOps;
         // gh pr create will fail — no git repo, no remote.
-        let result = create_pr(
-            dir.path(),
-            "test-branch",
-            "main",
-            "Test PR",
-            &plan,
-            &security,
-        )
-        .await;
+        let result = ops
+            .create_pr(dir.path(), "test-branch", "main", "Test PR", "body")
+            .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn view_existing_pr_no_repo() {
+    async fn real_ops_view_existing_pr_no_repo() {
         let dir = tempfile::tempdir().unwrap();
+        let ops = RealExternalOps;
         // gh pr view will fail — no git repo, no remote.
-        let result = view_existing_pr(dir.path(), "test-branch").await;
+        let result = ops.view_existing_pr(dir.path(), "test-branch").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn run_tests_multiword_command() {
+    async fn real_ops_run_tests_multiword_command() {
         let dir = tempfile::tempdir().unwrap();
+        let ops = RealExternalOps;
         // Multi-word command that succeeds.
-        run_tests("echo hello world", dir.path()).await.unwrap();
+        ops.run_tests("echo hello world", dir.path()).await.unwrap();
     }
 
     // --- read_relevant_files tests ---
@@ -2291,7 +2537,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2407,7 +2654,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2481,7 +2729,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2550,7 +2799,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2593,7 +2843,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2654,7 +2905,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2724,7 +2976,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2779,7 +3032,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2833,7 +3087,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2878,7 +3133,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -2950,9 +3206,20 @@ mod tests {
         config.intervention.pause_before_pr = false;
         config.limits.max_fix_attempts = 2;
 
+        let mock_ops = MockExternalOps::default();
+        // 3 test failures: initial + 2 fix attempts = max exhausted.
+        for _ in 0..3 {
+            mock_ops
+                .test_results
+                .lock()
+                .unwrap()
+                .push_back(Err("FAIL\n".into()));
+        }
+
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
 
         let result = pipeline
             .run(
@@ -3011,7 +3278,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run(
@@ -3045,7 +3313,8 @@ mod tests {
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        let pipeline = EngineeringPipeline::new(router, config, handler, history);
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
             .run("timeout-task", "do stuff", dir.path(), &base_branch, &[])
@@ -3059,6 +3328,463 @@ mod tests {
             result.error.is_some(),
             "should have an error message: {:?}",
             result.error
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // ExternalOps post-commit path tests
+    // -------------------------------------------------------------------
+
+    /// Initialize a git repo with a local bare remote so `workspace.push()` succeeds.
+    /// Returns `(base_branch, remote_tempdir)`. The remote tempdir must be kept alive.
+    fn init_test_repo_with_remote(dir: &Path) -> (String, tempfile::TempDir) {
+        let remote_dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(remote_dir.path())
+            .output()
+            .unwrap();
+
+        let base = init_test_repo(dir);
+
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &remote_dir.path().display().to_string(),
+            ])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        std::process::Command::new("git")
+            .args(["push", "-u", "origin", &base])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        (base, remote_dir)
+    }
+
+    #[tokio::test]
+    async fn pipeline_push_pr_merge_full_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.memory.beads_enabled = true;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/1".into()));
+        mock_ops.merge_results.lock().unwrap().push_back(Ok(()));
+        mock_ops
+            .close_bead_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run("test-full", "Fix a bug", dir.path(), &base_branch, &[])
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::PrMerged);
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://github.com/test/pr/1")
+        );
+        assert!(result.error.is_none());
+        assert!(
+            result.events.iter().any(|e| e.kind == EventKind::PrMerged),
+            "expected PrMerged event"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_push_failure_returns_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+        // No remote → push fails.
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run("test-push-fail", "Fix a bug", dir.path(), &base_branch, &[])
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(result.error.as_deref().unwrap().contains("push failed"));
+        assert!(result.pr_url.is_none());
+        assert!(result.branch.is_some());
+    }
+
+    #[tokio::test]
+    async fn pipeline_pr_creation_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Err("gh pr create failed: not authenticated".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run("test-pr-fail", "Fix a bug", dir.path(), &base_branch, &[])
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("PR creation failed"),
+        );
+        assert!(result.pr_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn pipeline_pr_exists_reuses_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let mock_ops = MockExternalOps::default();
+        // create_pr fails with "already exists"
+        mock_ops.create_pr_results.lock().unwrap().push_back(Err(
+            "gh pr create failed: a pull request already exists".into(),
+        ));
+        // view_existing_pr returns the existing URL
+        mock_ops
+            .view_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/42".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run("test-pr-exists", "Fix a bug", dir.path(), &base_branch, &[])
+            .await;
+
+        // Should succeed using the existing PR URL.
+        assert!(
+            result.status == PipelineStatus::PrCreated || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}",
+            result.status
+        );
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://github.com/test/pr/42")
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_merge_failure_pr_still_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/1".into()));
+        mock_ops
+            .merge_results
+            .lock()
+            .unwrap()
+            .push_back(Err("gh pr merge failed: merge conflict".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run(
+                "test-merge-fail",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        // Merge failed → status stays PrCreated.
+        assert_eq!(result.status, PipelineStatus::PrCreated);
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://github.com/test/pr/1")
+        );
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn pipeline_bead_close_failure_nonfatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.memory.beads_enabled = true;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/1".into()));
+        mock_ops.merge_results.lock().unwrap().push_back(Ok(()));
+        mock_ops
+            .close_bead_results
+            .lock()
+            .unwrap()
+            .push_back(Err("bd close failed: bead not found".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run("test-bead-fail", "Fix a bug", dir.path(), &base_branch, &[])
+            .await;
+
+        // Bead close failure is non-fatal — final status should still be PrMerged.
+        assert_eq!(result.status, PipelineStatus::PrMerged);
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn pipeline_cargo_fmt_failure_nonfatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        // Add Cargo.toml so the fmt path is triggered in the worktree.
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "Cargo.toml"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add Cargo.toml"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .fmt_results
+            .lock()
+            .unwrap()
+            .push_back(Err("cargo fmt failed".into()));
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/1".into()));
+        mock_ops.merge_results.lock().unwrap().push_back(Ok(()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run("test-fmt-fail", "Fix a bug", dir.path(), &base_branch, &[])
+            .await;
+
+        // Fmt failure is best-effort — pipeline should still succeed.
+        assert!(
+            result.status == PipelineStatus::PrCreated || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_test_failure_triggers_debug_via_mock() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "fix bug"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "not done", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+            // 3. Implementer — write_file tool call
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() {}\n"}),
+            }]),
+            // 4. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "fix: bug", "summary": "fixed"}"#,
+            ),
+            // 5. Debugger — should_retry: false
+            final_response(
+                r#"{"diagnosis": "test failure", "root_cause": "bug", "files_changed": [], "confidence": "low", "should_retry": false, "notes": null}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.test_command_override = Some("true".into()); // will be overridden by mock
+
+        let mock_ops = MockExternalOps::default();
+        // First test run fails, triggering debugger.
+        mock_ops
+            .test_results
+            .lock()
+            .unwrap()
+            .push_back(Err("FAIL: assertion error".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run(
+                "test-debug-mock",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::TestsFailed);
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::TestsFailed)
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::DebugAttempt)
+        );
+        assert!(result.stage_outputs.contains_key("debug_1"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_test_success_skips_debug_via_mock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.test_command_override = Some("true".into()); // will be overridden by mock
+
+        let mock_ops = MockExternalOps::default();
+        // Tests pass immediately.
+        mock_ops.test_results.lock().unwrap().push_back(Ok(()));
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/1".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run("test-pass-mock", "Fix a bug", dir.path(), &base_branch, &[])
+            .await;
+
+        assert!(
+            result.status == PipelineStatus::PrCreated || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::TestsPassed),
+            "expected TestsPassed event"
+        );
+        // No debug stage should exist.
+        assert!(
+            !result.stage_outputs.contains_key("debug_1"),
+            "should not have debug stage"
         );
     }
 }

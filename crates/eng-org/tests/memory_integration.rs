@@ -20,7 +20,7 @@ use glitchlab_router::RouterResponse;
 use glitchlab_router::provider::{Provider, ProviderFuture};
 
 use glitchlab_eng_org::config::EngConfig;
-use glitchlab_eng_org::pipeline::{AutoApproveHandler, EngineeringPipeline};
+use glitchlab_eng_org::pipeline::{AutoApproveHandler, EngineeringPipeline, RealExternalOps};
 
 // ---------------------------------------------------------------------------
 // Inline test helpers (duplicated from agents::test_helpers which is pub(crate))
@@ -268,7 +268,13 @@ async fn pipeline_records_history_to_composite() {
     config.intervention.pause_before_pr = false;
 
     let handler = Arc::new(AutoApproveHandler);
-    let pipeline = EngineeringPipeline::new(router, config, handler, composite.clone());
+    let pipeline = EngineeringPipeline::new(
+        router,
+        config,
+        handler,
+        composite.clone(),
+        Arc::new(RealExternalOps),
+    );
 
     // Run pipeline for "task-1".
     let _result = pipeline
@@ -342,7 +348,13 @@ async fn failure_context_flows_across_runs() {
     config.intervention.pause_before_pr = false;
 
     let handler = Arc::new(AutoApproveHandler);
-    let pipeline = EngineeringPipeline::new(router, config, handler, composite.clone());
+    let pipeline = EngineeringPipeline::new(
+        router,
+        config,
+        handler,
+        composite.clone(),
+        Arc::new(RealExternalOps),
+    );
 
     let _result = pipeline
         .run(
@@ -404,7 +416,13 @@ async fn failure_context_flows_across_runs() {
     config2.intervention.pause_before_pr = false;
 
     let handler2 = Arc::new(AutoApproveHandler);
-    let pipeline2 = EngineeringPipeline::new(router2, config2, handler2, composite.clone());
+    let pipeline2 = EngineeringPipeline::new(
+        router2,
+        config2,
+        handler2,
+        composite.clone(),
+        Arc::new(RealExternalOps),
+    );
 
     let _result2 = pipeline2
         .run(
@@ -469,7 +487,13 @@ async fn history_persists_across_pipeline_instances() {
         config.intervention.pause_before_pr = false;
 
         let handler = Arc::new(AutoApproveHandler);
-        let pipeline = EngineeringPipeline::new(router, config, handler, composite);
+        let pipeline = EngineeringPipeline::new(
+            router,
+            config,
+            handler,
+            composite,
+            Arc::new(RealExternalOps),
+        );
 
         let _result = pipeline
             .run(
