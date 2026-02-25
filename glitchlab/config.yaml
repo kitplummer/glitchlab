@@ -97,3 +97,16 @@ tools:
 # Governance settings
 governance:
   strict_mode: true
+
+# Ops agent configuration
+ops_agent:
+  pipeline_shape:
+    - monitor
+    - act
+    - report
+  tool_allowlist:
+    - "fly.io deploy"
+    - "health checks"
+  governance:
+    max_retries_on_failure: 3
+    human_approval_for_deploy: true
