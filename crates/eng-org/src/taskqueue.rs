@@ -208,6 +208,14 @@ impl TaskQueue {
         self.tasks.extend(tasks);
     }
 
+    /// Check whether any pending or in-progress task has an ID starting with the given prefix.
+    pub fn has_pending_with_prefix(&self, prefix: &str) -> bool {
+        self.tasks.iter().any(|t| {
+            matches!(t.status, TaskStatus::Pending | TaskStatus::InProgress)
+                && t.id.starts_with(prefix)
+        })
+    }
+
     /// All tasks (read-only).
     pub fn tasks(&self) -> &[Task] {
         &self.tasks
@@ -1038,5 +1046,77 @@ mod tests {
         let json = r#"{"id":"old","objective":"old task","priority":1,"status":"pending"}"#;
         let parsed: Task = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.decomposition_depth, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // has_pending_with_prefix tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_pending_with_prefix_finds_match() {
+        let tasks = vec![Task {
+            id: "tqm-stuck-agents-abc123".into(),
+            objective: "fix stuck".into(),
+            priority: 5,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        }];
+        let queue = TaskQueue::from_tasks(tasks);
+        assert!(queue.has_pending_with_prefix("tqm-stuck-agents"));
+    }
+
+    #[test]
+    fn has_pending_with_prefix_no_match() {
+        let tasks = vec![Task {
+            id: "task-1".into(),
+            objective: "regular task".into(),
+            priority: 5,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        }];
+        let queue = TaskQueue::from_tasks(tasks);
+        assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
+    }
+
+    #[test]
+    fn has_pending_with_prefix_ignores_completed() {
+        let tasks = vec![Task {
+            id: "tqm-stuck-agents-abc123".into(),
+            objective: "fix stuck".into(),
+            priority: 5,
+            status: TaskStatus::Completed,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        }];
+        let queue = TaskQueue::from_tasks(tasks);
+        assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
+    }
+
+    #[test]
+    fn has_pending_with_prefix_ignores_failed() {
+        let tasks = vec![Task {
+            id: "tqm-stuck-agents-abc123".into(),
+            objective: "fix stuck".into(),
+            priority: 5,
+            status: TaskStatus::Failed,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        }];
+        let queue = TaskQueue::from_tasks(tasks);
+        assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
     }
 }

@@ -66,6 +66,11 @@ memory:
   beads_enabled: true
   dolt_connection: "mysql://glitchlab:glitchlab@localhost:3306/glitchlab"
 
+# tqm:
+#   remediation_enabled: true
+#   remediation_in_run: false
+#   remediation_priority: 5
+
 providers:
   gemini:
     api_key_env: GEMINI_API_KEY

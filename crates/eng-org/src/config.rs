@@ -22,6 +22,8 @@ pub struct EngConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfigEntry>,
+    #[serde(default)]
+    pub tqm: crate::tqm::TQMConfig,
 }
 
 /// Configuration for the memory/persistence layer.
@@ -290,6 +292,7 @@ impl Default for EngConfig {
             test_command_override: None,
             memory: MemoryConfig::default(),
             providers: HashMap::new(),
+            tqm: crate::tqm::TQMConfig::default(),
         }
     }
 }

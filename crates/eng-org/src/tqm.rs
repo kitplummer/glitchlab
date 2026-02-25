@@ -45,6 +45,17 @@ pub struct TQMConfig {
     /// Number of setup/provider errors before flagging.
     #[serde(default = "default_provider_failures")]
     pub provider_failure_threshold: u32,
+
+    // -- Remediation task generation --
+    /// Whether to generate remediation tasks from detected patterns.
+    #[serde(default)]
+    pub remediation_enabled: bool,
+    /// Whether to execute remediation tasks in the current run (vs. saving for next run).
+    #[serde(default)]
+    pub remediation_in_run: bool,
+    /// Priority for generated remediation tasks (lower = higher priority).
+    #[serde(default = "default_remediation_priority")]
+    pub remediation_priority: u32,
 }
 
 fn default_decomposition_loop() -> u32 {
@@ -71,6 +82,9 @@ fn default_budget_pressure() -> f64 {
 fn default_provider_failures() -> u32 {
     3
 }
+fn default_remediation_priority() -> u32 {
+    5
+}
 
 impl Default for TQMConfig {
     fn default() -> Self {
@@ -83,6 +97,9 @@ impl Default for TQMConfig {
             architect_rejection_rate_threshold: default_architect_rejection(),
             budget_pressure_threshold: default_budget_pressure(),
             provider_failure_threshold: default_provider_failures(),
+            remediation_enabled: false,
+            remediation_in_run: false,
+            remediation_priority: default_remediation_priority(),
         }
     }
 }
@@ -424,6 +441,142 @@ fn check_provider_failures(
             affected_tasks: affected,
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Remediation task generation
+// ---------------------------------------------------------------------------
+
+/// Map a `PatternKind` to a short slug for use in remediation task IDs.
+fn kind_slug(kind: PatternKind) -> &'static str {
+    match kind {
+        PatternKind::DecompositionLoop => "decomp-loop",
+        PatternKind::ScopeCreep => "scope-creep",
+        PatternKind::ModelDegradation => "model-degrad",
+        PatternKind::StuckAgents => "stuck-agents",
+        PatternKind::TestFlakiness => "test-flaky",
+        PatternKind::ArchitectRejectionRate => "arch-reject",
+        PatternKind::BudgetPressure => "budget",
+        PatternKind::ProviderFailures => "provider",
+    }
+}
+
+/// Whether a pattern kind produces an actionable remediation task.
+fn is_actionable(kind: PatternKind) -> bool {
+    !matches!(
+        kind,
+        PatternKind::BudgetPressure | PatternKind::ProviderFailures
+    )
+}
+
+/// Generate a deterministic remediation task ID from the pattern kind and affected task IDs.
+fn remediation_task_id(kind: PatternKind, affected: &[String]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut sorted = affected.to_vec();
+    sorted.sort();
+
+    let mut hasher = DefaultHasher::new();
+    for id in &sorted {
+        id.hash(&mut hasher);
+    }
+    let hash = hasher.finish();
+    format!("tqm-{}-{:016x}", kind_slug(kind), hash)
+}
+
+/// Convert a single detected pattern into a remediation task (if actionable).
+fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::taskqueue::Task> {
+    if !is_actionable(pattern.kind) {
+        return None;
+    }
+
+    let objective = match pattern.kind {
+        PatternKind::DecompositionLoop => {
+            let ids = pattern.affected_tasks.join(", ");
+            format!("TQM: Simplify tasks stuck in decomposition loops: {ids}")
+        }
+        PatternKind::ScopeCreep => {
+            format!(
+                "TQM: Review and reprioritize {} deferred tasks",
+                pattern.occurrences
+            )
+        }
+        PatternKind::ModelDegradation => {
+            format!(
+                "TQM: Investigate {} model-related failures",
+                pattern.occurrences
+            )
+        }
+        PatternKind::StuckAgents => {
+            let ids = pattern.affected_tasks.join(", ");
+            format!("TQM: Investigate stuck tasks {ids}")
+        }
+        PatternKind::TestFlakiness => {
+            format!(
+                "TQM: Fix flaky tests affecting {} task runs",
+                pattern.occurrences
+            )
+        }
+        PatternKind::ArchitectRejectionRate => "TQM: Review architect rejection patterns".into(),
+        // Advisory-only patterns — not actionable.
+        PatternKind::BudgetPressure | PatternKind::ProviderFailures => return None,
+    };
+
+    let id = remediation_task_id(pattern.kind, &pattern.affected_tasks);
+
+    Some(crate::taskqueue::Task {
+        id,
+        objective,
+        priority,
+        status: crate::taskqueue::TaskStatus::Pending,
+        depends_on: vec![],
+        decomposition_depth: 0,
+        error: None,
+        pr_url: None,
+        outcome_context: None,
+    })
+}
+
+/// Generate remediation tasks from detected patterns.
+///
+/// Returns one task per actionable pattern. Advisory-only patterns
+/// (`BudgetPressure`, `ProviderFailures`) are skipped.
+pub fn generate_remediation_tasks(
+    patterns: &[DetectedPattern],
+    config: &TQMConfig,
+) -> Vec<crate::taskqueue::Task> {
+    patterns
+        .iter()
+        .filter_map(|p| pattern_to_task(p, config.remediation_priority))
+        .collect()
+}
+
+/// Generate remediation tasks, filtering out duplicates already in the queue.
+///
+/// Returns an empty vec if `config.remediation_enabled` is false.
+/// Skips patterns whose kind already has a pending/in-progress remediation task.
+pub fn generate_deduplicated_remediation_tasks(
+    patterns: &[DetectedPattern],
+    config: &TQMConfig,
+    queue: &crate::taskqueue::TaskQueue,
+) -> Vec<crate::taskqueue::Task> {
+    if !config.remediation_enabled {
+        return Vec::new();
+    }
+
+    let filtered: Vec<&DetectedPattern> = patterns
+        .iter()
+        .filter(|p| {
+            is_actionable(p.kind)
+                && !queue.has_pending_with_prefix(&format!("tqm-{}", kind_slug(p.kind)))
+        })
+        .collect();
+
+    filtered
+        .iter()
+        .filter_map(|p| pattern_to_task(p, config.remediation_priority))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -774,6 +927,9 @@ mod tests {
         assert!((config.architect_rejection_rate_threshold - 0.5).abs() < f64::EPSILON);
         assert!((config.budget_pressure_threshold - 0.9).abs() < f64::EPSILON);
         assert_eq!(config.provider_failure_threshold, 3);
+        assert!(!config.remediation_enabled);
+        assert!(!config.remediation_in_run);
+        assert_eq!(config.remediation_priority, 5);
     }
 
     #[test]
@@ -821,5 +977,236 @@ mod tests {
         assert_eq!(parsed.kind, PatternKind::TestFlakiness);
         assert_eq!(parsed.occurrences, 5);
         assert_eq!(parsed.affected_tasks.len(), 2);
+    }
+
+    #[test]
+    fn config_serde_backward_compat_without_remediation() {
+        // Configs serialised before remediation fields existed should still parse.
+        let json = r#"{
+            "decomposition_loop_threshold": 3,
+            "scope_creep_threshold": 3,
+            "model_degradation_threshold": 3,
+            "stuck_agents_threshold": 3,
+            "test_flakiness_threshold": 2,
+            "architect_rejection_rate_threshold": 0.5,
+            "budget_pressure_threshold": 0.9,
+            "provider_failure_threshold": 3
+        }"#;
+        let parsed: TQMConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.remediation_enabled);
+        assert!(!parsed.remediation_in_run);
+        assert_eq!(parsed.remediation_priority, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Remediation task generation tests
+    // -----------------------------------------------------------------------
+
+    fn make_pattern(kind: PatternKind, affected: Vec<String>) -> DetectedPattern {
+        DetectedPattern {
+            kind,
+            description: format!("{kind:?} detected"),
+            occurrences: affected.len() as u32,
+            threshold: 3.0,
+            severity: "warning".into(),
+            affected_tasks: affected,
+        }
+    }
+
+    #[test]
+    fn remediation_empty_patterns() {
+        let config = TQMConfig::default();
+        let tasks = generate_remediation_tasks(&[], &config);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn remediation_advisory_kinds_skipped() {
+        let config = TQMConfig::default();
+        let patterns = vec![
+            make_pattern(PatternKind::BudgetPressure, vec!["t1".into()]),
+            make_pattern(PatternKind::ProviderFailures, vec!["t2".into()]),
+        ];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn remediation_decomposition_loop_produces_task() {
+        let config = TQMConfig::default();
+        let patterns = vec![make_pattern(
+            PatternKind::DecompositionLoop,
+            vec!["t1".into(), "t2".into()],
+        )];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].id.starts_with("tqm-decomp-loop-"));
+        assert!(tasks[0].objective.contains("decomposition loops"));
+        assert!(tasks[0].objective.contains("t1"));
+        assert_eq!(tasks[0].priority, 5);
+    }
+
+    #[test]
+    fn remediation_scope_creep_produces_task() {
+        let config = TQMConfig::default();
+        let patterns = vec![make_pattern(
+            PatternKind::ScopeCreep,
+            vec!["t1".into(), "t2".into(), "t3".into()],
+        )];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].id.starts_with("tqm-scope-creep-"));
+        assert!(tasks[0].objective.contains("deferred tasks"));
+    }
+
+    #[test]
+    fn remediation_model_degradation_produces_task() {
+        let config = TQMConfig::default();
+        let patterns = vec![make_pattern(
+            PatternKind::ModelDegradation,
+            vec!["t1".into()],
+        )];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].id.starts_with("tqm-model-degrad-"));
+        assert!(tasks[0].objective.contains("model-related failures"));
+    }
+
+    #[test]
+    fn remediation_stuck_agents_produces_task() {
+        let config = TQMConfig::default();
+        let patterns = vec![make_pattern(PatternKind::StuckAgents, vec!["t1".into()])];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].id.starts_with("tqm-stuck-agents-"));
+        assert!(tasks[0].objective.contains("stuck tasks"));
+    }
+
+    #[test]
+    fn remediation_test_flakiness_produces_task() {
+        let config = TQMConfig::default();
+        let patterns = vec![make_pattern(
+            PatternKind::TestFlakiness,
+            vec!["t1".into(), "t2".into()],
+        )];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].id.starts_with("tqm-test-flaky-"));
+        assert!(tasks[0].objective.contains("flaky tests"));
+    }
+
+    #[test]
+    fn remediation_architect_rejection_produces_task() {
+        let config = TQMConfig::default();
+        let patterns = vec![make_pattern(
+            PatternKind::ArchitectRejectionRate,
+            vec!["t1".into()],
+        )];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].id.starts_with("tqm-arch-reject-"));
+        assert!(tasks[0].objective.contains("architect rejection"));
+    }
+
+    #[test]
+    fn remediation_deterministic_ids() {
+        let config = TQMConfig::default();
+        let patterns = vec![make_pattern(
+            PatternKind::StuckAgents,
+            vec!["t2".into(), "t1".into()],
+        )];
+        let tasks1 = generate_remediation_tasks(&patterns, &config);
+        let tasks2 = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks1[0].id, tasks2[0].id);
+    }
+
+    #[test]
+    fn remediation_different_affected_different_ids() {
+        let config = TQMConfig::default();
+        let p1 = vec![make_pattern(PatternKind::StuckAgents, vec!["t1".into()])];
+        let p2 = vec![make_pattern(PatternKind::StuckAgents, vec!["t2".into()])];
+        let t1 = generate_remediation_tasks(&p1, &config);
+        let t2 = generate_remediation_tasks(&p2, &config);
+        assert_ne!(t1[0].id, t2[0].id);
+    }
+
+    #[test]
+    fn remediation_respects_priority_config() {
+        let config = TQMConfig {
+            remediation_priority: 42,
+            ..TQMConfig::default()
+        };
+        let patterns = vec![make_pattern(PatternKind::TestFlakiness, vec!["t1".into()])];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks[0].priority, 42);
+    }
+
+    #[test]
+    fn remediation_multiple_patterns() {
+        let config = TQMConfig::default();
+        let patterns = vec![
+            make_pattern(PatternKind::StuckAgents, vec!["t1".into()]),
+            make_pattern(PatternKind::TestFlakiness, vec!["t2".into()]),
+            make_pattern(PatternKind::BudgetPressure, vec![]),
+        ];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        // BudgetPressure is advisory, so only 2 tasks.
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn dedup_returns_empty_when_disabled() {
+        let config = TQMConfig::default(); // remediation_enabled = false
+        let queue = crate::taskqueue::TaskQueue::from_tasks(vec![]);
+        let patterns = vec![make_pattern(PatternKind::StuckAgents, vec!["t1".into()])];
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn dedup_skips_existing_remediation_tasks() {
+        let config = TQMConfig {
+            remediation_enabled: true,
+            ..TQMConfig::default()
+        };
+
+        // Put an existing tqm-stuck-agents task in the queue.
+        let existing = crate::taskqueue::Task {
+            id: "tqm-stuck-agents-aaaa".into(),
+            objective: "existing".into(),
+            priority: 5,
+            status: crate::taskqueue::TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+        };
+        let queue = crate::taskqueue::TaskQueue::from_tasks(vec![existing]);
+
+        let patterns = vec![
+            make_pattern(PatternKind::StuckAgents, vec!["t1".into()]),
+            make_pattern(PatternKind::TestFlakiness, vec!["t2".into()]),
+        ];
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue);
+        // StuckAgents is deduplicated, only TestFlakiness remains.
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].id.starts_with("tqm-test-flaky-"));
+    }
+
+    #[test]
+    fn dedup_allows_different_kinds() {
+        let config = TQMConfig {
+            remediation_enabled: true,
+            ..TQMConfig::default()
+        };
+        let queue = crate::taskqueue::TaskQueue::from_tasks(vec![]);
+
+        let patterns = vec![
+            make_pattern(PatternKind::StuckAgents, vec!["t1".into()]),
+            make_pattern(PatternKind::TestFlakiness, vec!["t2".into()]),
+        ];
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue);
+        assert_eq!(tasks.len(), 2);
     }
 }
