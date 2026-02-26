@@ -264,10 +264,15 @@ impl Default for EngConfig {
                 repair_budget_fraction: default_repair_budget_fraction(),
             },
             intervention: InterventionConfig {
+                // When true, the orchestrator will pause after generating a plan, awaiting user approval.
                 pause_after_plan: true,
+                // When true, the orchestrator will pause after creating a pull request, awaiting user review.
                 pause_before_pr: true,
+                // When true, the orchestrator will pause if the planned changes affect core project files.
                 pause_on_core_change: true,
+                // When true, the orchestrator will pause if the estimated cost exceeds the configured budget.
                 pause_on_budget_exceeded: true,
+                // When true, the architect reviews the PR diff after creation and before auto-merge.
                 review_pr_diff: false,
             },
             workspace: WorkspaceConfig {
