@@ -5326,4 +5326,210 @@ mod tests {
         let result = build_rust_module_map(dir.path(), &files);
         assert!(result.is_empty());
     }
+
+    // --- short-circuit pipeline integration tests ---
+
+    /// Mock responses for a short-circuit pipeline run.
+    ///
+    /// Short circuit skips triage, security, release, and archivist, so the
+    /// sequence is: planner → implementer (tool_use) → implementer (final) →
+    /// architect review.
+    fn short_circuit_mock_responses() -> Vec<glitchlab_router::RouterResponse> {
+        vec![
+            // 1. Planner — trivial, 1 file, no core change
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add comment", "files": ["src/lib.rs"], "action": "modify"}], "files_likely_affected": ["src/lib.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "trivial", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Implementer — edit_file tool call (no triage!)
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/lib.rs", "content": "// Added comment\npub fn greet() -> &'static str { \"hello\" }\n"}),
+            }]),
+            // 3. Implementer — final metadata
+            final_response(
+                r#"{"files_changed": ["src/lib.rs"], "tests_added": [], "commit_message": "docs: add comment", "summary": "added comment"}"#,
+            ),
+            // 4. Architect review — merge (no security/release/archivist!)
+            final_response(
+                r#"{"verdict": "merge", "confidence": 0.95, "reasoning": "trivial change", "quality_score": 9, "issues": [], "architectural_fitness": "good", "merge_strategy": "squash"}"#,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn pipeline_short_circuit_skips_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let router = sequential_router_ref(short_circuit_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 2;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-short-circuit",
+                "Add a comment to lib.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated
+                || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+
+        // Triage should NOT be in stage outputs (skipped).
+        assert!(
+            !result.stage_outputs.contains_key("architect_triage"),
+            "triage should be skipped on short circuit"
+        );
+
+        // Archive should NOT be in stage outputs (skipped).
+        assert!(
+            !result.stage_outputs.contains_key("archive"),
+            "archivist should be skipped on short circuit"
+        );
+
+        // Security and release should exist but with synthetic "skipped" outputs.
+        let security = result.stage_outputs.get("security").unwrap();
+        assert_eq!(
+            security.data["verdict"].as_str().unwrap(),
+            "skipped",
+            "security verdict should be 'skipped'"
+        );
+
+        let release = result.stage_outputs.get("release").unwrap();
+        assert_eq!(
+            release.data["version_bump"].as_str().unwrap(),
+            "patch",
+            "release should default to 'patch'"
+        );
+        assert_eq!(
+            release.data["reasoning"].as_str().unwrap(),
+            "skipped (short circuit)",
+        );
+
+        // Plan and implement should still be present.
+        assert!(result.stage_outputs.contains_key("plan"));
+        assert!(result.stage_outputs.contains_key("implement"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_short_circuit_disabled_runs_all_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Use the full response set — short circuit is disabled by default.
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        // Explicitly disabled (the default).
+        config.pipeline.short_circuit_enabled = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-no-short-circuit",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated
+                || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+
+        // All stages should be present when short circuit is off.
+        assert!(result.stage_outputs.contains_key("architect_triage"));
+        assert!(result.stage_outputs.contains_key("security"));
+        assert!(result.stage_outputs.contains_key("release"));
+        assert!(result.stage_outputs.contains_key("archive"));
+
+        // Security should have a real verdict, not "skipped".
+        let security = result.stage_outputs.get("security").unwrap();
+        assert_ne!(
+            security.data["verdict"].as_str().unwrap_or(""),
+            "skipped",
+            "security should run when short circuit is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_short_circuit_not_eligible_runs_all_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Full responses needed — planner says "medium" so short circuit won't trigger.
+        let mut responses = pipeline_mock_responses();
+        // Replace planner response with medium complexity.
+        responses[0] = final_response(
+            r#"{"steps": [{"step_number": 1, "description": "refactor module", "files": ["src/a.rs", "src/b.rs", "src/c.rs"], "action": "modify"}], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs"], "requires_core_change": false, "risk_level": "medium", "risk_notes": "refactor", "test_strategy": [], "estimated_complexity": "medium", "dependencies_affected": false, "public_api_changed": false}"#,
+        );
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true; // Enabled, but won't qualify.
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-not-eligible",
+                "Refactor the module",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated
+                || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+
+        // Medium complexity + 3 files → not eligible → all stages run.
+        assert!(
+            result.stage_outputs.contains_key("architect_triage"),
+            "triage should run for non-eligible tasks"
+        );
+        assert!(
+            result.stage_outputs.contains_key("archive"),
+            "archivist should run for non-eligible tasks"
+        );
+    }
 }
