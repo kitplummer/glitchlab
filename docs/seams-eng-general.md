@@ -1,50 +1,38 @@
-# Seams: Engineering General Patterns
+# Seams between Engineering-Specific and General Agentic Patterns
 
-This document outlines general patterns and engineering-specific patterns related to 'seams' in the codebase. Understanding these patterns helps in identifying areas for refactoring, testing, and extending functionality with minimal impact.
+This document aims to delineate the patterns observed in agentic systems, distinguishing between those that are engineering-specific (and thus likely to remain within the `eng-org` or Python agents) and those that are generalizable (and thus candidates for extraction into a core "kernel" or shared library). This distinction is crucial for informing the kernel extraction phase and guiding future authors of new organizations.
 
-## General Patterns
+## General Agentic Patterns (Kernel Candidates)
 
-This section describes components that are designed to be generalizable and form the core "kernel" of the system. These components are intended to be reusable across different organizational contexts and are not tied to specific engineering practices or tools.
+These patterns represent fundamental concepts and mechanisms applicable across various agentic systems, regardless of the specific domain (e.g., engineering, medical, financial). They form the core infrastructure for building intelligent agents.
 
-### `crates/kernel`
-The `crates/kernel` crate contains the fundamental building blocks and core logic of the system. It defines traits, interfaces, and basic data structures that other components depend on. This crate is designed to be as minimal and abstract as possible, focusing on core functionalities that are universally applicable.
+**Examples of Modules/Concepts:**
 
-### `crates/memory`
-The `crates/memory` crate provides abstractions and utilities for memory management and data persistence. It defines how data is stored, retrieved, and managed within the system, offering a clean separation between data storage concerns and business logic. This crate aims to provide a flexible and efficient memory model that can be adapted to various storage backends.
+*   **Agent Core Loop:** The fundamental cycle of perception, deliberation, action, and learning. This includes mechanisms for receiving observations, updating internal state, deciding on actions, and executing them.
+*   **Memory Management:** Systems for storing, retrieving, and organizing an agent's experiences, knowledge, and beliefs. This could include short-term working memory, long-term episodic memory, and semantic knowledge bases.
+*   **Tool Use / Function Calling Abstraction:** A standardized interface for agents to interact with external tools, APIs, or functions. This involves defining how tools are described, how arguments are passed, and how results are received.
+*   **Goal Management & Planning:** Mechanisms for agents to define, prioritize, and track goals, as well as to generate and execute plans to achieve them. This includes hierarchical planning, sub-goal decomposition, and replanning capabilities.
+*   **Communication Protocols:** Standardized ways for agents to communicate with each other or with human users, including message formats, negotiation strategies, and coordination mechanisms.
+*   **Perception & Observation Processing:** General frameworks for agents to process raw sensory input (e.g., text, images, structured data) into meaningful observations that can inform their decision-making.
+*   **Basic State Representation:** Abstract models for an agent's internal state, including beliefs, desires, and intentions, independent of domain-specific details.
+*   **Prompt Engineering Utilities:** General utilities for constructing and managing prompts for large language models, including templating, few-shot examples, and context window management.
 
-### `crates/router`
-The `crates/router` crate is responsible for handling request routing and dispatching. It defines how incoming requests are matched to appropriate handlers and how responses are generated. This crate provides a flexible and extensible routing mechanism that can be used in different communication protocols and application architectures.
+## Engineering-Specific Patterns (Eng-Org / Python Agents)
 
+These patterns are tailored to the unique requirements and characteristics of engineering tasks, particularly within software development and system management. While they leverage general agentic principles, their implementation details and specific functionalities are highly specialized for the engineering domain.
 
-## Engineering-Specific Patterns
+**Examples of Modules/Concepts:**
 
-### `crates/eng-org`
+*   **Code Generation & Refactoring Tools:** Specific integrations with compilers, linters, formatters, and IDEs to generate, analyze, and modify source code. This includes understanding programming language syntax, semantic analysis, and applying refactoring patterns.
+*   **Version Control System (VCS) Integration:** Modules for interacting with Git (or other VCS) to manage code changes, create branches, commit, merge, and resolve conflicts. This involves understanding diffs, patches, and repository structures.
+*   **Build & Test Automation:** Agents designed to trigger builds, run test suites (unit, integration, end-to-end), parse test results, and report failures. This includes knowledge of build systems (e.g., Cargo, Maven, npm) and testing frameworks.
+*   **Deployment & Infrastructure Management:** Agents capable of deploying applications, managing cloud resources, configuring servers, and monitoring system health. This requires knowledge of specific cloud providers (AWS, GCP, Azure), containerization (Docker, Kubernetes), and infrastructure-as-code tools.
+*   **Issue Tracking & Project Management Integration:** Modules for interacting with issue trackers (e.g., Jira, GitHub Issues) to create, update, and resolve tickets, assign tasks, and track project progress.
+*   **Code Review & Feedback Mechanisms:** Agents that can analyze pull requests, provide constructive feedback, suggest improvements, and enforce coding standards. This involves understanding code quality metrics and best practices.
+*   **Debugging & Error Analysis:** Specialized agents that can analyze logs, stack traces, and error messages to diagnose software bugs, suggest fixes, and even apply patches.
+*   **Specific Language/Framework Adapters:** Modules providing deep understanding and interaction capabilities for particular programming languages (e.g., Python, Rust, TypeScript) or frameworks (e.g., React, Spring Boot, Django). This includes parsing ASTs, understanding library APIs, and generating idiomatic code.
+*   **Security Vulnerability Scanning:** Agents integrated with security tools to identify and report potential vulnerabilities in code or deployed systems.
 
-The `crates/eng-org` component provides foundational organizational structures and utilities specifically designed for engineering tasks within the Seams project. It aims to standardize common engineering patterns and facilitate consistent development practices across various modules.
+## Conclusion
 
-This crate contains:
-*   **`crates/eng-org/src/agent.rs`**: Defines the `Agent` trait and core agent-related functionalities. This is a key seam, as the `Agent` trait itself is general, but its concrete implementations and the specific `Agent` types (e.g., `PlannerAgent`, `ImplementerAgent`) are eng-specific.
-*   **`crates/eng-org/src/project.rs`**: Manages project-level configurations, metadata, and interactions. This includes defining project structures, dependencies, and build processes, which are often tailored to engineering workflows.
-*   **`crates/eng-org/src/lib.rs`**: Aggregates and re-exports modules within `eng-org`, providing a unified interface for engineering-specific utilities. It also contains eng-specific error handling and logging configurations.
-
-### `glitchlab/agents`
-
-The `glitchlab/agents` directory houses a collection of specialized agents, each responsible for a distinct phase or aspect of the software development lifecycle within the Glitchlab environment. These agents automate and streamline complex engineering workflows.
-
-*   **Planner Agent**: Responsible for breaking down high-level tasks into actionable steps and generating detailed execution plans.
-*   **Implementer Agent**: Focuses on translating plans into code, making necessary modifications, and ensuring the implementation aligns with the specified requirements.
-*   **Debugger Agent**: Identifies and diagnoses issues within the codebase, suggesting and applying fixes to resolve defects and improve system stability.
-*   **Security Agent**: Specializes in identifying security vulnerabilities, enforcing security best practices, and ensuring the integrity and confidentiality of the system.
-*   **Release Agent**: Manages the release process, including versioning, packaging, and deployment, ensuring a smooth and controlled delivery of software updates.
-
-## Seams Analysis
-
-This section highlights the key "seams" or points of interaction and distinction between the generalizable kernel components and the engineering-specific adaptations.
-
-*   **Agent Trait vs. Concrete Agents**: The `Agent` trait defined in `crates/kernel` (or a similar general crate) would represent a general pattern for defining autonomous entities. However, the concrete implementations of agents like `PlannerAgent`, `ImplementerAgent`, etc., found in `crates/eng-org` or `glitchlab/agents`, are engineering-specific. The seam lies in how the general `Agent` trait is specialized and extended for particular engineering tasks.
-
-*   **Configuration and Project Management**: General components might have basic configuration mechanisms. However, `crates/eng-org/src/project.rs` demonstrates an engineering-specific pattern for managing project configurations, build processes, and dependencies. The seam here is where general configuration principles are adapted to the specific needs of an engineering project.
-
-*   **Error Handling and Logging**: While general components might define basic error types and logging interfaces, `crates/eng-org/src/lib.rs` would contain engineering-specific error handling strategies and logging configurations tailored to the development and operational needs of the engineering organization. The seam is where general error reporting is augmented with eng-specific context and reporting mechanisms.
-
-*   **Tooling and Workflow Integration**: The `glitchlab/agents` directory exemplifies how general agent patterns are integrated into a specific engineering workflow. Each agent (Planner, Implementer, Debugger, Security, Release) represents a specialized tool within the Glitchlab environment. The seam is where general computational agents are given specific roles and responsibilities within an engineering toolchain.
+By clearly separating these two categories, we can ensure that the "kernel" remains lean, reusable, and domain-agnostic, providing a robust foundation for any agentic system. Engineering-specific functionalities can then be built on top of this kernel, allowing for specialized and efficient solutions within the `eng-org` and Python agents, while still benefiting from shared core capabilities. This approach facilitates easier onboarding for new organization authors and promotes a more modular and maintainable agent architecture.
