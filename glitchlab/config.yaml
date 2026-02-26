@@ -13,6 +13,9 @@ routing:
   release: "gemini/gemini-2.5-flash"
   archivist: "gemini/gemini-2.5-flash-lite"
 
+  # Example for Ollama routing (local models):
+  # ollama: "ollama/llama3"
+
 # Budget + safety limits per task
 limits:
   max_fix_attempts: 4
@@ -110,3 +113,15 @@ ops_agent:
   governance:
     max_retries_on_failure: 3
     human_approval_for_deploy: true
+
+# Failure detection configuration
+failure_detection:
+  enabled: true
+  step_timeout_seconds: 300
+  log_error_patterns:
+    - "error"
+    - "fail"
+    - "exception"
+    - "traceback"
+    - "panic"
+    - "fatal"

@@ -1,0 +1,10 @@
+task:
+  implementer:
+    model: ollama/llama3
+  tools:
+    - read_file
+  description: "This is a test task to ensure Ollama models can use tools."
+  steps:
+    - action: "run_command"
+      command: "echo 'Hello from Ollama tool task!'"
+      description: "A simple step to demonstrate task execution."
