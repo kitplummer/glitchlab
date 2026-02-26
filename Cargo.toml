@@ -6,6 +6,7 @@ members = [
     "crates/router",
     "crates/eng-org",
     "crates/cli",
+    "crates/ops-org",
 ]
 
 [workspace.package]
