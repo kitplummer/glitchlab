@@ -66,6 +66,10 @@ pub struct Task {
     /// are sorted before feature work in the queue.
     #[serde(default)]
     pub is_remediation: bool,
+    /// Hint from the parent task's planner about which files this sub-task
+    /// likely affects. Used to pre-seed the implementer's context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_hint: Option<Vec<String>>,
 }
 
 fn default_priority() -> u32 {
@@ -340,6 +344,7 @@ fn bead_to_task(bead: Bead) -> Task {
         outcome_context: None,
         remediation_depth: 0,
         is_remediation: false,
+        files_hint: None,
     }
 }
 
@@ -365,6 +370,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
             Task {
                 id: "task-2".into(),
@@ -378,6 +384,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
             Task {
                 id: "task-3".into(),
@@ -391,6 +398,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
         ]
     }
@@ -446,6 +454,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
             Task {
                 id: "b".into(),
@@ -459,6 +468,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -603,6 +613,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         };
         let yaml = serde_yaml::to_string(&task).unwrap();
         let parsed: Task = serde_yaml::from_str(&yaml).unwrap();
@@ -628,6 +639,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
             Task {
                 id: "b".into(),
@@ -641,6 +653,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
             Task {
                 id: "c".into(),
@@ -654,6 +667,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -680,6 +694,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         queue.inject_tasks(new_tasks);
         assert_eq!(queue.tasks().len(), 4);
@@ -918,6 +933,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
             Task {
                 id: "p1".into(),
@@ -931,6 +947,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -953,6 +970,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert_eq!(queue.actionable_count(), 1);
@@ -972,6 +990,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         let s = queue.summary();
@@ -1027,6 +1046,7 @@ mod tests {
             }),
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("outcome_context"));
@@ -1081,6 +1101,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: Task = serde_json::from_str(&json).unwrap();
@@ -1098,6 +1119,60 @@ mod tests {
         let json = r#"{"id":"old","objective":"old task","priority":1,"status":"pending"}"#;
         let parsed: Task = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.decomposition_depth, 0);
+    }
+
+    #[test]
+    fn task_serde_with_files_hint() {
+        let task = Task {
+            id: "hint-test".into(),
+            objective: "Test files_hint".into(),
+            priority: 1,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains("files_hint"));
+        let parsed: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.files_hint,
+            Some(vec!["src/lib.rs".into(), "src/main.rs".into()])
+        );
+    }
+
+    #[test]
+    fn task_serde_without_files_hint() {
+        let task = Task {
+            id: "no-hint".into(),
+            objective: "No file hints".into(),
+            priority: 1,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: None,
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        // None should be omitted (skip_serializing_if).
+        assert!(!json.contains("files_hint"));
+    }
+
+    #[test]
+    fn task_files_hint_backward_compat() {
+        // Tasks serialised before files_hint existed.
+        let json = r#"{"id":"old","objective":"old task","priority":1,"status":"pending"}"#;
+        let parsed: Task = serde_json::from_str(json).unwrap();
+        assert!(parsed.files_hint.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1118,6 +1193,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(queue.has_pending_with_prefix("tqm-stuck-agents"));
@@ -1137,6 +1213,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
@@ -1156,6 +1233,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
@@ -1175,6 +1253,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
@@ -1199,6 +1278,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
             Task {
                 id: "fix-1".into(),
@@ -1212,6 +1292,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 1,
                 is_remediation: true,
+                files_hint: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1243,6 +1324,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
             Task {
                 id: "fix-blocked".into(),
@@ -1256,6 +1338,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 1,
                 is_remediation: true,
+                files_hint: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1279,6 +1362,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 1,
                 is_remediation: true,
+                files_hint: None,
             },
             Task {
                 id: "fix-high".into(),
@@ -1292,6 +1376,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 1,
                 is_remediation: true,
+                files_hint: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);

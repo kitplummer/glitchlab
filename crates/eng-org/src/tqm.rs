@@ -647,6 +647,7 @@ fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::ta
         outcome_context: None,
         remediation_depth: 0,
         is_remediation: true,
+        files_hint: None,
     })
 }
 
@@ -1315,6 +1316,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: true,
+            files_hint: None,
         };
         let queue = crate::taskqueue::TaskQueue::from_tasks(vec![existing]);
 

@@ -641,7 +641,17 @@ impl Orchestrator {
             match queue.pick_next() {
                 Some(task) => {
                     task_id = task.id.clone();
-                    objective = task.objective.clone();
+                    // Append file hints from parent task to the objective so
+                    // the planner/implementer can focus on specific files.
+                    objective = if let Some(ref hints) = task.files_hint {
+                        format!(
+                            "{}\n\nFiles from parent task: {}",
+                            task.objective,
+                            hints.join(", ")
+                        )
+                    } else {
+                        task.objective.clone()
+                    };
                     task_depth = task.decomposition_depth;
                     task_is_remediation = task.is_remediation;
                     // Skip remediation tasks when repair budget is exhausted.
@@ -1317,6 +1327,7 @@ impl Orchestrator {
                     outcome_context: None,
                     remediation_depth: 1,
                     is_remediation: true,
+                    files_hint: None,
                 })
             })
             .collect()
@@ -1417,6 +1428,15 @@ impl Orchestrator {
                 })
                 .unwrap_or_default();
 
+            let files_hint: Option<Vec<String>> = item
+                .get("files_likely_affected")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                });
+
             tasks.push(crate::taskqueue::Task {
                 id,
                 objective,
@@ -1429,6 +1449,7 @@ impl Orchestrator {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint,
             });
         }
 
@@ -1703,6 +1724,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(0.10); // less than per-task $0.50
@@ -1741,6 +1763,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
             Task {
                 id: "b".into(),
@@ -1754,6 +1777,7 @@ mod tests {
                 outcome_context: None,
                 remediation_depth: 0,
                 is_remediation: false,
+                files_hint: None,
             },
         ];
         let mut queue = TaskQueue::from_tasks(tasks);
@@ -1831,6 +1855,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }
     }
 
@@ -2153,6 +2178,62 @@ mod tests {
         assert!(sub_tasks[0].depends_on.is_empty());
         assert_eq!(sub_tasks[1].id, "parent-part2");
         assert_eq!(sub_tasks[1].depends_on, vec!["parent-part1"]);
+    }
+
+    #[test]
+    fn extract_sub_tasks_with_files_hint() {
+        use glitchlab_kernel::agent::AgentMetadata;
+
+        let plan_data = serde_json::json!({
+            "estimated_complexity": "large",
+            "decomposition": [
+                {
+                    "id": "parent-part1",
+                    "objective": "Refactor module A",
+                    "files_likely_affected": ["src/a.rs", "src/a_test.rs"],
+                    "depends_on": []
+                },
+                {
+                    "id": "parent-part2",
+                    "objective": "Refactor module B",
+                    "depends_on": ["parent-part1"]
+                }
+            ],
+            "steps": [],
+            "files_likely_affected": ["src/a.rs", "src/a_test.rs", "src/b.rs"],
+            "requires_core_change": false,
+            "risk_level": "medium",
+            "risk_notes": "multi-file",
+            "test_strategy": [],
+            "dependencies_affected": false,
+            "public_api_changed": false
+        });
+
+        let plan_output = AgentOutput {
+            data: plan_data,
+            metadata: AgentMetadata {
+                agent: "planner".into(),
+                model: "test".into(),
+                tokens: 100,
+                cost: 0.01,
+                latency_ms: 50,
+            },
+            parse_error: false,
+        };
+
+        let mut stage_outputs = HashMap::new();
+        stage_outputs.insert("plan".into(), plan_output);
+
+        let sub_tasks = Orchestrator::extract_sub_tasks("parent", 0, &stage_outputs).unwrap();
+        assert_eq!(sub_tasks.len(), 2);
+
+        // First sub-task has files_hint from planner's files_likely_affected.
+        assert_eq!(
+            sub_tasks[0].files_hint,
+            Some(vec!["src/a.rs".into(), "src/a_test.rs".into()])
+        );
+        // Second sub-task has no files_likely_affected → files_hint is None.
+        assert!(sub_tasks[1].files_hint.is_none());
     }
 
     #[test]
@@ -2719,6 +2800,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -2754,6 +2836,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -2800,6 +2883,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 0,
             is_remediation: false,
+            files_hint: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -3241,6 +3325,7 @@ mod tests {
             outcome_context: None,
             remediation_depth: 1,
             is_remediation: true,
+            files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         let next = queue.pick_next().unwrap();

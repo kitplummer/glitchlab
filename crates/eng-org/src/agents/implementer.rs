@@ -18,7 +18,8 @@ You receive a plan and implement it by making changes and verifying them.
 
 ## Budget
 
-You have a STRICT maximum of {max_turns} tool-call turns and ~100K tokens.
+You have a STRICT maximum of {max_turns} tool-call turns.
+Each turn costs ~3-5K tokens. Budget is tight — do not explore.
 Each turn may include MULTIPLE tool calls — batch aggressively to stay within budget.
 Reserve 2 turns for final verification. You WILL be terminated if you exceed budget.
 

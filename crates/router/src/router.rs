@@ -417,6 +417,11 @@ impl Router {
     pub async fn budget_exceeded(&self) -> bool {
         self.budget.lock().await.exceeded()
     }
+
+    /// Resize the token budget (e.g. after triage assigns a task size).
+    pub async fn resize_budget(&self, max_tokens: u64) {
+        self.budget.lock().await.max_tokens = max_tokens;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,5 +1243,21 @@ mod tests {
             super::normalize_openai_url("http://localhost:11434/v1/"),
             "http://localhost:11434/v1/chat/completions"
         );
+    }
+
+    #[tokio::test]
+    async fn resize_budget_changes_max_tokens() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget);
+
+        // Fresh budget: tokens_remaining == max_tokens.
+        let summary = router.budget_summary().await;
+        assert_eq!(summary.tokens_remaining, 100_000);
+
+        router.resize_budget(35_000).await;
+
+        let summary = router.budget_summary().await;
+        assert_eq!(summary.tokens_remaining, 35_000);
     }
 }

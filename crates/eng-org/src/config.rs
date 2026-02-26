@@ -6,6 +6,45 @@ use glitchlab_router::ProviderInit;
 use glitchlab_router::chooser::{ModelChooser, ModelProfile, ModelTier, RolePreference};
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// TaskSize — t-shirt sizing for token budgets
+// ---------------------------------------------------------------------------
+
+/// T-shirt size assigned by triage to control per-task token budget.
+///
+/// XL tasks are rejected back to the planner for decomposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskSize {
+    S,
+    M,
+    L,
+    XL,
+}
+
+impl TaskSize {
+    /// Maximum token budget for this task size.
+    /// XL returns 0 — these tasks must be decomposed, never executed.
+    pub fn max_tokens(&self) -> u64 {
+        match self {
+            Self::S => 15_000,
+            Self::M => 35_000,
+            Self::L => 60_000,
+            Self::XL => 0,
+        }
+    }
+
+    /// Maximum tool-call turns for this task size.
+    /// XL returns 0 — these tasks must be decomposed, never executed.
+    pub fn max_tool_turns(&self) -> u32 {
+        match self {
+            Self::S => 3,
+            Self::M => 7,
+            Self::L => 12,
+            Self::XL => 0,
+        }
+    }
+}
+
 /// Full GLITCHLAB configuration (engineering org).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngConfig {
@@ -287,16 +326,16 @@ impl Default for EngConfig {
             limits: LimitsConfig {
                 // Maximum number of times to attempt to fix a failed task. (Range: 1-5)
                 max_fix_attempts: 2,
-                // Maximum number of tokens allowed for a single task. (Range: 10,000-500,000)
-                max_tokens_per_task: 120_000,
+                // Maximum number of tokens allowed for a single task (L ceiling — triage sizes down).
+                max_tokens_per_task: 60_000,
                 // Maximum dollar cost allowed for a single task. (Range: 0.10-10.00)
                 max_dollars_per_task: 0.50,
                 // When true, the orchestrator will pause and wait for human approval after generating a plan.
                 require_plan_review: true,
                 // When true, the orchestrator will pause and wait for human approval after creating a PR.
                 require_pr_review: true,
-                // Maximum number of tool turns allowed for a single task. (Range: 5-50)
-                max_tool_turns: 15,
+                // Maximum number of tool turns allowed for a single task (L ceiling — triage sizes down).
+                max_tool_turns: 12,
                 // Maximum duration in seconds for a single pipeline run. (Range: 300-3600)
                 max_pipeline_duration_secs: 600,
                 // Maximum recent turns to check for stuck detection. When tool results
@@ -667,7 +706,7 @@ mod tests {
     fn default_config_has_sane_values() {
         let config = EngConfig::default();
         assert_eq!(config.limits.max_fix_attempts, 2);
-        assert_eq!(config.limits.max_tokens_per_task, 120_000);
+        assert_eq!(config.limits.max_tokens_per_task, 60_000);
         assert!((config.limits.max_dollars_per_task - 0.50).abs() < f64::EPSILON);
         assert!(config.intervention.pause_after_plan);
         assert!(config.intervention.pause_before_pr);
@@ -676,7 +715,7 @@ mod tests {
         assert!(!config.blocked_patterns.is_empty());
         assert!(config.routing.implementer.contains("anthropic"));
         assert!(config.routing.planner.contains("anthropic"));
-        assert_eq!(config.limits.max_tool_turns, 15);
+        assert_eq!(config.limits.max_tool_turns, 12);
         assert_eq!(config.limits.max_pipeline_duration_secs, 600);
     }
 
@@ -739,7 +778,7 @@ mod tests {
         assert_eq!(config.limits.max_fix_attempts, 5);
         assert!((config.limits.max_dollars_per_task - 5.0).abs() < f64::EPSILON);
         // Non-overridden values should keep defaults.
-        assert_eq!(config.limits.max_tokens_per_task, 120_000);
+        assert_eq!(config.limits.max_tokens_per_task, 60_000);
     }
 
     #[test]
@@ -1511,5 +1550,41 @@ base_url: http://localhost:8080
         let map = config.routing_map();
         assert!(map.contains_key("ops_diagnosis"));
         assert!(map["ops_diagnosis"].contains("haiku"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TaskSize tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_size_max_tokens() {
+        assert_eq!(TaskSize::S.max_tokens(), 15_000);
+        assert_eq!(TaskSize::M.max_tokens(), 35_000);
+        assert_eq!(TaskSize::L.max_tokens(), 60_000);
+        assert_eq!(TaskSize::XL.max_tokens(), 0);
+    }
+
+    #[test]
+    fn task_size_max_tool_turns() {
+        assert_eq!(TaskSize::S.max_tool_turns(), 3);
+        assert_eq!(TaskSize::M.max_tool_turns(), 7);
+        assert_eq!(TaskSize::L.max_tool_turns(), 12);
+        assert_eq!(TaskSize::XL.max_tool_turns(), 0);
+    }
+
+    #[test]
+    fn task_size_serde_roundtrip() {
+        for size in &[TaskSize::S, TaskSize::M, TaskSize::L, TaskSize::XL] {
+            let json = serde_json::to_string(size).unwrap();
+            let parsed: TaskSize = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, size);
+        }
+    }
+
+    #[test]
+    fn task_size_equality() {
+        assert_eq!(TaskSize::S, TaskSize::S);
+        assert_ne!(TaskSize::S, TaskSize::M);
+        assert_ne!(TaskSize::L, TaskSize::XL);
     }
 }

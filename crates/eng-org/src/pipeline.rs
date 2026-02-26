@@ -27,7 +27,7 @@ use crate::agents::implementer::ImplementerAgent;
 use crate::agents::planner::PlannerAgent;
 use crate::agents::release::ReleaseAgent;
 use crate::agents::security::SecurityAgent;
-use crate::config::EngConfig;
+use crate::config::{EngConfig, TaskSize};
 use crate::indexer;
 use crate::tools::ToolDispatcher;
 use crate::workspace::Workspace;
@@ -576,9 +576,17 @@ impl EngineeringPipeline {
                 self.config.pipeline.short_circuit_max_files,
             );
 
+        // Task size — set by triage (or S for short-circuit).
+        let mut task_size = if use_short_circuit {
+            TaskSize::S
+        } else {
+            TaskSize::M // will be overwritten by triage
+        };
+
         if use_short_circuit {
             info!(
                 task_id,
+                ?task_size,
                 "short-circuit eligible — skipping triage, security, release, archivist"
             );
         }
@@ -620,6 +628,8 @@ impl EngineeringPipeline {
                         "architect_triage",
                         serde_json::json!({
                             "verdict": "proceed",
+                            "task_size": "M",
+                            "sizing_rationale": "default — triage agent failed",
                             "confidence": 0.0,
                             "reasoning": "triage agent failed",
                             "evidence": [],
@@ -634,6 +644,16 @@ impl EngineeringPipeline {
                 .as_str()
                 .unwrap_or("proceed")
                 .to_string();
+
+            // Extract task size from triage (default M if missing).
+            let task_size_str = triage_output.data["task_size"].as_str().unwrap_or("M");
+            task_size = match task_size_str {
+                "S" => TaskSize::S,
+                "L" => TaskSize::L,
+                "XL" => TaskSize::XL,
+                _ => TaskSize::M,
+            };
+
             self.emit(
                 &mut ctx,
                 EventKind::ArchitectTriage,
@@ -641,6 +661,59 @@ impl EngineeringPipeline {
             );
             ctx.stage_outputs
                 .insert("architect_triage".into(), triage_output);
+
+            // XL → force needs_refinement (even if verdict was "proceed").
+            if task_size == TaskSize::XL && triage_verdict != "already_done" {
+                info!(task_id, "triage sized XL — forcing decomposition");
+
+                let triage_data = ctx
+                    .stage_outputs
+                    .get("architect_triage")
+                    .map(|o| o.data.clone())
+                    .unwrap_or_default();
+
+                ctx.agent_context.previous_output = serde_json::json!({
+                    "original_plan": plan_output.data,
+                    "triage_feedback": triage_data,
+                    "instruction": "Task is too large (XL). Decompose into S/M/L sub-tasks. Each sub-task must touch at most 2 files.",
+                });
+
+                let replan_output = match planner.execute(&ctx.agent_context).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return self
+                            .fail(
+                                ctx,
+                                PipelineStatus::PlanFailed,
+                                format!("XL replan failed: {e}"),
+                            )
+                            .await;
+                    }
+                };
+                self.emit(&mut ctx, EventKind::PlanCreated, replan_output.data.clone());
+                ctx.stage_outputs
+                    .insert("plan".into(), replan_output.clone());
+                plan_output = replan_output;
+
+                // XL replan should produce a decomposition.
+                if let Some(decomposition) = plan_output.data.get("decomposition")
+                    && decomposition.is_array()
+                    && !decomposition.as_array().unwrap().is_empty()
+                {
+                    let budget = self.router.budget_summary().await;
+                    return PipelineResult {
+                        status: PipelineStatus::Decomposed,
+                        stage_outputs: ctx.stage_outputs,
+                        events: ctx.events,
+                        budget,
+                        pr_url: None,
+                        branch: None,
+                        error: None,
+                        outcome_context: None,
+                    };
+                }
+                // If replan didn't decompose, fall through with the new plan.
+            }
 
             if triage_verdict == "already_done" {
                 info!(task_id, "architect triage: work already done, skipping");
@@ -709,6 +782,15 @@ impl EngineeringPipeline {
                 }
             }
         }
+
+        // Resize budget to triage-assigned size.
+        self.router.resize_budget(task_size.max_tokens()).await;
+        info!(
+            task_id,
+            ?task_size,
+            max_tokens = task_size.max_tokens(),
+            "budget sized by triage"
+        );
 
         // Strip repo context from objective — the planner already consumed it;
         // downstream agents (implementer, debugger, etc.) don't need the full
@@ -819,7 +901,7 @@ impl EngineeringPipeline {
         let implementer = ImplementerAgent::new(
             Arc::clone(&self.router),
             impl_dispatcher,
-            self.config.limits.max_tool_turns,
+            task_size.max_tool_turns(),
             self.config.limits.max_stuck_turns,
         );
         let impl_output = match implementer.execute(&ctx.agent_context).await {
@@ -5585,6 +5667,240 @@ mod tests {
         assert!(
             result.stage_outputs.contains_key("archive"),
             "archivist should run for non-eligible tasks"
+        );
+    }
+
+    // --- task sizing tests ---
+
+    /// Mock responses for a pipeline run with triage returning task_size "S".
+    /// Same as `pipeline_mock_responses()` but triage includes `task_size`.
+    fn pipeline_mock_responses_with_task_size(
+        task_size: &str,
+    ) -> Vec<glitchlab_router::RouterResponse> {
+        vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "trivial", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed with task_size
+            final_response(&format!(
+                r#"{{"verdict": "proceed", "task_size": "{task_size}", "sizing_rationale": "test", "confidence": 0.9, "reasoning": "ok", "evidence": [], "architectural_notes": "", "suggested_changes": []}}"#,
+            )),
+            // 3. Implementer — write_file tool call
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() {}\n"}),
+            }]),
+            // 4. Implementer — final metadata
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: add greet", "summary": "done"}"#,
+            ),
+            // 5. Security
+            final_response(r#"{"verdict": "pass", "issues": [], "summary": "no issues"}"#),
+            // 6. Release
+            final_response(
+                r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
+            ),
+            // 7. Archivist
+            final_response(
+                r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
+            ),
+            // 8. Architect review — merge
+            final_response(
+                r#"{"verdict": "merge", "confidence": 0.9, "reasoning": "good", "quality_score": 8, "issues": [], "architectural_fitness": "good", "merge_strategy": "squash"}"#,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn pipeline_triage_sizing_applies_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses_with_task_size("S"));
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router.clone(), config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-sizing-s",
+                "Add a small function",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated
+                || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+
+        // Budget should have been resized to S (15,000 tokens).
+        let summary = router.budget_summary().await;
+        // After resize_budget(15_000), the tracker's max_tokens is 15_000.
+        // tokens_remaining = max_tokens - used. Since tokens were used,
+        // the remaining should be ≤ 15_000.
+        assert!(
+            summary.tokens_remaining <= 15_000,
+            "budget should be resized to S (15k), got remaining: {}",
+            summary.tokens_remaining
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_triage_sizing_l() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses_with_task_size("L"));
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router.clone(), config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-sizing-l",
+                "Implement new module",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated
+                || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+
+        // Budget should have been resized to L (60,000 tokens).
+        let summary = router.budget_summary().await;
+        assert!(
+            summary.tokens_remaining <= 60_000,
+            "budget should be resized to L (60k), got remaining: {}",
+            summary.tokens_remaining
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_triage_xl_forces_decomposition() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — multi-file task
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "refactor", "files": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "action": "modify"}], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "requires_core_change": false, "risk_level": "high", "risk_notes": "big change", "test_strategy": [], "estimated_complexity": "large", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — XL (forces decomposition)
+            final_response(
+                r#"{"verdict": "proceed", "task_size": "XL", "sizing_rationale": "4+ files", "confidence": 0.9, "reasoning": "too large", "evidence": [], "architectural_notes": "", "suggested_changes": ["decompose"]}"#,
+            ),
+            // 3. Re-plan (triggered by XL) — produces decomposition
+            final_response(
+                r#"{"steps": [], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "requires_core_change": false, "risk_level": "medium", "risk_notes": "decomposed", "test_strategy": [], "estimated_complexity": "large", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "t1-part1", "objective": "refactor a.rs", "files_likely_affected": ["src/a.rs"], "depends_on": []}, {"id": "t1-part2", "objective": "refactor b.rs", "files_likely_affected": ["src/b.rs"], "depends_on": ["t1-part1"]}]}"#,
+            ),
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-xl-decompose",
+                "Large refactor across 4 files",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::Decomposed,
+            "XL task should be decomposed, got {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+
+        // Plan should contain the decomposition.
+        let plan = result.stage_outputs.get("plan").unwrap();
+        assert!(
+            plan.data.get("decomposition").is_some(),
+            "decomposed plan should have decomposition field"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_short_circuit_uses_task_size_s() {
+        // Short-circuit tasks should use TaskSize::S budget (15k tokens, 3 turns).
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let router = sequential_router_ref(short_circuit_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 2;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router.clone(), config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-short-circuit-size",
+                "Add a comment",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated
+                || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+
+        // Budget should be resized to S (15,000 tokens) for short-circuit.
+        let summary = router.budget_summary().await;
+        assert!(
+            summary.tokens_remaining <= 15_000,
+            "short-circuit should use S budget (15k), got remaining: {}",
+            summary.tokens_remaining
         );
     }
 }

@@ -10,8 +10,8 @@ boundaries:
     - ".glitchlab/config.yaml"
 
 limits:
-  max_tool_turns: 15
-  max_tokens_per_task: 120000
+  max_tool_turns: 12
+  max_tokens_per_task: 60000
   max_dollars_per_task: 0.50
   max_total_tasks: 200
   max_remediation_depth: 1

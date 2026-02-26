@@ -318,9 +318,10 @@ tasks:
     `#[cfg(test)]` block starting around line 111. Use `read_file` to read
     the full file.
   priority: 300
-  status: in_progress
+  status: failed
   depends_on: []
   decomposition_depth: 0
+  error: no changes produced — implementer output resulted in an empty commit
   remediation_depth: 0
   is_remediation: false
 - id: test-archivist-parse-error
@@ -331,9 +332,10 @@ tasks:
     verify the output contains `parse_error: true`. The existing `#[cfg(test)]`
     block starts around line 100. Use `read_file` to read the full file.
   priority: 320
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
+  error: debugger recommends not retrying
   remediation_depth: 0
   is_remediation: false
 - id: test-release-parse-error
@@ -344,9 +346,10 @@ tasks:
     with `parse_error: true`. The existing `#[cfg(test)]` block starts around
     line 101. Use `read_file` to read the full file.
   priority: 340
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
+  error: 'implementer failed: parse_error'
   remediation_depth: 0
   is_remediation: false
 - id: test-architect-triage-parse-error
@@ -358,9 +361,10 @@ tasks:
     `parse_error: true`. The existing `#[cfg(test)]` block starts around
     line 207. Use `read_file` to read the full file.
   priority: 350
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
+  error: 'debugger failed: budget exceeded: token limit exceeded: 126498 / 120000 tokens used'
   remediation_depth: 0
   is_remediation: false
 - id: test-architect-review-parse-error
@@ -371,9 +375,10 @@ tasks:
     `parse_error: true` in the output. Add to the existing `#[cfg(test)]`
     block around line 207. Use `read_file` to read the full file.
   priority: 360
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
+  error: 'budget exceeded: token limit exceeded: 124580 / 120000 tokens used'
   remediation_depth: 0
   is_remediation: false
 - id: status-md-update
@@ -388,9 +393,10 @@ tasks:
     (7) a brief "what works" section listing proven capabilities. Keep it
     under 50 lines. This is a Markdown file, not compiled.
   priority: 400
-  status: pending
+  status: completed
   depends_on: []
   decomposition_depth: 0
+  pr_url: https://github.com/kitplummer/glitchlab/pull/55
   remediation_depth: 0
   is_remediation: false
 - id: model-pool-config-doc
@@ -404,9 +410,10 @@ tasks:
     and quality-focused setups. Reference `crates/router/src/chooser.rs` for
     the implementation. Keep under 80 lines.
   priority: 440
-  status: pending
+  status: completed
   depends_on: []
   decomposition_depth: 0
+  pr_url: https://github.com/kitplummer/glitchlab/pull/56
   remediation_depth: 0
   is_remediation: false
 - id: readme-update
@@ -432,7 +439,7 @@ tasks:
     and unit tests for the enum. The `EngineeringPipeline` struct is near the
     top of the file. Use `read_file` to read lines 1-60 to find it.
   priority: 500
-  status: pending
+  status: completed
   depends_on: []
   decomposition_depth: 0
   remediation_depth: 0
@@ -449,7 +456,7 @@ tasks:
     with a temp `.rs` file containing `#[cfg(test)]`. The `is_test_file()`
     function starts around line 218. Use `read_file` to read lines 216-246.
   priority: 540
-  status: pending
+  status: completed
   depends_on: []
   decomposition_depth: 0
   remediation_depth: 0
@@ -472,9 +479,10 @@ tasks:
     Expected outcome: Failed with BoundaryViolation, TQM pattern detected,
     Circuit escalates. This validates the entire self-repair path.
   priority: 550
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
+  error: 'objective references protected path(s): crates/kernel, crates/kernel/src/agent.rs'
   remediation_depth: 0
   is_remediation: false
 - id: circuit-fix-0-7371f136
@@ -583,5 +591,133 @@ tasks:
   depends_on: []
   decomposition_depth: 1
   error: 'budget exceeded: token limit exceeded: 132072 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
+- id: circuit-fix-0-0708e44b
+  objective: Investigate and fix the parsing logic in the archivist component that is causing 'test-archivist-parse-error' to fail.
+  priority: 2
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 1
+  is_remediation: true
+- id: circuit-fix-1-e72f1a69
+  objective: Investigate and fix the parsing logic in the architect component that is causing 'test-architect-triage-parse-error' to fail.
+  priority: 2
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 1
+  is_remediation: true
+- id: archivist-parse-fix-part1
+  objective: Investigate the parsing logic within the Rust archivist agent to identify the root cause of the 'test-archivist-parse-error'. Focus on how the agent processes input or internal data structures.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'implementer failed: repeated_results'
+  remediation_depth: 0
+  is_remediation: false
+- id: archivist-parse-fix-part2
+  objective: Implement the necessary fix to the identified parsing logic in `crates/eng-org/src/agents/archivist.rs` and add a new, targeted test case to `crates/eng-org/tests/memory_integration.rs` (or a new dedicated test file) that reproduces the original parse error and verifies the correction.
+  priority: 50
+  status: pending
+  depends_on:
+  - archivist-parse-fix-part1
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: architect-parse-fix-part1
+  objective: Investigate the parsing logic within `crates/eng-org/src/agents/architect.rs` to understand how it processes input during the triage phase and identify potential causes for 'token limit exceeded' errors. Pay close attention to any calls to shared parsing utilities in `crates/eng-org/src/agents/parse.rs`.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: no changes produced — implementer output resulted in an empty commit
+  remediation_depth: 0
+  is_remediation: false
+- id: architect-parse-fix-part2
+  objective: Implement a fix for the identified parsing issue in `crates/eng-org/src/agents/architect.rs` (or `crates/eng-org/src/agents/parse.rs` if the root cause is there). The fix should address the 'token limit exceeded' error, potentially by optimizing parsing, adding input size validation, or handling malformed/large inputs more robustly.
+  priority: 50
+  status: pending
+  depends_on:
+  - architect-parse-fix-part1
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: add-pipeline-mode-enum
+  objective: Add the `PipelineMode` enum with `Full`, `PlanOnly`, `SkipSecurity`, `DryRun` variants to `crates/eng-org/src/pipeline.rs`, implement `std::fmt::Display` for it, and add unit tests.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'budget exceeded: token limit exceeded: 120753 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
+- id: add-mode-to-engineering-pipeline
+  objective: 'Add a `pub pipeline_mode: PipelineMode` field to the `EngineeringPipeline` struct in `crates/eng-org/src/pipeline.rs` and initialize it to `PipelineMode::Full` in its constructor.'
+  priority: 50
+  status: pending
+  depends_on:
+  - add-pipeline-mode-enum
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: gate-pipeline-stages
+  objective: Modify the `EngineeringPipeline`'s `run` method (or related stage-specific methods) in `crates/eng-org/src/pipeline.rs` to gate the security review and PR creation stages based on the `pipeline_mode` field.
+  priority: 50
+  status: pending
+  depends_on:
+  - add-mode-to-engineering-pipeline
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: indexer-inline-tests-part1
+  objective: 'Add `has_inline_tests: bool` field to the `RepoIndex` struct in `crates/eng-org/src/indexer.rs`.'
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'budget exceeded: token limit exceeded: 131089 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
+- id: indexer-inline-tests-part2
+  objective: 'Implement a private helper function `has_inline_tests_in_file(path: &Path) -> bool` in `crates/eng-org/src/indexer.rs`. This function should read the first 100 lines of a `.rs` file and check for `#[cfg(test)]` or `#[test]` patterns.'
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'budget exceeded: token limit exceeded: 126036 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
+- id: indexer-inline-tests-part3
+  objective: Extend the `is_test_file()` function in `crates/eng-org/src/indexer.rs` to call `has_inline_tests_in_file()` for `.rs` files that are not already classified as test files by existing path/filename patterns. If `has_inline_tests_in_file()` returns true, `is_test_file()` should also return true.
+  priority: 50
+  status: pending
+  depends_on:
+  - indexer-inline-tests-part2
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: indexer-inline-tests-part4
+  objective: Modify `build_index()` in `crates/eng-org/src/indexer.rs` to track if any `.rs` file was classified as a test file due to inline tests (i.e., `has_inline_tests_in_file()` returned true). Populate the `RepoIndex.has_inline_tests` field with this aggregate boolean value.
+  priority: 50
+  status: pending
+  depends_on:
+  - indexer-inline-tests-part1
+  - indexer-inline-tests-part3
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: indexer-inline-tests-part5
+  objective: Add unit tests in `crates/eng-org/src/indexer.rs` for the new `has_inline_tests_in_file` function, for `is_test_file` with a temporary file containing inline tests, and for `build_index` to verify the `RepoIndex.has_inline_tests` field is correctly set.
+  priority: 50
+  status: pending
+  depends_on:
+  - indexer-inline-tests-part1
+  - indexer-inline-tests-part2
+  - indexer-inline-tests-part3
+  - indexer-inline-tests-part4
+  decomposition_depth: 1
   remediation_depth: 0
   is_remediation: false
