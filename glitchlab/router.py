@@ -191,5 +191,17 @@ class Router:
         )
 
 
+def select_with_fallbacks(primary_model: str, fallback_models: list[str]) -> list[str]:
+    """
+    Returns an ordered list of models, with the primary model first,
+    followed by unique fallback models.
+    """
+    models = [primary_model]
+    for model in fallback_models:
+        if model not in models:
+            models.append(model)
+    return models
+
+
 class BudgetExceededError(Exception):
     pass
