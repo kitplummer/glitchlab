@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod indexer;
 pub mod orchestrator;
 pub mod pipeline;
+pub mod policy;
 pub mod taskqueue;
 pub mod tools;
 pub mod tqm;
