@@ -175,7 +175,7 @@ pub(crate) fn prune_messages(messages: &mut [Message], budget: usize) {
     let protect_tail = 4.min(len);
     let protect_tail_start = len.saturating_sub(protect_tail);
 
-    for msg in &mut messages[protect_head..protect_tail_start] {
+    for msg in &mut messages[protect_head..protect_tail_start.max(protect_head)] {
         if let MessageContent::Blocks(blocks) = &mut msg.content {
             for block in blocks.iter_mut() {
                 if let ContentBlock::ToolResult(result) = block {
@@ -1545,5 +1545,38 @@ mod tests {
             ),
             "expected Stuck(RepeatedResults), got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn prune_messages_empty() {
+        let mut messages: Vec<Message> = vec![];
+        prune_messages(&mut messages, 10);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn prune_messages_single_message() {
+        let mut messages = vec![Message {
+            role: MessageRole::System,
+            content: MessageContent::Text("system prompt".into()),
+        }];
+        prune_messages(&mut messages, 10);
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn prune_messages_two_messages() {
+        let mut messages = vec![
+            Message {
+                role: MessageRole::System,
+                content: MessageContent::Text("system prompt".into()),
+            },
+            Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("user message".into()),
+            },
+        ];
+        prune_messages(&mut messages, 10);
+        assert_eq!(messages.len(), 2);
     }
 }

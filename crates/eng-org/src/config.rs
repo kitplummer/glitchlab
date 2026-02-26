@@ -106,6 +106,10 @@ fn default_restart_intensity_window_secs() -> u64 {
     300
 }
 
+fn default_max_total_tasks() -> u32 {
+    200
+}
+
 /// Configuration for a model in the cost-aware pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfileConfig {
@@ -156,6 +160,10 @@ pub struct LimitsConfig {
     /// Time window in seconds for restart intensity tracking.
     #[serde(default = "default_restart_intensity_window_secs")]
     pub restart_intensity_window_secs: u64,
+    /// Maximum total tasks in the queue before the orchestrator halts.
+    /// Prevents unbounded task proliferation from decomposition loops.
+    #[serde(default = "default_max_total_tasks")]
+    pub max_total_tasks: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +232,7 @@ impl Default for EngConfig {
                 max_decomposition_depth: 3,
                 restart_intensity_max_failures: 5,
                 restart_intensity_window_secs: 300,
+                max_total_tasks: default_max_total_tasks(),
             },
             intervention: InterventionConfig {
                 pause_after_plan: true,
@@ -1338,6 +1347,41 @@ base_url: http://localhost:8080
         let config = EngConfig::load(Some(dir.path())).unwrap();
         assert_eq!(config.limits.restart_intensity_max_failures, 10);
         assert_eq!(config.limits.restart_intensity_window_secs, 600);
+    }
+
+    #[test]
+    fn max_total_tasks_default() {
+        let config = EngConfig::default();
+        assert_eq!(config.limits.max_total_tasks, 200);
+    }
+
+    #[test]
+    fn max_total_tasks_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "limits:\n  max_total_tasks: 50\n",
+        )
+        .unwrap();
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(config.limits.max_total_tasks, 50);
+    }
+
+    #[test]
+    fn max_total_tasks_backward_compat() {
+        // Configs without max_total_tasks should still parse with default.
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "limits:\n  max_tool_turns: 10\n",
+        )
+        .unwrap();
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(config.limits.max_total_tasks, 200);
     }
 
     #[test]

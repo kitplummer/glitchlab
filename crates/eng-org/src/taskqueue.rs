@@ -216,6 +216,16 @@ impl TaskQueue {
         })
     }
 
+    /// Total number of tasks in the queue (all statuses).
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    /// Returns `true` if the queue contains no tasks.
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
     /// All tasks (read-only).
     pub fn tasks(&self) -> &[Task] {
         &self.tasks

@@ -460,7 +460,7 @@ impl EngineeringPipeline {
         // --- Stage 3: Plan ---
         ctx.current_stage = Some("plan".into());
         let planner = PlannerAgent::new(Arc::clone(&self.router));
-        let plan_output = match planner.execute(&ctx.agent_context).await {
+        let mut plan_output = match planner.execute(&ctx.agent_context).await {
             Ok(o) => o,
             Err(e) => {
                 return self
@@ -564,6 +564,58 @@ impl EngineeringPipeline {
                 error: None,
                 outcome_context: None,
             };
+        }
+
+        if triage_verdict == "needs_refinement" {
+            info!(task_id, "architect triage: refinement needed, replanning");
+
+            let triage_data = ctx
+                .stage_outputs
+                .get("architect_triage")
+                .map(|o| o.data.clone())
+                .unwrap_or_default();
+
+            ctx.agent_context.previous_output = serde_json::json!({
+                "original_plan": plan_output.data,
+                "triage_feedback": triage_data,
+                "instruction": "The architect reviewed your plan and requested refinements. Revise the plan addressing every issue in triage_feedback.suggested_changes.",
+            });
+
+            // Re-invoke planner (max 1 replan — no recursion).
+            let replan_output = match planner.execute(&ctx.agent_context).await {
+                Ok(o) => o,
+                Err(e) => {
+                    return self
+                        .fail(
+                            ctx,
+                            PipelineStatus::PlanFailed,
+                            format!("replan failed: {e}"),
+                        )
+                        .await;
+                }
+            };
+            self.emit(&mut ctx, EventKind::PlanCreated, replan_output.data.clone());
+            ctx.stage_outputs
+                .insert("plan".into(), replan_output.clone());
+            plan_output = replan_output;
+
+            // Re-check for decomposition (same logic as Stage 3b).
+            if let Some(decomposition) = plan_output.data.get("decomposition")
+                && decomposition.is_array()
+                && !decomposition.as_array().unwrap().is_empty()
+            {
+                let budget = self.router.budget_summary().await;
+                return PipelineResult {
+                    status: PipelineStatus::Decomposed,
+                    stage_outputs: ctx.stage_outputs,
+                    events: ctx.events,
+                    budget,
+                    pr_url: None,
+                    branch: None,
+                    error: None,
+                    outcome_context: None,
+                };
+            }
         }
 
         // Strip repo context from objective — the planner already consumed it;
@@ -1003,17 +1055,36 @@ impl EngineeringPipeline {
                     .await;
             }
             "request_changes" => {
-                info!(task_id, "architect review: changes requested, stopping");
+                info!(task_id, "architect review: changes requested");
+
+                let review_data = ctx.stage_outputs.get("architect_review").map(|o| &o.data);
+                let issues_summary = review_data
+                    .and_then(|d| d.get("issues"))
+                    .map(|i| i.to_string())
+                    .unwrap_or_default();
+                let reasoning = review_data
+                    .and_then(|d| d.get("reasoning"))
+                    .and_then(|r| r.as_str())
+                    .map(String::from);
+
                 let budget = self.router.budget_summary().await;
                 return PipelineResult {
-                    status: PipelineStatus::Committed,
+                    status: PipelineStatus::Retryable,
                     stage_outputs: ctx.stage_outputs,
                     events: ctx.events,
                     budget,
                     pr_url: None,
                     branch: Some(workspace.branch_name().into()),
-                    error: Some("architect review requested changes".into()),
-                    outcome_context: None,
+                    error: Some(format!("architect requested changes: {issues_summary}")),
+                    outcome_context: Some(OutcomeContext {
+                        approach: "implementation completed but architect requested changes".into(),
+                        obstacle: glitchlab_kernel::outcome::ObstacleKind::ArchitecturalGap {
+                            description: issues_summary,
+                        },
+                        discoveries: vec![],
+                        recommendation: reasoning,
+                        files_explored: vec![],
+                    }),
                 };
             }
             _ => {
@@ -2812,17 +2883,18 @@ mod tests {
             )
             .await;
 
-        assert_eq!(result.status, PipelineStatus::Committed);
+        assert_eq!(result.status, PipelineStatus::Retryable);
         assert!(result.error.is_some());
         assert!(
             result
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("architect review requested changes")
+                .contains("architect requested changes")
         );
         assert!(result.branch.is_some());
         assert!(result.pr_url.is_none());
+        assert!(result.outcome_context.is_some());
     }
 
     #[tokio::test]
@@ -3785,6 +3857,195 @@ mod tests {
         assert!(
             !result.stage_outputs.contains_key("debug_1"),
             "should not have debug stage"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_triage_needs_refinement_triggers_replan() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — initial plan
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — needs_refinement
+            final_response(
+                r#"{"verdict": "needs_refinement", "confidence": 0.8, "reasoning": "plan missing error handling", "evidence": [], "architectural_notes": "", "suggested_changes": ["add error handling for edge cases"]}"#,
+            ),
+            // 3. Planner — revised plan (after replan)
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature with error handling"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 4. Implementer — write_file
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() -> Result<(), String> { Ok(()) }\n"}),
+            }]),
+            // 5. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: greet with error handling", "summary": "done"}"#,
+            ),
+            // 6. Security
+            final_response(r#"{"verdict": "pass", "issues": [], "summary": "ok"}"#),
+            // 7. Release
+            final_response(
+                r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
+            ),
+            // 8. Archivist
+            final_response(
+                r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
+            ),
+            // 9. Architect review — merge
+            final_response(
+                r#"{"verdict": "merge", "confidence": 0.9, "reasoning": "good", "quality_score": 8, "issues": [], "architectural_fitness": "good", "merge_strategy": "squash"}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-needs-refinement",
+                "Add greet function",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        // Should have proceeded past triage (planner called twice).
+        assert!(
+            result.stage_outputs.contains_key("architect_triage"),
+            "expected architect_triage stage output"
+        );
+        assert!(
+            result.stage_outputs.contains_key("plan"),
+            "expected plan stage output"
+        );
+        // Two PlanCreated events: original + replan.
+        let plan_events: Vec<_> = result
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::PlanCreated)
+            .collect();
+        assert_eq!(
+            plan_events.len(),
+            2,
+            "expected 2 PlanCreated events (original + replan), got {}",
+            plan_events.len()
+        );
+        // Implementation should have been attempted (we got past triage).
+        assert!(
+            result.stage_outputs.contains_key("implement"),
+            "expected implement stage output — replan should have proceeded to implementation"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_review_request_changes_returns_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "not done", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+            // 3. Implementer — write_file
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn greet() {}\n"}),
+            }]),
+            // 4. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: greet", "summary": "done"}"#,
+            ),
+            // 5. Security
+            final_response(r#"{"verdict": "pass", "issues": [], "summary": "ok"}"#),
+            // 6. Release
+            final_response(
+                r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
+            ),
+            // 7. Archivist
+            final_response(
+                r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
+            ),
+            // 8. Architect review — request_changes with issues
+            final_response(
+                r#"{"verdict": "request_changes", "confidence": 0.7, "reasoning": "needs tests and error handling", "quality_score": 4, "issues": [{"severity": "high", "description": "no tests", "suggestion": "add unit tests"}, {"severity": "medium", "description": "no error handling", "suggestion": "add Result return type"}], "architectural_fitness": "poor", "merge_strategy": "squash"}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-review-retryable",
+                "Add greet function",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::Retryable,
+            "expected Retryable, got {:?}",
+            result.status
+        );
+        assert!(result.error.is_some());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("architect requested changes"),
+            "error should mention architect requested changes"
+        );
+        assert!(result.branch.is_some());
+        assert!(result.pr_url.is_none());
+
+        // outcome_context should be populated with architect feedback
+        let oc = result
+            .outcome_context
+            .expect("outcome_context should be populated");
+        assert!(
+            oc.approach.contains("architect requested changes"),
+            "approach should mention architect"
+        );
+        assert!(
+            matches!(
+                oc.obstacle,
+                glitchlab_kernel::outcome::ObstacleKind::ArchitecturalGap { .. }
+            ),
+            "obstacle should be ArchitecturalGap"
+        );
+        assert!(
+            oc.recommendation.is_some(),
+            "recommendation should contain architect reasoning"
         );
     }
 }
