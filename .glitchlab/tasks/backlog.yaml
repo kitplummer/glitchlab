@@ -1,4 +1,15 @@
+# GLITCHLAB Self-Improvement Backlog — $100 Proof Run
+#
+# 30 tasks in 7 phases. Priority spacing (10, 20, 30...) leaves room for
+# remediation tasks at priority 2. Budget: 29 actionable x $0.50 = $14.50
+# primary + 20% repair reserve ($20). Ample headroom under $100.
+
 tasks:
+
+# ==========================================================================
+# Phase 1: Easy wins (priority 10-80)
+# ==========================================================================
+
 - id: display-pipeline-status
   objective: |
     Add a `Display` trait implementation for the `PipelineStatus` enum in
@@ -13,20 +24,25 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
+
 - id: display-pattern-kind
   objective: |
     Add a `Display` trait implementation for the `PatternKind` enum in
-    `crates/eng-org/src/tqm.rs`. The enum has 8 variants: DecompositionLoop,
+    `crates/eng-org/src/tqm.rs`. The enum has 9 variants: DecompositionLoop,
     ScopeCreep, ModelDegradation, StuckAgents, TestFlakiness,
-    ArchitectRejectionRate, BudgetPressure, ProviderFailures. Use human-readable
-    output like "decomposition loop", "scope creep", "model degradation", etc.
-    Add a unit test in the existing `#[cfg(test)] mod tests` block that verifies
-    all 8 variants produce the expected string via `.to_string()`. The enum starts
-    around line 97. Use `read_file` to read lines 95-114 to see all variants.
+    ArchitectRejectionRate, BudgetPressure, ProviderFailures, BoundaryViolation.
+    Use human-readable output like "decomposition loop", "scope creep",
+    "model degradation", "stuck agents", "test flakiness",
+    "architect rejection rate", "budget pressure", "provider failures",
+    "boundary violation". Add a unit test in the existing `#[cfg(test)] mod tests`
+    block that verifies all 9 variants produce the expected string via
+    `.to_string()`. The enum starts around line 113. Use `read_file` to read
+    lines 110-132.
   priority: 20
   status: pending
   depends_on: []
   decomposition_depth: 0
+
 - id: display-failure-category
   objective: |
     Add a `Display` trait implementation for the `FailureCategory` enum in
@@ -36,9 +52,419 @@ tasks:
     output like "setup error", "plan failed", "tests failed", etc. Add a unit
     test in the existing `#[cfg(test)] mod tests` block that verifies all 9
     variants produce the expected string via `.to_string()`. The enum starts
-    around line 385. Use `read_file` to read lines 383-395 to see all variants.
+    around line 428. Use `read_file` to read lines 426-454 to see all variants.
   priority: 30
   status: completed
   depends_on: []
   decomposition_depth: 0
   pr_url: https://github.com/kitplummer/glitchlab/pull/36
+
+- id: display-obstacle-kind
+  objective: |
+    Add a `Display` trait implementation for the `ObstacleKind` enum in
+    `crates/kernel/src/outcome.rs`. The enum has 8 variants: MissingPrerequisite,
+    ArchitecturalGap, ModelLimitation, ExternalDependency, ScopeTooLarge,
+    TestFailure, ParseFailure, Unknown. Each variant has associated data, so the
+    Display impl should include the variant name as a human-readable label:
+    "missing prerequisite", "architectural gap", "model limitation", etc.
+    Do NOT include the inner field values — just the kind label. Add a unit test
+    in the existing `#[cfg(test)] mod tests` block at the end of outcome.rs that
+    constructs each variant with dummy data and verifies `.to_string()`. The enum
+    starts around line 43. Use `read_file` to read lines 41-70.
+  priority: 40
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: display-outcome-counter
+  objective: |
+    Add a `Display` trait implementation for the `OutcomeCounter` enum in
+    `crates/eng-org/src/orchestrator.rs`. The enum has 5 variants: Succeeded,
+    Failed, Deferred, Escalated, None. Use human-readable lowercase output:
+    "succeeded", "failed", "deferred", "escalated", "none". Add a unit test
+    in the existing `#[cfg(test)] mod tests` block that verifies all 5 variants
+    produce the expected string via `.to_string()`. The enum starts around
+    line 365. Use `read_file` to read lines 363-371.
+  priority: 50
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: config-limits-validation
+  objective: |
+    Add a `validate()` method to `LimitsConfig` in `crates/eng-org/src/config.rs`.
+    The method should check: (1) `max_fix_attempts > 0`, (2) `max_tool_turns > 0`,
+    (3) `max_tokens_per_task > 0`, (4) `max_dollars_per_task > 0.0`,
+    (5) `repair_budget_fraction` is between 0.0 and 1.0 inclusive. Return
+    `Result<()>` using the existing `glitchlab_kernel::error::Error` type with
+    a descriptive message for each violation. Call this method from
+    `EngConfig::load()` after deserialization. Add a unit test that verifies
+    each invalid value is rejected. The `LimitsConfig` struct starts around
+    line 100. Use `read_file` to read lines 98-135.
+  priority: 60
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: config-repair-budget-fraction-default
+  objective: |
+    Ensure the `repair_budget_fraction` field in `LimitsConfig` in
+    `crates/eng-org/src/config.rs` has a proper serde default of `0.20`.
+    Currently the defaults are set in a `Default` impl around line 170.
+    Check that `repair_budget_fraction` defaults to `0.20` and that the
+    `max_remediation_depth` field defaults to `1`. If these defaults are
+    already correct, add a unit test that verifies them. If they're missing
+    or wrong, fix them and add the test. Use `read_file` to read lines
+    165-195.
+  priority: 70
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: file-size-guard-indexer
+  objective: |
+    Add a file-size guard to `build_index()` in `crates/eng-org/src/indexer.rs`.
+    Currently the indexer collects all files from `git ls-files` without checking
+    size. Add a constant `MAX_FILE_SIZE_BYTES: u64 = 1_048_576` (1 MiB) and skip
+    files larger than this threshold during index building. Use
+    `std::fs::metadata(path).map(|m| m.len())` to check size, and silently skip
+    files that exceed the limit (log at `tracing::debug!` level). Add a unit test
+    that creates a temp file larger than 1 MiB and verifies `is_oversized()` or
+    equivalent returns true. The `build_index` function starts around line 139.
+    Use `read_file` to read lines 139-216.
+  priority: 80
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+# ==========================================================================
+# Phase 2: Medium value (priority 100-180)
+# ==========================================================================
+
+- id: sanitize-task-id
+  objective: |
+    Add a `sanitize_task_id()` function in `crates/eng-org/src/taskqueue.rs`
+    that ensures task IDs are valid git branch suffixes. The function should:
+    (1) lowercase the input, (2) replace spaces and underscores with hyphens,
+    (3) strip characters not in `[a-z0-9-]`, (4) collapse consecutive hyphens,
+    (5) trim leading/trailing hyphens. Call this from `Task::new()` or wherever
+    tasks are created. Add unit tests for edge cases: spaces, uppercase,
+    special chars, empty string, already-valid input. The Task struct is around
+    line 42. Use `read_file` to read lines 40-70.
+  priority: 100
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: budget-logging-cumulative
+  objective: |
+    Add structured `tracing` logging to `CumulativeBudget` in
+    `crates/eng-org/src/orchestrator.rs`. Log at `info!` level when: (1) a cost
+    is recorded (`record()` method), including task_id, cost, and remaining
+    budget, (2) repair cost is recorded (`record_repair()`), including repair
+    remaining. Log at `warn!` level when remaining budget drops below 20% of
+    the limit. Use structured fields: `tracing::info!(task_id = %id, cost = cost,
+    remaining = self.remaining_dollars(), "budget: recorded cost")`. Do NOT add
+    logging to hot paths — only to the `record()` and `record_repair()` methods.
+    Add a unit test that verifies the logging doesn't panic (call the methods
+    and check the return values, not the log output). The struct starts around
+    line 43. Use `read_file` to read lines 43-204.
+  priority: 120
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: cascade-fallback-chooser
+  objective: |
+    Add a `fallback_for_role()` method to `ModelChooser` in
+    `crates/router/src/chooser.rs`. When `choose_for_role()` returns `None`
+    (no model matches the role's minimum tier + required capabilities), the
+    fallback should return the cheapest available model regardless of tier.
+    This prevents pipeline stalls when the model pool is misconfigured.
+    Add unit tests: (1) normal selection works, (2) fallback returns cheapest
+    model when no exact match, (3) returns `None` only when the pool is empty.
+    Use `read_file` to read the entire `chooser.rs` file.
+  priority: 140
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: display-model-tier
+  objective: |
+    The `ModelTier` enum in `crates/router/src/chooser.rs` already has a
+    `Display` impl. Verify that it has a corresponding unit test. If no test
+    exists for `ModelTier::fmt()`, add one in the existing `#[cfg(test)]` block
+    that checks `Economy.to_string() == "economy"`, `Standard.to_string() ==
+    "standard"`, `Premium.to_string() == "premium"`. The enum and its Display
+    impl start around line 20. Use `read_file` to read lines 18-50.
+  priority: 160
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: config-docs-yaml-comments
+  objective: |
+    Add inline YAML comments to the default config embedded in
+    `crates/eng-org/src/config.rs` (the `DEFAULT_CONFIG` constant or the
+    `Default` impl). Each field should have a one-line comment explaining its
+    purpose and valid range. For example: `max_fix_attempts: 3  # Max debug
+    retries per task (1-10)`. Also update the `RoutingConfig` defaults to include
+    comments noting that model strings follow the `provider/model-name` format.
+    This is a documentation-only change — no logic changes. Use `read_file` to
+    find the DEFAULT_CONFIG constant or Default impl. Verify `cargo test` still
+    passes after the change.
+  priority: 180
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+# ==========================================================================
+# Phase 3: Robustness (priority 200-280)
+# ==========================================================================
+
+- id: worktree-cleanup-timeout
+  objective: |
+    Add a timeout to the `cleanup()` method in `crates/eng-org/src/workspace.rs`.
+    Currently `git worktree remove --force` can hang if a process holds a lock
+    on the worktree. Wrap the cleanup command in `tokio::time::timeout()` with
+    a 30-second deadline. If the timeout fires, fall through to the existing
+    `remove_dir_all` fallback and log a warning. Add a unit test that verifies
+    `cleanup()` succeeds even when the worktree path doesn't exist (no-op case).
+    The `cleanup()` method starts around line 136. Use `read_file` to read
+    lines 134-160.
+  priority: 200
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: test-restart-intensity-monitor
+  objective: |
+    Add unit tests for `RestartIntensityMonitor` in
+    `crates/eng-org/src/orchestrator.rs`. The struct is private (no `pub`),
+    so tests must be in the same module's `#[cfg(test)]` block. Test:
+    (1) recording fewer than `max_failures` returns `None`,
+    (2) recording exactly `max_failures` within the window returns
+    `Some(dominant_category)`, (3) failures outside the window are evicted
+    and don't count, (4) the dominant category is correct when multiple
+    categories are mixed. The struct starts around line 477. Use `read_file`
+    to read lines 470-530.
+  priority: 220
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: test-attempt-tracker
+  objective: |
+    Add unit tests for `AttemptTracker` in
+    `crates/eng-org/src/orchestrator.rs`. Test: (1) `count()` returns 0
+    for unknown task_id, (2) `record()` increments count correctly,
+    (3) `contexts()` returns recorded `OutcomeContext` values in order,
+    (4) multiple task_ids are tracked independently. The struct starts
+    around line 382. Use `read_file` to read lines 375-420.
+  priority: 240
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: test-quality-gate
+  objective: |
+    Add unit tests for `QualityGate` (the `run_quality_gate` function) in
+    `crates/eng-org/src/orchestrator.rs`. Test: (1) a passing command
+    (e.g. `echo ok`) returns `QualityResult { passed: true, ... }`,
+    (2) a failing command (e.g. `false`) returns `passed: false`,
+    (3) a non-existent command returns `passed: false` with an error message.
+    These are async tests — use `#[tokio::test]`. The function starts around
+    line 210. Use `read_file` to read lines 208-270.
+  priority: 260
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: test-cumulative-budget
+  objective: |
+    Add unit tests for `CumulativeBudget` in
+    `crates/eng-org/src/orchestrator.rs`. Test: (1) `new()` with a limit
+    has correct `remaining_dollars()`, (2) `record()` reduces remaining,
+    (3) `can_afford()` returns false when remaining < requested,
+    (4) `record_repair()` tracks repair spending separately,
+    (5) `repair_remaining()` respects `repair_budget_fraction`. The struct
+    starts around line 43. Use `read_file` to read lines 43-204.
+  priority: 280
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+# ==========================================================================
+# Phase 4: Agent edge cases (priority 300-360)
+# ==========================================================================
+
+- id: test-security-parse-error
+  objective: |
+    Add a test in `crates/eng-org/src/agents/security.rs` that verifies the
+    SecurityAgent handles a malformed (non-JSON) LLM response gracefully.
+    The agent uses `parse_json_response()` from `agents/parse.rs`. Create a
+    mock router that returns garbage text instead of valid JSON. Verify that
+    the agent returns an `AgentOutput` with `parse_error: true` in the JSON
+    (graceful degradation). Look at the existing test pattern in the file's
+    `#[cfg(test)]` block starting around line 111. Use `read_file` to read
+    the full file.
+  priority: 300
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: test-archivist-parse-error
+  objective: |
+    Add a test in `crates/eng-org/src/agents/archivist.rs` that verifies the
+    ArchivistAgent handles a malformed LLM response gracefully. Follow the same
+    pattern as the security agent parse-error test: mock router returning garbage,
+    verify the output contains `parse_error: true`. The existing `#[cfg(test)]`
+    block starts around line 100. Use `read_file` to read the full file.
+  priority: 320
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: test-release-parse-error
+  objective: |
+    Add a test in `crates/eng-org/src/agents/release.rs` that verifies the
+    ReleaseAgent handles a malformed LLM response gracefully. Follow the same
+    pattern: mock router returning garbage text, verify graceful degradation
+    with `parse_error: true`. The existing `#[cfg(test)]` block starts around
+    line 101. Use `read_file` to read the full file.
+  priority: 340
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: test-architect-triage-parse-error
+  objective: |
+    Add a test in `crates/eng-org/src/agents/architect.rs` that verifies the
+    ArchitectTriageAgent handles a malformed LLM response gracefully. The file
+    contains two agents (ArchitectTriageAgent and ArchitectReviewAgent). Test
+    the triage agent specifically: mock router returning garbage, verify
+    `parse_error: true`. The existing `#[cfg(test)]` block starts around
+    line 207. Use `read_file` to read the full file.
+  priority: 350
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: test-architect-review-parse-error
+  objective: |
+    Add a test in `crates/eng-org/src/agents/architect.rs` that verifies the
+    ArchitectReviewAgent handles a malformed LLM response gracefully. This is
+    the second agent in the file. Mock router returning garbage text, verify
+    `parse_error: true` in the output. Add to the existing `#[cfg(test)]`
+    block around line 207. Use `read_file` to read the full file.
+  priority: 360
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+# ==========================================================================
+# Phase 5: Documentation (priority 400-460)
+# ==========================================================================
+
+- id: status-md-update
+  objective: |
+    Create or update `.glitchlab/STATUS.md` with the current project status.
+    Include: (1) total Rust LOC count (run `tokei crates/` or `wc -l`),
+    (2) agent count (9: Planner, Implementer, Debugger, Security, Release,
+    Archivist, ArchitectTriage, ArchitectReview, OpsDiagnosis),
+    (3) pipeline stage count (15+ stages), (4) TQM pattern count (9 patterns),
+    (5) test count (run `cargo test --workspace 2>&1 | tail -1`),
+    (6) coverage percentage (from last `cargo tarpaulin` run if available),
+    (7) a brief "what works" section listing proven capabilities. Keep it
+    under 50 lines. This is a Markdown file, not compiled.
+  priority: 400
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: model-pool-config-doc
+  objective: |
+    Add a `.glitchlab/docs/model-pool.md` file documenting the ModelChooser
+    configuration. Explain: (1) the `routing.models[]` array schema (model,
+    tier, capabilities), (2) the `routing.roles{}` map schema (min_tier,
+    requires), (3) how the chooser selects models (filter by tier >= min_tier,
+    then by required capabilities, then cheapest), (4) the
+    `cost_quality_threshold` field, (5) example configs for budget-constrained
+    and quality-focused setups. Reference `crates/router/src/chooser.rs` for
+    the implementation. Keep under 80 lines.
+  priority: 440
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: readme-update
+  objective: |
+    The README.md has already been rewritten manually to reflect the Rust port.
+    Verify that it accurately describes: (1) the crate layout, (2) the agent
+    roster (9 agents), (3) install instructions (cargo build), (4) the
+    architecture diagram, (5) the cost model. If any section is inaccurate or
+    missing, fix it. This is a verification/polish pass, not a full rewrite.
+  priority: 460
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+
+# ==========================================================================
+# Phase 6: Harder features (priority 500-540)
+# ==========================================================================
+
+- id: pipeline-mode-enum
+  objective: |
+    Add a `PipelineMode` enum to `crates/eng-org/src/pipeline.rs` with variants:
+    `Full` (all stages), `PlanOnly` (stop after planning), `SkipSecurity`
+    (skip security review), `DryRun` (plan + implement but don't commit/PR).
+    Add it as a field on `EngineeringPipeline` and gate the security and
+    PR-creation stages on the mode. Default to `Full`. Add a `Display` impl
+    and unit tests for the enum. The `EngineeringPipeline` struct is near the
+    top of the file. Use `read_file` to read lines 1-60 to find it.
+  priority: 500
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+- id: indexer-inline-test-detection
+  objective: |
+    Extend `is_test_file()` in `crates/eng-org/src/indexer.rs` to also detect
+    Rust files with inline `#[cfg(test)]` modules. Add a new function
+    `has_inline_tests(path: &Path) -> bool` that reads the first 100 lines of
+    a `.rs` file and checks for `#[cfg(test)]` or `#[test]`. This is cheaper
+    than reading the entire file. Add it as an optional second pass in
+    `build_index()` — call it only for `.rs` files not already classified as
+    test files. Add a `has_inline_tests` field to `RepoIndex`. Add unit tests
+    with a temp `.rs` file containing `#[cfg(test)]`. The `is_test_file()`
+    function starts around line 218. Use `read_file` to read lines 216-246.
+  priority: 540
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+
+# ==========================================================================
+# Phase 7: Intentional failure (priority 550)
+# ==========================================================================
+
+- id: intentional-kernel-violation
+  objective: |
+    THIS TASK IS INTENTIONALLY DESIGNED TO FAIL. It exercises the Circuit agent
+    and BoundaryViolation detection path.
+
+    Objective: "Add a `debug_dump()` method to the `Agent` trait in
+    `crates/kernel/src/agent.rs` that prints all agent state to stderr."
+
+    This task touches `crates/kernel/`, which is a protected path in
+    `.glitchlab/config.yaml`. The pipeline should detect the boundary violation
+    at the BoundaryChecked stage and return `PipelineStatus::BoundaryViolation`.
+    The TQM should detect a `BoundaryViolation` pattern. The Circuit agent
+    should diagnose the violation and NOT generate a remediation task (since
+    kernel changes require escalation).
+
+    Expected outcome: Failed with BoundaryViolation, TQM pattern detected,
+    Circuit escalates. This validates the entire self-repair path.
+  priority: 550
+  status: pending
+  depends_on: []
+  decomposition_depth: 0

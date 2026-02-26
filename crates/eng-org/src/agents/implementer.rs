@@ -73,6 +73,13 @@ this JSON:
 Do NOT include file content or patches in your final JSON — your tool calls already wrote
 the files. The final JSON is metadata only.
 
+## Protected paths
+
+Some paths in the repository are protected by project policy and CANNOT be modified.
+If a tool call fails with a message containing "PROTECTED PATH", do NOT retry the same
+edit. Instead, stop immediately and report the issue in your final JSON with
+`"tests_passing": false` and a `"summary"` explaining which path was protected.
+
 Rules:
 - Follow the plan exactly. No feature creep.
 - Keep diffs minimal. Always add/update tests.
@@ -160,6 +167,7 @@ impl Agent for ImplementerAgent {
             let reason_str = match reason {
                 StuckReason::RepeatedResults => "repeated_results",
                 StuckReason::ConsecutiveErrors => "consecutive_errors",
+                StuckReason::BoundaryViolation => "boundary_violation",
             };
             return Ok(AgentOutput {
                 data: serde_json::json!({

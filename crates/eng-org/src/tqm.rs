@@ -124,6 +124,8 @@ pub enum PatternKind {
     BudgetPressure,
     /// Provider/setup errors indicate infrastructure problems.
     ProviderFailures,
+    /// A task hit a boundary/protected-path violation.
+    BoundaryViolation,
 }
 
 /// A pattern detected by the TQM analyzer.
@@ -161,6 +163,7 @@ pub fn analyze(result: &OrchestratorResult, config: &TQMConfig) -> Vec<DetectedP
     check_architect_rejection_rate(result, config, &mut patterns);
     check_budget_pressure(result, config, &mut patterns);
     check_provider_failures(result, config, &mut patterns);
+    check_boundary_violations(result, config, &mut patterns);
 
     patterns
 }
@@ -197,6 +200,7 @@ pub fn analyze_incremental(
 
     check_budget_pressure(result, config, &mut patterns);
     check_provider_failures(result, config, &mut patterns);
+    check_boundary_violations(result, config, &mut patterns);
 
     // Filter out patterns whose kind was already detected in a previous call.
     patterns.retain(|p| !already_detected.contains(&p.kind));
@@ -478,6 +482,38 @@ fn check_provider_failures(
     }
 }
 
+/// Check for boundary/protected-path violations.
+///
+/// Fires on the first occurrence — no threshold configuration needed.
+fn check_boundary_violations(
+    result: &OrchestratorResult,
+    _config: &TQMConfig,
+    patterns: &mut Vec<DetectedPattern>,
+) {
+    let mut affected = Vec::new();
+    for run in &result.run_results {
+        let error_text = run.error.as_deref().unwrap_or("");
+        if run.status == "BoundaryViolation"
+            || (run.status == "ImplementationFailed"
+                && (error_text.contains("PROTECTED PATH")
+                    || error_text.contains("boundary_violation")))
+        {
+            affected.push(run.task_id.clone());
+        }
+    }
+    if !affected.is_empty() {
+        let count = affected.len() as u32;
+        patterns.push(DetectedPattern {
+            kind: PatternKind::BoundaryViolation,
+            description: format!("{count} task(s) hit boundary violations (protected path)"),
+            occurrences: count,
+            threshold: 1.0,
+            severity: "warning".into(),
+            affected_tasks: affected,
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Remediation task generation
 // ---------------------------------------------------------------------------
@@ -493,6 +529,7 @@ fn kind_slug(kind: PatternKind) -> &'static str {
         PatternKind::ArchitectRejectionRate => "arch-reject",
         PatternKind::BudgetPressure => "budget",
         PatternKind::ProviderFailures => "provider",
+        PatternKind::BoundaryViolation => "boundary",
     }
 }
 
@@ -554,6 +591,10 @@ fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::ta
             )
         }
         PatternKind::ArchitectRejectionRate => "TQM: Review architect rejection patterns".into(),
+        PatternKind::BoundaryViolation => {
+            let ids = pattern.affected_tasks.join(", ");
+            format!("TQM: Investigate boundary violations for tasks: {ids}")
+        }
         // Advisory-only patterns — not actionable.
         PatternKind::BudgetPressure | PatternKind::ProviderFailures => return None,
     };
@@ -989,6 +1030,7 @@ mod tests {
             PatternKind::ArchitectRejectionRate,
             PatternKind::BudgetPressure,
             PatternKind::ProviderFailures,
+            PatternKind::BoundaryViolation,
         ] {
             let json = serde_json::to_string(&kind).unwrap();
             let parsed: PatternKind = serde_json::from_str(&json).unwrap();
@@ -1332,6 +1374,110 @@ mod tests {
             patterns
                 .iter()
                 .any(|p| p.kind == PatternKind::ArchitectRejectionRate)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Boundary violation tests
+    // -----------------------------------------------------------------------
+
+    fn run_result_with_error(task_id: &str, status: &str, error: &str) -> TaskRunResult {
+        TaskRunResult {
+            task_id: task_id.into(),
+            status: status.into(),
+            cost: 0.5,
+            tokens: 1000,
+            pr_url: None,
+            error: Some(error.into()),
+            outcome_context: None,
+        }
+    }
+
+    #[test]
+    fn boundary_violation_detected_on_first_occurrence() {
+        let mut result = empty_result();
+        result.tasks_attempted = 1;
+        result.run_results = vec![run_result("t1", "BoundaryViolation")];
+        let patterns = analyze(&result, &TQMConfig::default());
+        let boundary = patterns
+            .iter()
+            .find(|p| p.kind == PatternKind::BoundaryViolation);
+        assert!(boundary.is_some());
+        let b = boundary.unwrap();
+        assert_eq!(b.severity, "warning");
+        assert_eq!(b.occurrences, 1);
+        assert_eq!(b.affected_tasks, vec!["t1"]);
+    }
+
+    #[test]
+    fn boundary_violation_from_implementation_failed_with_protected_path() {
+        let mut result = empty_result();
+        result.tasks_attempted = 1;
+        result.run_results = vec![run_result_with_error(
+            "t1",
+            "ImplementationFailed",
+            "PROTECTED PATH — cannot modify 'crates/kernel/src/outcome.rs'. This path is protected by project policy.",
+        )];
+        let patterns = analyze(&result, &TQMConfig::default());
+        let boundary = patterns
+            .iter()
+            .find(|p| p.kind == PatternKind::BoundaryViolation);
+        assert!(boundary.is_some());
+        assert_eq!(boundary.unwrap().affected_tasks, vec!["t1"]);
+    }
+
+    #[test]
+    fn boundary_violation_not_detected_for_normal_failure() {
+        let mut result = empty_result();
+        result.tasks_attempted = 1;
+        result.run_results = vec![run_result_with_error(
+            "t1",
+            "ImplementationFailed",
+            "compilation error in foo.rs",
+        )];
+        let patterns = analyze(&result, &TQMConfig::default());
+        assert!(
+            !patterns
+                .iter()
+                .any(|p| p.kind == PatternKind::BoundaryViolation)
+        );
+    }
+
+    #[test]
+    fn boundary_violation_remediation_task_generated() {
+        let config = TQMConfig::default();
+        let patterns = vec![make_pattern(
+            PatternKind::BoundaryViolation,
+            vec!["t1".into()],
+        )];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].id.starts_with("tqm-boundary-"));
+        assert!(tasks[0].objective.contains("boundary violations"));
+        assert!(tasks[0].objective.contains("t1"));
+    }
+
+    #[test]
+    fn boundary_violation_incremental_fires_once() {
+        let mut result = empty_result();
+        result.tasks_attempted = 1;
+        result.run_results = vec![run_result("t1", "BoundaryViolation")];
+        let config = TQMConfig::default();
+
+        // First call: should detect the pattern.
+        let first = analyze_incremental(&result, &config, &[]);
+        assert!(
+            first
+                .iter()
+                .any(|p| p.kind == PatternKind::BoundaryViolation)
+        );
+
+        // Second call with previous patterns: should NOT re-fire.
+        let second = analyze_incremental(&result, &config, &first);
+        assert!(
+            !second
+                .iter()
+                .any(|p| p.kind == PatternKind::BoundaryViolation)
         );
     }
 
