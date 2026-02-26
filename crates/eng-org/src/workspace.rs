@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use glitchlab_kernel::error::{Error, Result};
+use tokio::fs;
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -23,6 +24,8 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    const MIN_TRUNCATION_CHECK_SIZE: usize = 500;
+    const TRUNCATION_THRESHOLD_PERCENTAGE: f64 = 0.10; // 10%
     pub fn new(repo_path: &Path, task_id: &str, worktree_base: &str) -> Self {
         let repo_path = repo_path.to_path_buf();
         let branch_name = format!("glitchlab/{task_id}");
@@ -161,6 +164,31 @@ impl Workspace {
 
         self.created = false;
         info!(task_id = %self.task_id, "workspace cleaned up");
+        Ok(())
+    }
+
+    /// Write content to a file within the worktree, with a truncation guard.
+    pub async fn write_file(&self, path: &Path, content: &[u8]) -> Result<()> {
+        let full_path = self.worktree_path.join(path);
+
+        if full_path.exists() {
+            let existing_content = fs::read(&full_path).await.map_err(Error::Io)?;
+            let existing_len = existing_content.len();
+            let new_len = content.len();
+
+            if existing_len >= Self::MIN_TRUNCATION_CHECK_SIZE
+                && (new_len as f64) < (existing_len as f64 * Self::TRUNCATION_THRESHOLD_PERCENTAGE)
+            {
+                return Err(Error::Workspace(format!(
+                    "potential file truncation detected for {}: existing size {} bytes, new size {} bytes. Aborting write.",
+                    path.display(),
+                    existing_len,
+                    new_len
+                )));
+            }
+        }
+
+        fs::write(&full_path, content).await.map_err(Error::Io)?;
         Ok(())
     }
 
@@ -385,6 +413,108 @@ mod tests {
     #[tokio::test]
     async fn cleanup_noop_when_not_created() {
         let mut ws = Workspace::new(Path::new("/tmp/repo"), "task-456", ".worktrees");
+        ws.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_write_file_truncation_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo_root");
+        std::fs::create_dir(&repo_root).unwrap();
+
+        // Initialize a git repo with a commit.
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        std::fs::write(repo_root.join("README.md"), "initial readme content").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+
+        let mut ws = Workspace::new(&repo_root, "test-task-trunc", ".glitchlab/worktrees");
+        ws.create("main").await.unwrap(); // Create worktree from main branch
+
+        let worktree_path = ws.worktree_path();
+        let test_file_path = Path::new("test_file.txt");
+        let full_test_file_path = worktree_path.join(test_file_path);
+
+        // Test case 1: Write a new file. Expect success.
+        let new_content = b"Hello, world!";
+        ws.write_file(test_file_path, new_content).await.unwrap();
+        assert_eq!(fs::read(&full_test_file_path).await.unwrap(), new_content);
+
+        // Test case 2: Modify an existing file (larger than MIN_TRUNCATION_CHECK_SIZE) with a minor size reduction (e.g., 20% reduction). Expect success.
+        let large_content = vec![b'A'; 1000]; // 1000 bytes
+        fs::write(&full_test_file_path, &large_content)
+            .await
+            .unwrap(); // Write directly to set initial state
+        let slightly_smaller_content = vec![b'B'; 800]; // 800 bytes (20% reduction)
+        ws.write_file(test_file_path, &slightly_smaller_content)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(&full_test_file_path).await.unwrap(),
+            slightly_smaller_content
+        );
+
+        // Test case 3: Modify an existing file (larger than MIN_TRUNCATION_CHECK_SIZE) with a significant size reduction (e.g., 95% reduction). Expect the truncation guard to trigger and return an error.
+        let large_content_for_truncation = vec![b'C'; 1000]; // 1000 bytes
+        fs::write(&full_test_file_path, &large_content_for_truncation)
+            .await
+            .unwrap();
+        let significantly_smaller_content = vec![b'D'; 50]; // 50 bytes (95% reduction)
+        let err = ws
+            .write_file(test_file_path, &significantly_smaller_content)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Workspace(_)));
+        assert!(
+            err.to_string()
+                .contains("potential file truncation detected")
+        );
+        // Verify file content was not changed
+        assert_eq!(
+            fs::read(&full_test_file_path).await.unwrap(),
+            large_content_for_truncation
+        );
+
+        // Test case 4: Modify a very small file (smaller than MIN_TRUNCATION_CHECK_SIZE) with a significant size reduction. Expect success (guard should not apply).
+        let small_content = vec![b'E'; 100]; // 100 bytes (less than MIN_TRUNCATION_CHECK_SIZE)
+        fs::write(&full_test_file_path, &small_content)
+            .await
+            .unwrap();
+        let even_smaller_content = vec![b'F'; 10]; // 10 bytes
+        ws.write_file(test_file_path, &even_smaller_content)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(&full_test_file_path).await.unwrap(),
+            even_smaller_content
+        );
+
+        // Test case 5: Modify an existing file by increasing its size. Expect success.
+        let initial_content_for_increase = vec![b'G'; 100];
+        fs::write(&full_test_file_path, &initial_content_for_increase)
+            .await
+            .unwrap();
+        let increased_content = vec![b'H'; 200];
+        ws.write_file(test_file_path, &increased_content)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(&full_test_file_path).await.unwrap(),
+            increased_content
+        );
+
         ws.cleanup().await.unwrap();
     }
 
