@@ -11,7 +11,13 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import os
 from loguru import logger
+
+class TruncationGuardError(Exception):
+    """Raised when a file write operation is blocked by the truncation guard."""
+    pass
+
 
 
 @dataclass
@@ -137,3 +143,33 @@ class ToolExecutor:
 
     def clear_log(self) -> None:
         self._execution_log.clear()
+
+def write_file_with_truncation_guard(
+    path: Path, content: str, min_old_size_for_check: int = 100, min_ratio: float = 0.1
+):
+    """
+    Writes content to a file, with a truncation guard.
+
+    Args:
+        path: The path to the file.
+        content: The content to write.
+        min_old_size_for_check: Minimum size of the old file in bytes to perform the check.
+        min_ratio: Minimum allowed ratio of new size to old size.
+
+    Raises:
+        TruncationGuardError: If the new content is significantly smaller than the old.
+    """
+    old_size = 0
+    if path.exists():
+        old_size = os.path.getsize(path)
+
+    new_size = len(content.encode("utf-8"))
+
+    if old_size > min_old_size_for_check and new_size < old_size * min_ratio:
+        raise TruncationGuardError(
+            f"Truncation guard triggered for {path}. "
+            f"Old size: {old_size} bytes, New size: {new_size} bytes. "
+            f"New content is less than {min_ratio:.0%} of the old content."
+        )
+    path.write_text(content)
+
