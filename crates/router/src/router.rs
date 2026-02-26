@@ -104,6 +104,17 @@ impl Router {
     /// Resolve role → model string using the chooser (if present) or the
     /// static routing map as a fallback.
     async fn resolve_model(&self, role: &str) -> error::Result<String> {
+        self.select_with_fallbacks(role, &[]).await
+    }
+
+    /// Resolve role → model string using the chooser (if present) or the
+    /// static routing map as a fallback. If the chooser or static map
+    /// don't have a match, try the `fallbacks` in order.
+    pub async fn select_with_fallbacks(
+        &self,
+        role: &str,
+        fallbacks: &[String],
+    ) -> error::Result<String> {
         if let Some(ref chooser) = self.chooser {
             let budget = self.budget.lock().await;
             let remaining = budget.dollars_remaining();
@@ -115,10 +126,17 @@ impl Router {
             }
             // Fall through to static map if chooser has no match.
         }
-        self.routing
-            .get(role)
-            .cloned()
-            .ok_or_else(|| error::Error::Config(format!("no model configured for role `{role}`")))
+        if let Some(model) = self.routing.get(role) {
+            return Ok(model.clone());
+        }
+        for fallback in fallbacks {
+            if let Some(model) = self.routing.get(fallback) {
+                return Ok(model.clone());
+            }
+        }
+        Err(error::Error::Config(format!(
+            "no model configured for role `{role}` or fallbacks"
+        )))
     }
 
     /// Make a completion call for the given agent role.
