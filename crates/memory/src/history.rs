@@ -71,6 +71,14 @@ pub struct EventsSummary {
     pub fix_attempts: u32,
 }
 
+/// Event recorded when a model is escalated to a more powerful one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEscalation {
+    pub original_model: String,
+    pub escalated_model: String,
+    pub reason: String,
+}
+
 // ---------------------------------------------------------------------------
 // HistoryQuery — filter/limit for reads
 // ---------------------------------------------------------------------------
@@ -607,5 +615,19 @@ mod tests {
         let json = r#"{"timestamp":"2026-02-21T14:30:00Z","task_id":"old","status":"error","budget":{},"events_summary":{}}"#;
         let entry: HistoryEntry = serde_json::from_str(json).unwrap();
         assert!(entry.outcome_context.is_none());
+    }
+
+    #[test]
+    fn model_escalation_roundtrip() {
+        let event = ModelEscalation {
+            original_model: "claude-3-opus-20240229".into(),
+            escalated_model: "gpt-4-turbo".into(),
+            reason: "model lacked capability".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ModelEscalation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.original_model, "claude-3-opus-20240229");
+        assert_eq!(parsed.escalated_model, "gpt-4-turbo");
+        assert_eq!(parsed.reason, "model lacked capability");
     }
 }
