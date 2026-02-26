@@ -37,6 +37,8 @@ pub(crate) enum StuckReason {
     RepeatedResults,
     /// Multiple consecutive turns produced errors.
     ConsecutiveErrors,
+    /// A tool call hit a protected-path boundary violation.
+    BoundaryViolation,
 }
 
 /// Outcome of a tool-use loop.
@@ -258,6 +260,27 @@ pub(crate) async fn tool_use_loop(
                 info!(role, tool = call.name.as_str(), "tool call succeeded");
             }
             results.push(result);
+        }
+
+        // Bail immediately on boundary violations — no point retrying.
+        let has_boundary_violation = results
+            .iter()
+            .any(|r| r.is_error && r.content.contains("PROTECTED PATH"));
+        if has_boundary_violation {
+            warn!(
+                role,
+                "tool-use loop hit boundary violation, stopping immediately"
+            );
+            for result in results {
+                messages.push(Message {
+                    role: MessageRole::User,
+                    content: MessageContent::Blocks(vec![ContentBlock::ToolResult(result)]),
+                });
+            }
+            return Ok(ToolLoopOutcome::Stuck {
+                reason: StuckReason::BoundaryViolation,
+                last_response: response,
+            });
         }
 
         // Check for stuck agent before appending results.

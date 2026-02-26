@@ -463,6 +463,18 @@ impl EngineeringPipeline {
             enriched.push_str("\n\n");
             enriched.push_str(&repo_context);
         }
+        if !self.config.boundaries.protected_paths.is_empty() {
+            enriched.push_str("\n\n## Protected Paths\n\n");
+            enriched.push_str(
+                "The following paths are protected by project policy. \
+                 If the task requires changes under any of these, \
+                 set `requires_core_change` to true.\n\n",
+            );
+            for p in &self.config.boundaries.protected_paths {
+                enriched.push_str(&format!("- `{p}`\n"));
+            }
+        }
+
         ctx.agent_context.objective = enriched;
 
         // Store failure context separately in extra (independently droppable
@@ -754,6 +766,19 @@ impl EngineeringPipeline {
             let reason = impl_output.data["stuck_reason"]
                 .as_str()
                 .unwrap_or("parse_error");
+
+            // Route boundary violations to BoundaryViolation status so
+            // TQM can detect them without relying on error-string matching.
+            if reason == "boundary_violation" {
+                return self
+                    .fail(
+                        ctx,
+                        PipelineStatus::BoundaryViolation,
+                        format!("implementer hit protected path: {reason}"),
+                    )
+                    .await;
+            }
+
             return self
                 .fail(
                     ctx,
@@ -3364,6 +3389,149 @@ mod tests {
 
         assert_eq!(result.status, PipelineStatus::BoundaryViolation);
         assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn pipeline_injects_protected_paths_into_planner_context() {
+        use glitchlab_kernel::agent::Message;
+        use glitchlab_router::provider::{Provider, ProviderFuture};
+
+        /// Mock provider that captures all messages sent to it and returns
+        /// pre-scripted responses.
+        struct CapturingProvider {
+            responses: Mutex<VecDeque<glitchlab_router::RouterResponse>>,
+            captured: Mutex<Vec<Vec<Message>>>,
+        }
+
+        impl CapturingProvider {
+            fn new(responses: Vec<glitchlab_router::RouterResponse>) -> Self {
+                Self {
+                    responses: Mutex::new(VecDeque::from(responses)),
+                    captured: Mutex::new(Vec::new()),
+                }
+            }
+        }
+
+        impl Provider for CapturingProvider {
+            fn complete(
+                &self,
+                _model: &str,
+                messages: &[Message],
+                _temperature: f32,
+                _max_tokens: u32,
+                _response_format: Option<&serde_json::Value>,
+            ) -> ProviderFuture<'_> {
+                self.captured.lock().unwrap().push(messages.to_vec());
+                let response = self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| glitchlab_router::RouterResponse {
+                        request_id: String::new(),
+                        content: "no more responses".into(),
+                        model: "cap/test".into(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        cost: 0.0,
+                        latency_ms: 0,
+                        tool_calls: vec![],
+                        stop_reason: None,
+                    });
+                Box::pin(async move { Ok(response) })
+            }
+
+            fn complete_with_tools(
+                &self,
+                model: &str,
+                messages: &[Message],
+                temperature: f32,
+                max_tokens: u32,
+                _tools: &[glitchlab_kernel::tool::ToolDefinition],
+                response_format: Option<&serde_json::Value>,
+            ) -> ProviderFuture<'_> {
+                self.complete(model, messages, temperature, max_tokens, response_format)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — a valid plan response (will touch protected path)
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "edit secrets"}], "files_likely_affected": ["secrets/keys.yaml"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "ok", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+        ];
+
+        let capturing_provider = Arc::new(CapturingProvider::new(responses));
+        let provider_clone = Arc::clone(&capturing_provider);
+
+        let routing = std::collections::HashMap::from([
+            ("planner".to_string(), "cap/test".to_string()),
+            ("implementer".to_string(), "cap/test".to_string()),
+            ("debugger".to_string(), "cap/test".to_string()),
+            ("security".to_string(), "cap/test".to_string()),
+            ("release".to_string(), "cap/test".to_string()),
+            ("archivist".to_string(), "cap/test".to_string()),
+            ("architect_triage".to_string(), "cap/test".to_string()),
+            ("architect_review".to_string(), "cap/test".to_string()),
+        ]);
+        let budget = glitchlab_kernel::budget::BudgetTracker::new(1_000_000, 100.0);
+        let mut router = glitchlab_router::Router::new(routing, budget);
+        router.register_provider("cap".into(), capturing_provider);
+        let router: RouterRef = Arc::new(router);
+
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.boundaries.protected_paths = vec!["crates/kernel/".into(), "secrets/".into()];
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let _result = pipeline
+            .run(
+                "test-inject",
+                "Modify kernel code",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        // The first call to the provider is the planner. Its user message
+        // (last message) should contain the protected paths section.
+        let captured = provider_clone.captured.lock().unwrap();
+        assert!(!captured.is_empty(), "expected at least one provider call");
+        let planner_messages = &captured[0];
+        let user_msg = planner_messages
+            .iter()
+            .find(|m| m.role == glitchlab_kernel::agent::MessageRole::User)
+            .expect("planner call should have a user message");
+        let text = match &user_msg.content {
+            glitchlab_kernel::agent::MessageContent::Text(t) => t.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("## Protected Paths"),
+            "planner objective should contain protected paths header"
+        );
+        assert!(
+            text.contains("crates/kernel/"),
+            "planner objective should list crates/kernel/"
+        );
+        assert!(
+            text.contains("secrets/"),
+            "planner objective should list secrets/"
+        );
     }
 
     #[tokio::test]

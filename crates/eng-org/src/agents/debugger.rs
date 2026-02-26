@@ -138,6 +138,7 @@ impl Agent for DebuggerAgent {
             let reason_str = match reason {
                 StuckReason::RepeatedResults => "repeated_results",
                 StuckReason::ConsecutiveErrors => "consecutive_errors",
+                StuckReason::BoundaryViolation => "boundary_violation",
             };
             return Ok(AgentOutput {
                 data: serde_json::json!({

@@ -383,7 +383,12 @@ impl ToolDispatcher {
     fn check_protected(&self, path: &str) -> Result<(), String> {
         for protected in &self.protected_paths {
             if path.starts_with(protected.as_str()) {
-                return Err(format!("protected path: {path}"));
+                return Err(format!(
+                    "PROTECTED PATH — cannot modify '{}'. \
+                     This path is protected by project policy. \
+                     Do NOT retry this operation.",
+                    path
+                ));
             }
         }
         Ok(())
@@ -639,7 +644,7 @@ mod tests {
         );
         let result = dispatcher.dispatch(&call).await;
         assert!(result.is_error);
-        assert!(result.content.contains("protected path"));
+        assert!(result.content.contains("PROTECTED PATH"));
     }
 
     // -- edit_file --
@@ -684,7 +689,7 @@ mod tests {
         );
         let result = dispatcher.dispatch(&call).await;
         assert!(result.is_error);
-        assert!(result.content.contains("protected path"));
+        assert!(result.content.contains("PROTECTED PATH"));
     }
 
     // -- run_command --
@@ -772,5 +777,19 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("old_string not found"));
         assert!(result.content.contains("Hint: line"));
+    }
+
+    #[tokio::test]
+    async fn check_protected_error_message_format() {
+        let dir = TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+        let call = make_call(
+            "write_file",
+            json!({"path": ".env", "content": "SECRET=oops"}),
+        );
+        let result = dispatcher.dispatch(&call).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("PROTECTED PATH"));
+        assert!(result.content.contains("Do NOT retry"));
     }
 }
