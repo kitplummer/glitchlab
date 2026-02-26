@@ -123,6 +123,11 @@ impl BeadsClient {
         self.run_bd(&["update", task_id, "--status", status]).await
     }
 
+    /// Close a bead.
+    pub async fn close_bead(&self, task_id: &str) -> Result<String> {
+        self.update_status(task_id, "closed").await
+    }
+
     /// List beads (raw text output).
     pub async fn list(&self) -> Result<String> {
         self.run_bd(&["list"]).await
@@ -516,6 +521,23 @@ mod tests {
         assert_eq!(lines[1], "gl-99");
         assert_eq!(lines[2], "--status");
         assert_eq!(lines[3], "pr_created");
+    }
+
+    #[tokio::test]
+    async fn close_bead_uses_correct_bd_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, args_file) = mock_bd_capture(dir.path(), "");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        client.close_bead("gl-42").await.unwrap();
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        // bd update gl-42 --status closed
+        assert_eq!(lines[0], "update");
+        assert_eq!(lines[1], "gl-42");
+        assert_eq!(lines[2], "--status");
+        assert_eq!(lines[3], "closed");
     }
 
     // -----------------------------------------------------------------------
