@@ -19,6 +19,7 @@ anyhow.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 glob.workspace = true
+schemars = { workspace = true, features = ["derive"] }
 
 [features]
 live = []

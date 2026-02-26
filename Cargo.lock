@@ -597,6 +597,7 @@ dependencies = [
  "glitchlab-memory",
  "glitchlab-router",
  "glob",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
