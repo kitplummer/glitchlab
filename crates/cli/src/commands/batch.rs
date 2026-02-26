@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use glitchlab_eng_org::config::EngConfig;
+use glitchlab_eng_org::dashboard::DashboardEmitter;
 use glitchlab_eng_org::orchestrator::{
     CumulativeBudget, Orchestrator, OrchestratorParams, OrchestratorResult,
 };
@@ -50,11 +51,13 @@ pub async fn execute(args: BatchArgs<'_>) -> Result<()> {
     }
 
     // --- Load task queue ---
+    // Explicit --tasks-file always wins; otherwise try Beads, then default YAML.
+    let explicit_tasks_file = args.tasks_file.is_some();
     let tasks_path = match args.tasks_file {
         Some(p) => p.to_path_buf(),
         None => args.repo.join(".glitchlab/tasks/backlog.yaml"),
     };
-    let mut queue = if config.memory.beads_enabled {
+    let mut queue = if !explicit_tasks_file && config.memory.beads_enabled {
         let client = BeadsClient::new(args.repo, config.memory.beads_bd_path.clone());
         match TaskQueue::load_from_beads(&client).await {
             Ok(q) if !q.tasks().is_empty() => {
@@ -187,7 +190,23 @@ pub async fn execute(args: BatchArgs<'_>) -> Result<()> {
     let history: Arc<dyn HistoryBackend> =
         glitchlab_memory::build_backend(args.repo, &mem_config).await;
 
-    let orchestrator = Orchestrator::new(config.clone(), handler, history);
+    // --- Dashboard event emitter ---
+    let events_path = args.repo.join(".glitchlab/logs/events.jsonl");
+    let dashboard = match DashboardEmitter::new(&events_path) {
+        Ok(d) => {
+            eprintln!("dashboard events: {}", events_path.display());
+            Some(Arc::new(d))
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to create dashboard emitter, continuing without it");
+            None
+        }
+    };
+
+    let mut orchestrator = Orchestrator::new(config.clone(), handler, history);
+    if let Some(d) = dashboard {
+        orchestrator = orchestrator.with_dashboard(d);
+    }
     let params = OrchestratorParams {
         repo_path: args.repo.to_path_buf(),
         base_branch,

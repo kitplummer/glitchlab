@@ -17,6 +17,7 @@ use glitchlab_memory::history::HistoryBackend;
 use glitchlab_router::Router;
 
 use crate::config::EngConfig;
+use crate::dashboard::{DashboardEmitter, DashboardEvent};
 use crate::pipeline::{EngineeringPipeline, InterventionHandler, RealExternalOps};
 use crate::taskqueue::{TaskQueue, TaskStatus};
 
@@ -538,6 +539,7 @@ pub struct Orchestrator {
     config: EngConfig,
     handler: Arc<dyn InterventionHandler>,
     history: Arc<dyn HistoryBackend>,
+    dashboard: Option<Arc<DashboardEmitter>>,
 }
 
 impl Orchestrator {
@@ -550,6 +552,20 @@ impl Orchestrator {
             config,
             handler,
             history,
+            dashboard: None,
+        }
+    }
+
+    /// Attach a dashboard emitter for structured event output.
+    pub fn with_dashboard(mut self, dashboard: Arc<DashboardEmitter>) -> Self {
+        self.dashboard = Some(dashboard);
+        self
+    }
+
+    /// Emit a dashboard event (no-op if no emitter attached).
+    fn dash(&self, event: DashboardEvent) {
+        if let Some(ref d) = self.dashboard {
+            d.emit(event);
         }
     }
 
@@ -586,6 +602,11 @@ impl Orchestrator {
         };
 
         let mut detected_patterns: Vec<crate::tqm::DetectedPattern> = vec![];
+
+        self.dash(DashboardEvent::RunStarted {
+            total_tasks: queue.summary().pending as usize,
+            budget_dollars: budget.limit_dollars(),
+        });
 
         // --- Task loop ---
         loop {
@@ -677,6 +698,10 @@ impl Orchestrator {
             let _ = queue.save();
 
             info!(task_id = %task_id, "starting task");
+            self.dash(DashboardEvent::TaskStarted {
+                task_id: task_id.clone(),
+                is_remediation: task_is_remediation,
+            });
 
             // --- Create fresh router + pipeline for this task ---
             let attempt_contexts = tracker.contexts(&task_id);
@@ -732,6 +757,11 @@ impl Orchestrator {
             result.total_cost += cost;
             result.total_tokens += tokens;
 
+            // Dashboard: budget threshold check
+            if let Some(ref d) = self.dashboard {
+                d.check_budget_threshold(budget.total_cost(), budget.limit_dollars());
+            }
+
             let run_result = TaskRunResult {
                 task_id: task_id.clone(),
                 status: status_str,
@@ -754,6 +784,11 @@ impl Orchestrator {
                         occurrences = pattern.occurrences,
                         "TQM: pattern detected mid-run"
                     );
+                    self.dash(DashboardEvent::PatternDetected {
+                        kind: format!("{:?}", pattern.kind),
+                        severity: pattern.severity.clone(),
+                        occurrences: pattern.occurrences,
+                    });
                 }
                 if !new_patterns.is_empty() {
                     // Guard: skip Circuit if current task was already remediation (meta-loop)
@@ -767,10 +802,17 @@ impl Orchestrator {
                             .invoke_circuit_for_patterns(&new_patterns, &result, budget)
                             .await;
                         if !circuit_tasks.is_empty() {
+                            let ids: Vec<String> =
+                                circuit_tasks.iter().map(|t| t.id.clone()).collect();
                             info!(
                                 count = circuit_tasks.len(),
                                 "TQM: Circuit injecting remediation tasks into queue"
                             );
+                            self.dash(DashboardEvent::RemediationInjected {
+                                source: "circuit".into(),
+                                count: circuit_tasks.len(),
+                                task_ids: ids,
+                            });
                             queue.inject_tasks(circuit_tasks);
                         } else {
                             // Fallback to generic remediation if Circuit produced nothing.
@@ -781,10 +823,17 @@ impl Orchestrator {
                                     queue,
                                 );
                             if !fallback_tasks.is_empty() {
+                                let ids: Vec<String> =
+                                    fallback_tasks.iter().map(|t| t.id.clone()).collect();
                                 info!(
                                     count = fallback_tasks.len(),
                                     "TQM: fallback injecting remediation tasks into queue"
                                 );
+                                self.dash(DashboardEvent::RemediationInjected {
+                                    source: "tqm_fallback".into(),
+                                    count: fallback_tasks.len(),
+                                    task_ids: ids,
+                                });
                                 queue.inject_tasks(fallback_tasks);
                             }
                         }
@@ -796,10 +845,16 @@ impl Orchestrator {
                             queue,
                         );
                         if !tasks.is_empty() {
+                            let ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
                             info!(
                                 count = tasks.len(),
                                 "TQM: injecting remediation tasks into queue"
                             );
+                            self.dash(DashboardEvent::RemediationInjected {
+                                source: "tqm_generic".into(),
+                                count: tasks.len(),
+                                task_ids: ids,
+                            });
                             queue.inject_tasks(tasks);
                         }
                     }
@@ -812,7 +867,7 @@ impl Orchestrator {
             // Handle decomposition specially (needs sub-task extraction).
             if pipeline_result.status == PipelineStatus::Decomposed {
                 let max_depth = self.config.limits.max_decomposition_depth;
-                Self::handle_decomposition(
+                let sub_ids = Self::handle_decomposition(
                     queue,
                     &mut result,
                     &task_id,
@@ -820,21 +875,64 @@ impl Orchestrator {
                     max_depth,
                     &pipeline_result.stage_outputs,
                 );
+                self.dash(DashboardEvent::TaskDecomposed {
+                    task_id: task_id.clone(),
+                    sub_task_ids: sub_ids,
+                });
                 continue;
+            }
+
+            // Dashboard: boundary violation
+            if pipeline_result.status == PipelineStatus::BoundaryViolation {
+                self.dash(DashboardEvent::BoundaryViolation {
+                    task_id: task_id.clone(),
+                });
             }
 
             let routing = Self::route_outcome(&pipeline_result);
             queue.update_status(&task_id, routing.task_status.clone());
 
             match routing.counter {
-                OutcomeCounter::Succeeded => result.tasks_succeeded += 1,
+                OutcomeCounter::Succeeded => {
+                    result.tasks_succeeded += 1;
+                    self.dash(DashboardEvent::TaskSucceeded {
+                        task_id: task_id.clone(),
+                        status: format!("{:?}", pipeline_result.status),
+                        cost,
+                        tokens,
+                        pr_url: pipeline_result.pr_url.clone(),
+                    });
+                    if let Some(ref url) = pipeline_result.pr_url {
+                        self.dash(DashboardEvent::PrCreated {
+                            task_id: task_id.clone(),
+                            url: url.clone(),
+                        });
+                    }
+                    if pipeline_result.status == PipelineStatus::PrMerged
+                        && let Some(ref url) = pipeline_result.pr_url
+                    {
+                        self.dash(DashboardEvent::PrMerged {
+                            task_id: task_id.clone(),
+                            url: url.clone(),
+                        });
+                    }
+                }
                 OutcomeCounter::Failed => {
                     result.tasks_failed += 1;
+                    self.dash(DashboardEvent::TaskFailed {
+                        task_id: task_id.clone(),
+                        status: format!("{:?}", pipeline_result.status),
+                        cost,
+                        reason: pipeline_result.error.clone(),
+                    });
                     let category = pipeline_status_to_failure_category(pipeline_result.status);
                     if let Some(dominant) = intensity_monitor.record_failure(category) {
                         warn!(?dominant, "restart intensity exceeded");
                         result.cease_reason = CeaseReason::SystemicFailure;
                         result.dominant_failure_pattern = Some(dominant);
+                        self.dash(DashboardEvent::SystemicFailure {
+                            dominant_category: format!("{dominant:?}"),
+                        });
                     }
                 }
                 OutcomeCounter::Deferred => result.tasks_deferred += 1,
@@ -895,9 +993,13 @@ impl Orchestrator {
                         details = %qr.details,
                         "quality gate failed — halting orchestrator"
                     );
+                    self.dash(DashboardEvent::QualityGateFailed {
+                        details: qr.details,
+                    });
                     result.cease_reason = CeaseReason::QualityGateFailed;
                     break;
                 }
+                self.dash(DashboardEvent::QualityGatePassed);
             }
 
             // --- Stop on failure (optional) ---
@@ -944,6 +1046,16 @@ impl Orchestrator {
             cease_reason = ?result.cease_reason,
             "orchestrator run complete"
         );
+
+        self.dash(DashboardEvent::RunCompleted {
+            succeeded: result.tasks_succeeded,
+            failed: result.tasks_failed,
+            deferred: result.tasks_deferred,
+            escalated: result.tasks_escalated,
+            total_cost: result.total_cost,
+            duration_secs: result.duration.as_secs_f64(),
+            cease_reason: format!("{:?}", result.cease_reason),
+        });
 
         result
     }
@@ -1214,6 +1326,7 @@ impl Orchestrator {
     ///
     /// Returns `true` if decomposition succeeded (sub-tasks injected),
     /// `false` if it failed (depth exceeded or no sub-tasks found).
+    /// Returns the IDs of injected sub-tasks (empty if decomposition failed).
     fn handle_decomposition(
         queue: &mut TaskQueue,
         result: &mut OrchestratorResult,
@@ -1221,7 +1334,7 @@ impl Orchestrator {
         task_depth: u32,
         max_depth: u32,
         stage_outputs: &HashMap<String, AgentOutput>,
-    ) -> bool {
+    ) -> Vec<String> {
         if task_depth >= max_depth {
             warn!(
                 task_id = %task_id,
@@ -1236,16 +1349,17 @@ impl Orchestrator {
             );
             result.tasks_failed += 1;
             let _ = queue.save();
-            return false;
+            return Vec::new();
         }
 
         if let Some(sub_tasks) = Self::extract_sub_tasks(task_id, task_depth, stage_outputs) {
             let count = sub_tasks.len();
+            let ids: Vec<String> = sub_tasks.iter().map(|t| t.id.clone()).collect();
             info!(task_id = %task_id, count, "decomposed into sub-tasks");
             queue.inject_tasks(sub_tasks);
             queue.update_status(task_id, TaskStatus::Completed);
             let _ = queue.save();
-            true
+            ids
         } else {
             warn!(
                 task_id = %task_id,
@@ -1255,7 +1369,7 @@ impl Orchestrator {
             queue.update_status(task_id, TaskStatus::Failed);
             queue.set_error(task_id, "decomposition produced no sub-tasks".into());
             let _ = queue.save();
-            false
+            Vec::new()
         }
     }
 
@@ -2610,7 +2724,7 @@ mod tests {
         let mut result = empty_orchestrator_result();
         let stage_outputs = decomposition_stage_outputs();
 
-        let ok = Orchestrator::handle_decomposition(
+        let ids = Orchestrator::handle_decomposition(
             &mut queue,
             &mut result,
             "deep-task",
@@ -2619,7 +2733,7 @@ mod tests {
             &stage_outputs,
         );
 
-        assert!(!ok);
+        assert!(ids.is_empty());
         assert_eq!(result.tasks_failed, 1);
         let task = queue.tasks().iter().find(|t| t.id == "deep-task").unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
@@ -2645,7 +2759,7 @@ mod tests {
         let mut result = empty_orchestrator_result();
         let stage_outputs = decomposition_stage_outputs();
 
-        let ok = Orchestrator::handle_decomposition(
+        let ids = Orchestrator::handle_decomposition(
             &mut queue,
             &mut result,
             "parent-task",
@@ -2654,7 +2768,7 @@ mod tests {
             &stage_outputs,
         );
 
-        assert!(ok);
+        assert_eq!(ids, vec!["sub-1", "sub-2"]);
         assert_eq!(result.tasks_failed, 0);
         // Parent should be completed.
         let parent = queue
@@ -2691,7 +2805,7 @@ mod tests {
         let mut result = empty_orchestrator_result();
         let empty_outputs = HashMap::new(); // no "plan" stage → no sub-tasks
 
-        let ok = Orchestrator::handle_decomposition(
+        let ids = Orchestrator::handle_decomposition(
             &mut queue,
             &mut result,
             "empty-decomp",
@@ -2700,7 +2814,7 @@ mod tests {
             &empty_outputs,
         );
 
-        assert!(!ok);
+        assert!(ids.is_empty());
         assert_eq!(result.tasks_failed, 1);
         let task = queue
             .tasks()

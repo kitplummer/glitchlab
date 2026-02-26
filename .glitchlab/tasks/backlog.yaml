@@ -1,15 +1,4 @@
-# GLITCHLAB Self-Improvement Backlog — $100 Proof Run
-#
-# 30 tasks in 7 phases. Priority spacing (10, 20, 30...) leaves room for
-# remediation tasks at priority 2. Budget: 29 actionable x $0.50 = $14.50
-# primary + 20% repair reserve ($20). Ample headroom under $100.
-
 tasks:
-
-# ==========================================================================
-# Phase 1: Easy wins (priority 10-80)
-# ==========================================================================
-
 - id: display-pipeline-status
   objective: |
     Add a `Display` trait implementation for the `PipelineStatus` enum in
@@ -21,10 +10,12 @@ tasks:
     expected string via `.to_string()`. The enum starts around line 141. Use
     `read_file` to read lines 139-180 to see all variants.
   priority: 10
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'objective references protected path(s): crates/kernel/src/pipeline.rs`.'
+  remediation_depth: 0
+  is_remediation: false
 - id: display-pattern-kind
   objective: |
     Add a `Display` trait implementation for the `PatternKind` enum in
@@ -39,10 +30,12 @@ tasks:
     `.to_string()`. The enum starts around line 113. Use `read_file` to read
     lines 110-132.
   priority: 20
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'implementer failed: repeated_results'
+  remediation_depth: 0
+  is_remediation: false
 - id: display-failure-category
   objective: |
     Add a `Display` trait implementation for the `FailureCategory` enum in
@@ -58,7 +51,8 @@ tasks:
   depends_on: []
   decomposition_depth: 0
   pr_url: https://github.com/kitplummer/glitchlab/pull/36
-
+  remediation_depth: 0
+  is_remediation: false
 - id: display-obstacle-kind
   objective: |
     Add a `Display` trait implementation for the `ObstacleKind` enum in
@@ -72,10 +66,12 @@ tasks:
     constructs each variant with dummy data and verifies `.to_string()`. The enum
     starts around line 43. Use `read_file` to read lines 41-70.
   priority: 40
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'objective references protected path(s): crates/kernel/src/outcome.rs`.'
+  remediation_depth: 0
+  is_remediation: false
 - id: display-outcome-counter
   objective: |
     Add a `Display` trait implementation for the `OutcomeCounter` enum in
@@ -86,10 +82,12 @@ tasks:
     produce the expected string via `.to_string()`. The enum starts around
     line 365. Use `read_file` to read lines 363-371.
   priority: 50
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'budget exceeded: token limit exceeded: 150763 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
 - id: config-limits-validation
   objective: |
     Add a `validate()` method to `LimitsConfig` in `crates/eng-org/src/config.rs`.
@@ -102,10 +100,11 @@ tasks:
     each invalid value is rejected. The `LimitsConfig` struct starts around
     line 100. Use `read_file` to read lines 98-135.
   priority: 60
-  status: pending
+  status: completed
   depends_on: []
   decomposition_depth: 0
-
+  remediation_depth: 0
+  is_remediation: false
 - id: config-repair-budget-fraction-default
   objective: |
     Ensure the `repair_budget_fraction` field in `LimitsConfig` in
@@ -117,10 +116,12 @@ tasks:
     or wrong, fix them and add the test. Use `read_file` to read lines
     165-195.
   priority: 70
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'budget exceeded: token limit exceeded: 120360 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
 - id: file-size-guard-indexer
   objective: |
     Add a file-size guard to `build_index()` in `crates/eng-org/src/indexer.rs`.
@@ -133,14 +134,12 @@ tasks:
     equivalent returns true. The `build_index` function starts around line 139.
     Use `read_file` to read lines 139-216.
   priority: 80
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
-# ==========================================================================
-# Phase 2: Medium value (priority 100-180)
-# ==========================================================================
-
+  error: 'implementer failed: repeated_results'
+  remediation_depth: 0
+  is_remediation: false
 - id: sanitize-task-id
   objective: |
     Add a `sanitize_task_id()` function in `crates/eng-org/src/taskqueue.rs`
@@ -152,10 +151,11 @@ tasks:
     special chars, empty string, already-valid input. The Task struct is around
     line 42. Use `read_file` to read lines 40-70.
   priority: 100
-  status: pending
+  status: completed
   depends_on: []
   decomposition_depth: 0
-
+  remediation_depth: 0
+  is_remediation: false
 - id: budget-logging-cumulative
   objective: |
     Add structured `tracing` logging to `CumulativeBudget` in
@@ -170,10 +170,12 @@ tasks:
     and check the return values, not the log output). The struct starts around
     line 43. Use `read_file` to read lines 43-204.
   priority: 120
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'implementer failed: repeated_results'
+  remediation_depth: 0
+  is_remediation: false
 - id: cascade-fallback-chooser
   objective: |
     Add a `fallback_for_role()` method to `ModelChooser` in
@@ -185,10 +187,12 @@ tasks:
     model when no exact match, (3) returns `None` only when the pool is empty.
     Use `read_file` to read the entire `chooser.rs` file.
   priority: 140
-  status: pending
+  status: completed
   depends_on: []
   decomposition_depth: 0
-
+  pr_url: https://github.com/kitplummer/glitchlab/pull/49
+  remediation_depth: 0
+  is_remediation: false
 - id: display-model-tier
   objective: |
     The `ModelTier` enum in `crates/router/src/chooser.rs` already has a
@@ -198,10 +202,12 @@ tasks:
     "standard"`, `Premium.to_string() == "premium"`. The enum and its Display
     impl start around line 20. Use `read_file` to read lines 18-50.
   priority: 160
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'budget exceeded: token limit exceeded: 123769 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
 - id: config-docs-yaml-comments
   objective: |
     Add inline YAML comments to the default config embedded in
@@ -214,14 +220,11 @@ tasks:
     find the DEFAULT_CONFIG constant or Default impl. Verify `cargo test` still
     passes after the change.
   priority: 180
-  status: pending
+  status: completed
   depends_on: []
   decomposition_depth: 0
-
-# ==========================================================================
-# Phase 3: Robustness (priority 200-280)
-# ==========================================================================
-
+  remediation_depth: 0
+  is_remediation: false
 - id: worktree-cleanup-timeout
   objective: |
     Add a timeout to the `cleanup()` method in `crates/eng-org/src/workspace.rs`.
@@ -233,10 +236,12 @@ tasks:
     The `cleanup()` method starts around line 136. Use `read_file` to read
     lines 134-160.
   priority: 200
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'budget exceeded: token limit exceeded: 120184 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
 - id: test-restart-intensity-monitor
   objective: |
     Add unit tests for `RestartIntensityMonitor` in
@@ -249,10 +254,12 @@ tasks:
     categories are mixed. The struct starts around line 477. Use `read_file`
     to read lines 470-530.
   priority: 220
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'budget exceeded: token limit exceeded: 120747 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
 - id: test-attempt-tracker
   objective: |
     Add unit tests for `AttemptTracker` in
@@ -262,10 +269,12 @@ tasks:
     (4) multiple task_ids are tracked independently. The struct starts
     around line 382. Use `read_file` to read lines 375-420.
   priority: 240
-  status: pending
+  status: completed
   depends_on: []
   decomposition_depth: 0
-
+  pr_url: https://github.com/kitplummer/glitchlab/pull/54
+  remediation_depth: 0
+  is_remediation: false
 - id: test-quality-gate
   objective: |
     Add unit tests for `QualityGate` (the `run_quality_gate` function) in
@@ -276,10 +285,12 @@ tasks:
     These are async tests — use `#[tokio::test]`. The function starts around
     line 210. Use `read_file` to read lines 208-270.
   priority: 260
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
+  error: 'implementer failed: parse_error'
+  remediation_depth: 0
+  is_remediation: false
 - id: test-cumulative-budget
   objective: |
     Add unit tests for `CumulativeBudget` in
@@ -290,14 +301,12 @@ tasks:
     (5) `repair_remaining()` respects `repair_budget_fraction`. The struct
     starts around line 43. Use `read_file` to read lines 43-204.
   priority: 280
-  status: pending
+  status: failed
   depends_on: []
   decomposition_depth: 0
-
-# ==========================================================================
-# Phase 4: Agent edge cases (priority 300-360)
-# ==========================================================================
-
+  error: 'budget exceeded: token limit exceeded: 133391 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
 - id: test-security-parse-error
   objective: |
     Add a test in `crates/eng-org/src/agents/security.rs` that verifies the
@@ -309,10 +318,11 @@ tasks:
     `#[cfg(test)]` block starting around line 111. Use `read_file` to read
     the full file.
   priority: 300
-  status: pending
+  status: in_progress
   depends_on: []
   decomposition_depth: 0
-
+  remediation_depth: 0
+  is_remediation: false
 - id: test-archivist-parse-error
   objective: |
     Add a test in `crates/eng-org/src/agents/archivist.rs` that verifies the
@@ -324,7 +334,8 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
-
+  remediation_depth: 0
+  is_remediation: false
 - id: test-release-parse-error
   objective: |
     Add a test in `crates/eng-org/src/agents/release.rs` that verifies the
@@ -336,7 +347,8 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
-
+  remediation_depth: 0
+  is_remediation: false
 - id: test-architect-triage-parse-error
   objective: |
     Add a test in `crates/eng-org/src/agents/architect.rs` that verifies the
@@ -349,7 +361,8 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
-
+  remediation_depth: 0
+  is_remediation: false
 - id: test-architect-review-parse-error
   objective: |
     Add a test in `crates/eng-org/src/agents/architect.rs` that verifies the
@@ -361,11 +374,8 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
-
-# ==========================================================================
-# Phase 5: Documentation (priority 400-460)
-# ==========================================================================
-
+  remediation_depth: 0
+  is_remediation: false
 - id: status-md-update
   objective: |
     Create or update `.glitchlab/STATUS.md` with the current project status.
@@ -381,7 +391,8 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
-
+  remediation_depth: 0
+  is_remediation: false
 - id: model-pool-config-doc
   objective: |
     Add a `.glitchlab/docs/model-pool.md` file documenting the ModelChooser
@@ -396,7 +407,8 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
-
+  remediation_depth: 0
+  is_remediation: false
 - id: readme-update
   objective: |
     The README.md has already been rewritten manually to reflect the Rust port.
@@ -408,11 +420,8 @@ tasks:
   status: completed
   depends_on: []
   decomposition_depth: 0
-
-# ==========================================================================
-# Phase 6: Harder features (priority 500-540)
-# ==========================================================================
-
+  remediation_depth: 0
+  is_remediation: false
 - id: pipeline-mode-enum
   objective: |
     Add a `PipelineMode` enum to `crates/eng-org/src/pipeline.rs` with variants:
@@ -426,7 +435,8 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
-
+  remediation_depth: 0
+  is_remediation: false
 - id: indexer-inline-test-detection
   objective: |
     Extend `is_test_file()` in `crates/eng-org/src/indexer.rs` to also detect
@@ -442,11 +452,8 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
-
-# ==========================================================================
-# Phase 7: Intentional failure (priority 550)
-# ==========================================================================
-
+  remediation_depth: 0
+  is_remediation: false
 - id: intentional-kernel-violation
   objective: |
     THIS TASK IS INTENTIONALLY DESIGNED TO FAIL. It exercises the Circuit agent
@@ -468,3 +475,113 @@ tasks:
   status: pending
   depends_on: []
   decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+- id: circuit-fix-0-7371f136
+  objective: Review and correct the resource access logic within the 'display-pipeline-status' task to ensure it only accesses permitted paths.
+  priority: 2
+  status: failed
+  depends_on: []
+  decomposition_depth: 0
+  error: 'budget exceeded: token limit exceeded: 130074 / 120000 tokens used'
+  remediation_depth: 1
+  is_remediation: true
+- id: add-limits-config-validation-part1
+  objective: Implement the `validate()` method for `LimitsConfig` in `crates/eng-org/src/config.rs`, performing all specified checks and returning `Result<()>` using `glitchlab_kernel::error::Error::Message` for violations.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'budget exceeded: token limit exceeded: 135543 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
+- id: add-limits-config-validation-part2
+  objective: Locate the `EngConfig::load()` method (or similar deserialization entry point) in `crates/eng-org/src/config.rs` and call `self.limits.validate()?` after deserialization to ensure loaded configurations are valid.
+  priority: 50
+  status: pending
+  depends_on:
+  - add-limits-config-validation-part1
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: add-limits-config-validation-part3
+  objective: Add a unit test module (`#[cfg(test)] mod tests`) to `crates/eng-org/src/config.rs` and include test cases that verify `LimitsConfig::validate()` correctly rejects invalid configurations for each specified rule.
+  priority: 50
+  status: pending
+  depends_on:
+  - add-limits-config-validation-part1
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: add-task-id-sanitization-part1
+  objective: Implement the `sanitize_task_id` function in `crates/eng-org/src/taskqueue.rs` that transforms a string into a valid git branch suffix by lowercasing, replacing spaces/underscores with hyphens, stripping invalid characters, collapsing consecutive hyphens, and trimming leading/trailing hyphens.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'budget exceeded: token limit exceeded: 132483 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
+- id: add-task-id-sanitization-part2
+  objective: Add a `#[cfg(test)] mod tests` block to `crates/eng-org/src/taskqueue.rs` and write unit tests for the `sanitize_task_id` function, covering edge cases like spaces, uppercase, special characters, empty string, and already-valid input.
+  priority: 50
+  status: pending
+  depends_on:
+  - add-task-id-sanitization-part1
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: add-task-id-sanitization-part3
+  objective: Integrate the `sanitize_task_id` function by calling it on the `id` field within the `bead_to_task` helper function in `crates/eng-org/src/taskqueue.rs` to ensure all task IDs derived from Beads are properly sanitized.
+  priority: 50
+  status: pending
+  depends_on:
+  - add-task-id-sanitization-part1
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+- id: add-config-comments-part1-routing
+  objective: Add inline comments to the `RoutingConfig` fields within the `EngConfig::default()` implementation in `crates/eng-org/src/config.rs`. Ensure comments note the `provider/model-name` format for model strings.
+  priority: 50
+  status: completed
+  depends_on: []
+  decomposition_depth: 1
+  pr_url: https://github.com/kitplummer/glitchlab/pull/50
+  remediation_depth: 0
+  is_remediation: false
+- id: add-config-comments-part2-limits
+  objective: Add inline comments to the `LimitsConfig` fields within the `EngConfig::default()` implementation in `crates/eng-org/src/config.rs`, explaining purpose and valid ranges.
+  priority: 50
+  status: completed
+  depends_on: []
+  decomposition_depth: 1
+  pr_url: https://github.com/kitplummer/glitchlab/pull/51
+  remediation_depth: 0
+  is_remediation: false
+- id: add-config-comments-part3-intervention
+  objective: Add inline comments to the `InterventionConfig` fields within the `EngConfig::default()` implementation in `crates/eng-org/src/config.rs`, explaining their purpose.
+  priority: 50
+  status: completed
+  depends_on: []
+  decomposition_depth: 1
+  pr_url: https://github.com/kitplummer/glitchlab/pull/52
+  remediation_depth: 0
+  is_remediation: false
+- id: add-config-comments-part4-workspace-boundaries
+  objective: Add inline comments to the `WorkspaceConfig` and `BoundariesConfig` fields within the `EngConfig::default()` implementation in `crates/eng-org/src/config.rs`, explaining their purpose.
+  priority: 50
+  status: completed
+  depends_on: []
+  decomposition_depth: 1
+  pr_url: https://github.com/kitplummer/glitchlab/pull/53
+  remediation_depth: 0
+  is_remediation: false
+- id: add-config-comments-part5-memory-toplevel
+  objective: Add inline comments to the `MemoryConfig` fields and the remaining top-level `EngConfig` fields (e.g., `allowed_tools`, `blocked_patterns`, `test_command_override`, `providers`, `tqm`) within the `EngConfig::default()` implementation in `crates/eng-org/src/config.rs`, explaining their purpose.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'budget exceeded: token limit exceeded: 132072 / 120000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
