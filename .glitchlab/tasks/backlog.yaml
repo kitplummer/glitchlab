@@ -1,34 +1,44 @@
 tasks:
-- id: display-model-tier
+- id: display-pipeline-status
   objective: |
-    Add a `Display` trait implementation for the `ModelTier` enum in
-    `crates/router/src/chooser.rs`. The output should be the variant name
-    as a lowercase string: "economy", "standard", "premium". This matches
-    the `from_str_loose` parsing already present. Add a unit test in the
-    existing `#[cfg(test)] mod tests` block that verifies all three variants
-    produce the expected string via `.to_string()`.
+    Add a `Display` trait implementation for the `PipelineStatus` enum in
+    `crates/kernel/src/pipeline.rs`. The enum has 19 variants (PrCreated through
+    Error). Use human-readable lowercase output matching the serde rename_all
+    snake_case pattern, e.g. PrCreated -> "pr created", TestsFailed -> "tests failed",
+    BudgetExceeded -> "budget exceeded", etc. Add a unit test in the existing
+    `#[cfg(test)] mod tests` block that verifies all 19 variants produce the
+    expected string via `.to_string()`. The enum starts around line 141. Use
+    `read_file` to read lines 139-180 to see all variants.
   priority: 10
-  status: completed
+  status: pending
   depends_on: []
-- id: display-task-status
+  decomposition_depth: 0
+- id: display-pattern-kind
   objective: |
-    Add a `Display` trait implementation for the `TaskStatus` enum in
-    `crates/eng-org/src/taskqueue.rs`. Use snake_case output matching the
-    serde rename: "pending", "in_progress", "completed", "failed", "skipped".
-    Add a unit test in the existing test module that verifies all five
-    variants produce the correct string via `.to_string()`.
+    Add a `Display` trait implementation for the `PatternKind` enum in
+    `crates/eng-org/src/tqm.rs`. The enum has 8 variants: DecompositionLoop,
+    ScopeCreep, ModelDegradation, StuckAgents, TestFlakiness,
+    ArchitectRejectionRate, BudgetPressure, ProviderFailures. Use human-readable
+    output like "decomposition loop", "scope creep", "model degradation", etc.
+    Add a unit test in the existing `#[cfg(test)] mod tests` block that verifies
+    all 8 variants produce the expected string via `.to_string()`. The enum starts
+    around line 97. Use `read_file` to read lines 95-114 to see all variants.
   priority: 20
-  status: completed
+  status: pending
   depends_on: []
-- id: display-cease-reason
+  decomposition_depth: 0
+- id: display-failure-category
   objective: |
-    Add a `Display` trait implementation for the `CeaseReason` enum in
-    `crates/eng-org/src/orchestrator.rs`. Use human-readable output:
-    "all tasks done", "budget exhausted", "quality gate failed". Add a
-    unit test that verifies all three variants produce the correct string.
-    The enum is defined around line 234. Use `read_file` with `start_line`
-    and `end_line` to read only the relevant section (~lines 220-250).
+    Add a `Display` trait implementation for the `FailureCategory` enum in
+    `crates/eng-org/src/orchestrator.rs`. The enum has 9 variants: SetupError,
+    PlanFailed, ImplementationFailed, TestsFailed, ArchitectRejected,
+    MaxAttemptsExceeded, BudgetExceeded, Timeout, Other. Use human-readable
+    output like "setup error", "plan failed", "tests failed", etc. Add a unit
+    test in the existing `#[cfg(test)] mod tests` block that verifies all 9
+    variants produce the expected string via `.to_string()`. The enum starts
+    around line 385. Use `read_file` to read lines 383-395 to see all variants.
   priority: 30
   status: completed
   depends_on: []
-  pr_url: https://github.com/kitplummer/glitchlab/pull/20
+  decomposition_depth: 0
+  pr_url: https://github.com/kitplummer/glitchlab/pull/36
