@@ -106,8 +106,11 @@ impl BeadsClient {
 
     /// Create a new bead for a task.
     pub async fn create_bead(&self, task_id: &str, status: &str) -> Result<String> {
-        self.run_bd(&["create", "--task", task_id, "--status", status])
-            .await
+        let title = format!("Task {task_id}: {status}");
+        self.run_bd(&[
+            "create", &title, "--id", task_id, "--type", "task", "--silent",
+        ])
+        .await
     }
 
     /// Link two beads.
@@ -117,8 +120,7 @@ impl BeadsClient {
 
     /// Update a bead's status.
     pub async fn update_status(&self, task_id: &str, status: &str) -> Result<String> {
-        self.run_bd(&["update", "--task", task_id, "--status", status])
-            .await
+        self.run_bd(&["update", task_id, "--status", status]).await
     }
 
     /// List beads (raw text output).
@@ -147,9 +149,15 @@ impl HistoryBackend for BeadsClient {
         entry: &'a HistoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.create_bead(&entry.task_id, &entry.status)
-                .await
-                .map(|_| ())
+            // Try updating the existing bead first (task loaded from backlog).
+            // If that fails (bead doesn't exist yet), create a new one.
+            match self.update_status(&entry.task_id, &entry.status).await {
+                Ok(_) => Ok(()),
+                Err(_) => self
+                    .create_bead(&entry.task_id, &entry.status)
+                    .await
+                    .map(|_| ()),
+            }
         })
     }
 
@@ -408,6 +416,106 @@ mod tests {
         assert_eq!(bead.dependencies[0].dep_type, "parent-child");
         assert_eq!(bead.dependencies[1].target_id, "gl-1e0.1");
         assert_eq!(bead.dependencies[1].dep_type, "blocks");
+    }
+
+    // -----------------------------------------------------------------------
+    // Arg-capturing mock for verifying bd command signatures
+    // -----------------------------------------------------------------------
+
+    /// Create a mock bd script that writes all args to a file and prints
+    /// an optional response to stdout.
+    fn mock_bd_capture(dir: &std::path::Path, response: &str) -> (PathBuf, PathBuf) {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CAP_COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = CAP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let script = dir.join(format!("mock_bd_cap_{n}"));
+        let args_file = dir.join(format!("mock_bd_args_{n}"));
+        let content = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\n",
+            args_file.display(),
+            response.replace('\'', "'\\''")
+        );
+        let mut f = std::fs::File::create(&script).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        (script, args_file)
+    }
+
+    #[tokio::test]
+    async fn create_bead_uses_correct_bd_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, args_file) = mock_bd_capture(dir.path(), "gl-42");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let result = client.create_bead("gl-42", "failed").await.unwrap();
+        assert_eq!(result, "gl-42");
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        // bd create "Task gl-42: failed" --id gl-42 --type task --silent
+        assert_eq!(lines[0], "create");
+        assert_eq!(lines[1], "Task gl-42: failed");
+        assert_eq!(lines[2], "--id");
+        assert_eq!(lines[3], "gl-42");
+        assert_eq!(lines[4], "--type");
+        assert_eq!(lines[5], "task");
+        assert_eq!(lines[6], "--silent");
+    }
+
+    #[tokio::test]
+    async fn update_status_uses_correct_bd_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, args_file) = mock_bd_capture(dir.path(), "");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        client.update_status("gl-42", "closed").await.unwrap();
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        // bd update gl-42 --status closed
+        assert_eq!(lines[0], "update");
+        assert_eq!(lines[1], "gl-42");
+        assert_eq!(lines[2], "--status");
+        assert_eq!(lines[3], "closed");
+    }
+
+    #[tokio::test]
+    async fn record_updates_existing_bead_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mock always succeeds — update should be tried first
+        let (script, args_file) = mock_bd_capture(dir.path(), "");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let entry = HistoryEntry {
+            timestamp: chrono::Utc::now(),
+            task_id: "gl-99".into(),
+            status: "pr_created".into(),
+            pr_url: None,
+            branch: None,
+            error: None,
+            budget: glitchlab_kernel::budget::BudgetSummary::default(),
+            events_summary: crate::history::EventsSummary::default(),
+            stage_outputs: None,
+            events: None,
+            outcome_context: None,
+        };
+        client.record(&entry).await.unwrap();
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        // Should have called update (tried first), not create
+        assert_eq!(lines[0], "update");
+        assert_eq!(lines[1], "gl-99");
+        assert_eq!(lines[2], "--status");
+        assert_eq!(lines[3], "pr_created");
     }
 
     // -----------------------------------------------------------------------
