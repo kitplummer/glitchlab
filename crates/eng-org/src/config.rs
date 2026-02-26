@@ -234,14 +234,23 @@ impl Default for EngConfig {
     fn default() -> Self {
         Self {
             routing: RoutingConfig {
+                // Planner agent model (provider/model-name).
                 planner: "anthropic/claude-haiku-4-5-20251001".into(),
+                // Implementer agent model (provider/model-name).
                 implementer: "anthropic/claude-sonnet-4-20250514".into(),
+                // Debugger agent model (provider/model-name).
                 debugger: "anthropic/claude-sonnet-4-20250514".into(),
+                // Security agent model (provider/model-name).
                 security: "anthropic/claude-haiku-4-5-20251001".into(),
+                // Release agent model (provider/model-name).
                 release: "anthropic/claude-haiku-4-5-20251001".into(),
+                // Archivist agent model (provider/model-name).
                 archivist: "anthropic/claude-haiku-4-5-20251001".into(),
+                // Architect triage agent model (provider/model-name).
                 architect_triage: default_architect_model(),
+                // Architect review agent model (provider/model-name).
                 architect_review: default_architect_model(),
+                // Ops diagnosis agent model (provider/model-name).
                 ops_diagnosis: default_ops_diagnosis_model(),
                 models: Vec::new(),
                 roles: HashMap::new(),
