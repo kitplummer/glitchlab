@@ -173,6 +173,13 @@ impl ModelChooser {
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
     }
+
+    /// Fallback to the cheapest available model regardless of role preferences.
+    ///
+    /// Returns `None` if the model pool is empty.
+    pub fn fallback_for_role(&self) -> Option<&str> {
+        self.models.first().map(|m| m.model_string.as_str())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +423,20 @@ mod tests {
     fn is_empty_with_models() {
         let chooser = test_chooser(0.5);
         assert!(!chooser.is_empty());
+    }
+
+    #[test]
+    fn fallback_for_role_returns_cheapest_when_available() {
+        let chooser = test_chooser(0.7);
+        let selected = chooser.fallback_for_role();
+        assert_eq!(selected, Some("gemini/gemini-2.5-flash-lite"));
+    }
+
+    #[test]
+    fn fallback_for_role_returns_none_when_pool_empty() {
+        let chooser = ModelChooser::new(vec![], HashMap::new(), 0.5);
+        let selected = chooser.fallback_for_role();
+        assert_eq!(selected, None);
     }
 
     #[test]
