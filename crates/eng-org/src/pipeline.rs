@@ -1681,17 +1681,24 @@ fn extract_all_plan_files(plan: &serde_json::Value) -> Vec<String> {
 
 /// Determine whether the planner output qualifies for short-circuit mode.
 ///
-/// Eligible when: complexity is trivial/small, no core change required,
-/// file count within limit, and no decomposition.
+/// Uses structural signals (file count, step count, decomposition) as the
+/// primary check rather than trusting the LLM's stated complexity label.
+/// A task is eligible when it has no decomposition, no core change, few
+/// files, few steps, and complexity is not "large".
 fn is_short_circuit_eligible(plan_data: &serde_json::Value, max_files: usize) -> bool {
-    let complexity = plan_data["estimated_complexity"]
-        .as_str()
-        .unwrap_or("medium");
-    if complexity != "trivial" && complexity != "small" {
+    // Decomposed tasks need the full pipeline.
+    if plan_data
+        .get("decomposition")
+        .is_some_and(|d| d.is_array() && !d.as_array().unwrap().is_empty())
+    {
+        tracing::debug!("short-circuit: ineligible — task has decomposition");
         return false;
     }
 
-    if plan_data["requires_core_change"].as_bool().unwrap_or(true) {
+    // Core changes need full review. Default false — boundary checking
+    // is enforced independently by the tool dispatcher.
+    if plan_data["requires_core_change"].as_bool().unwrap_or(false) {
+        tracing::debug!("short-circuit: ineligible — requires core change");
         return false;
     }
 
@@ -1700,17 +1707,38 @@ fn is_short_circuit_eligible(plan_data: &serde_json::Value, max_files: usize) ->
         .map(|a| a.len())
         .unwrap_or(0);
     if file_count > max_files || file_count == 0 {
+        tracing::debug!(
+            file_count,
+            max_files,
+            "short-circuit: ineligible — file count out of range"
+        );
         return false;
     }
 
-    // Decomposed tasks need the full pipeline.
-    if plan_data
-        .get("decomposition")
-        .is_some_and(|d| d.is_array() && !d.as_array().unwrap().is_empty())
-    {
+    // More than 3 steps is structurally too complex for short-circuit.
+    let step_count = plan_data["steps"].as_array().map(|a| a.len()).unwrap_or(0);
+    if step_count > 3 {
+        tracing::debug!(step_count, "short-circuit: ineligible — too many steps");
         return false;
     }
 
+    // Reject only "large" — trust structural signals over the LLM's label.
+    // Sub-tasks from decomposition are structurally small but often labelled
+    // "medium" by the planner; rejecting "medium" would defeat the purpose.
+    let complexity = plan_data["estimated_complexity"]
+        .as_str()
+        .unwrap_or("medium");
+    if complexity == "large" {
+        tracing::debug!(complexity, "short-circuit: ineligible — large complexity");
+        return false;
+    }
+
+    tracing::debug!(
+        file_count,
+        step_count,
+        complexity,
+        "short-circuit: eligible"
+    );
     true
 }
 
@@ -5188,11 +5216,38 @@ mod tests {
     }
 
     #[test]
-    fn short_circuit_medium_complexity_rejected() {
+    fn short_circuit_medium_complexity_with_few_files_allowed() {
+        // Sub-tasks from decomposition are structurally small but labelled
+        // "medium" — they should still qualify for short-circuit.
         let plan = serde_json::json!({
             "estimated_complexity": "medium",
             "requires_core_change": false,
             "files_likely_affected": ["src/lib.rs"],
+            "steps": [{"step_number": 1, "description": "edit"}],
+        });
+        assert!(is_short_circuit_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn short_circuit_large_complexity_rejected() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "large",
+            "requires_core_change": false,
+            "files_likely_affected": ["src/lib.rs"],
+        });
+        assert!(!is_short_circuit_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn short_circuit_too_many_steps_rejected() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "small",
+            "requires_core_change": false,
+            "files_likely_affected": ["src/lib.rs"],
+            "steps": [
+                {"step_number": 1}, {"step_number": 2},
+                {"step_number": 3}, {"step_number": 4},
+            ],
         });
         assert!(!is_short_circuit_eligible(&plan, 2));
     }
@@ -5486,7 +5541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base_branch = init_test_repo(dir.path());
 
-        // Full responses needed — planner says "medium" so short circuit won't trigger.
+        // Full responses needed — 3 files exceeds max_files so short circuit won't trigger.
         let mut responses = pipeline_mock_responses();
         // Replace planner response with medium complexity.
         responses[0] = final_response(
@@ -5522,7 +5577,7 @@ mod tests {
             result.error
         );
 
-        // Medium complexity + 3 files → not eligible → all stages run.
+        // 3 files exceeds max_files (2) → not eligible → all stages run.
         assert!(
             result.stage_outputs.contains_key("architect_triage"),
             "triage should run for non-eligible tasks"
