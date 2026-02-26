@@ -13,6 +13,9 @@ routing:
   release: "gemini/gemini-2.5-flash"
   archivist: "gemini/gemini-2.5-flash-lite"
 
+  # Example for Ollama routing (local models):
+  # ollama: "ollama/llama3"
+
 # Budget + safety limits per task
 limits:
   max_fix_attempts: 4
