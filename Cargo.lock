@@ -638,6 +638,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "glitchlab-ops-org"
+version = "0.1.0"
+
+[[package]]
 name = "glitchlab-router"
 version = "0.1.0"
 dependencies = [
