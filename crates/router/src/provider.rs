@@ -50,6 +50,14 @@ pub trait Provider: Send + Sync {
         let _ = tools;
         self.complete(model, messages, temperature, max_tokens, response_format)
     }
+
+    /// Returns `true` if the provider supports native tool use (i.e., it can
+    /// parse tool definitions and return tool calls in its responses).
+    ///
+    /// Defaults to `false`.
+    fn supports_native_tool_use(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -151,5 +159,25 @@ mod tests {
         };
         assert!(init2.base_url.is_none());
         assert!(init2.name.is_none());
+    }
+
+    #[test]
+    fn default_supports_native_tool_use_is_false() {
+        struct MockProvider;
+        impl Provider for MockProvider {
+            fn complete(
+                &self,
+                _model: &str,
+                _messages: &[Message],
+                _temperature: f32,
+                _max_tokens: u32,
+                _response_format: Option<&serde_json::Value>,
+            ) -> ProviderFuture<'_> {
+                unimplemented!()
+            }
+        }
+
+        let provider = MockProvider;
+        assert!(!provider.supports_native_tool_use());
     }
 }
