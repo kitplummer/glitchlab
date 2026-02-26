@@ -2143,6 +2143,86 @@ mod tests {
         assert_eq!(contexts[1].approach, "attempt 2");
     }
 
+    use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+    fn make_outcome_context(approach: &str) -> OutcomeContext {
+        OutcomeContext {
+            approach: approach.into(),
+            obstacle: ObstacleKind::Unknown {
+                detail: "test".into(),
+            },
+            discoveries: vec![],
+            recommendation: None,
+            files_explored: vec![],
+        }
+    }
+
+    #[test]
+    fn test_count_unknown_task_id() {
+        let tracker = AttemptTracker::new();
+        assert_eq!(tracker.count("non-existent-task"), 0);
+    }
+
+    #[test]
+    fn test_record_increments_count() {
+        let mut tracker = AttemptTracker::new();
+        let task_id = "task-1";
+
+        assert_eq!(tracker.count(task_id), 0);
+
+        tracker.record(task_id, make_outcome_context("attempt1"));
+        assert_eq!(tracker.count(task_id), 1);
+
+        tracker.record(task_id, make_outcome_context("attempt2"));
+        assert_eq!(tracker.count(task_id), 2);
+    }
+
+    #[test]
+    fn test_contexts_returns_in_order() {
+        let mut tracker = AttemptTracker::new();
+        let task_id = "task-1";
+
+        let ctx1 = make_outcome_context("first");
+        let ctx2 = make_outcome_context("second");
+        let ctx3 = make_outcome_context("third");
+
+        tracker.record(task_id, ctx1.clone());
+        tracker.record(task_id, ctx2.clone());
+        tracker.record(task_id, ctx3.clone());
+
+        let contexts = tracker.contexts(task_id);
+        assert_eq!(contexts.len(), 3);
+        assert_eq!(contexts[0].approach, "first");
+        assert_eq!(contexts[1].approach, "second");
+        assert_eq!(contexts[2].approach, "third");
+    }
+
+    #[test]
+    fn test_multiple_task_ids_tracked_independently() {
+        let mut tracker = AttemptTracker::new();
+
+        let ctx1_1 = make_outcome_context("task1-attempt1");
+        let ctx1_2 = make_outcome_context("task1-attempt2");
+        let ctx2_1 = make_outcome_context("task2-attempt1");
+
+        tracker.record("task-1", ctx1_1);
+        tracker.record("task-2", ctx2_1);
+        tracker.record("task-1", ctx1_2);
+
+        assert_eq!(tracker.count("task-1"), 2);
+        assert_eq!(tracker.count("task-2"), 1);
+        assert_eq!(tracker.count("task-3"), 0);
+
+        let contexts1 = tracker.contexts("task-1");
+        assert_eq!(contexts1.len(), 2);
+        assert_eq!(contexts1[0].approach, "task1-attempt1");
+        assert_eq!(contexts1[1].approach, "task1-attempt2");
+
+        let contexts2 = tracker.contexts("task-2");
+        assert_eq!(contexts2.len(), 1);
+        assert_eq!(contexts2[0].approach, "task2-attempt1");
+    }
+
     #[test]
     fn attempt_tracker_default() {
         let tracker = AttemptTracker::default();
