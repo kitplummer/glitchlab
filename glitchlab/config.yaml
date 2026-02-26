@@ -110,3 +110,15 @@ ops_agent:
   governance:
     max_retries_on_failure: 3
     human_approval_for_deploy: true
+
+# Failure detection configuration
+failure_detection:
+  enabled: true
+  step_timeout_seconds: 300
+  log_error_patterns:
+    - "error"
+    - "fail"
+    - "exception"
+    - "traceback"
+    - "panic"
+    - "fatal"
