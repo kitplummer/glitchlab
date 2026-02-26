@@ -218,6 +218,7 @@ pub enum EventKind {
     PrCreated,
     ArchitectTriage,
     ArchitectReview,
+    ArchitectPrReview,
     PrMerged,
     BudgetExceeded,
     Error,
@@ -384,6 +385,13 @@ mod tests {
         let kind = EventKind::ArchitectReview;
         let json = serde_json::to_string(&kind).unwrap();
         assert_eq!(json, "\"architect_review\"");
+    }
+
+    #[test]
+    fn event_kind_architect_pr_review_serde() {
+        let kind = EventKind::ArchitectPrReview;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"architect_pr_review\"");
     }
 
     #[test]

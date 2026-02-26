@@ -172,6 +172,9 @@ pub struct InterventionConfig {
     pub pause_before_pr: bool,
     pub pause_on_core_change: bool,
     pub pause_on_budget_exceeded: bool,
+    /// When true, the architect reviews the PR diff after creation and before auto-merge.
+    #[serde(default)]
+    pub review_pr_diff: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +242,7 @@ impl Default for EngConfig {
                 pause_before_pr: true,
                 pause_on_core_change: true,
                 pause_on_budget_exceeded: true,
+                review_pr_diff: false,
             },
             workspace: WorkspaceConfig {
                 worktree_dir: ".glitchlab/worktrees".into(),
@@ -576,6 +580,7 @@ mod tests {
         assert!((config.limits.max_dollars_per_task - 0.50).abs() < f64::EPSILON);
         assert!(config.intervention.pause_after_plan);
         assert!(config.intervention.pause_before_pr);
+        assert!(!config.intervention.review_pr_diff);
         assert!(!config.allowed_tools.is_empty());
         assert!(!config.blocked_patterns.is_empty());
         assert!(config.routing.implementer.contains("anthropic"));

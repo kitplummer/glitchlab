@@ -105,6 +105,13 @@ pub trait ExternalOps: Send + Sync {
         branch: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 
+    /// Fetch a PR diff via `gh pr diff <url>`.
+    fn pr_diff<'a>(
+        &'a self,
+        worktree: &'a Path,
+        pr_url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+
     /// Auto-merge a PR via `gh pr merge --squash --delete-branch`.
     fn merge_pr<'a>(
         &'a self,
@@ -226,6 +233,30 @@ impl ExternalOps for RealExternalOps {
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 Err(format!("gh pr view failed: {stderr}"))
+            }
+        })
+    }
+
+    fn pr_diff<'a>(
+        &'a self,
+        worktree: &'a Path,
+        pr_url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let output = Command::new("gh")
+                .args(["pr", "diff", pr_url])
+                .current_dir(worktree)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| format!("gh pr diff: {e}"))?;
+
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(format!("gh pr diff failed: {stderr}"))
             }
         })
     }
@@ -1176,7 +1207,104 @@ impl EngineeringPipeline {
             serde_json::json!({ "url": &pr_url }),
         );
 
-        // --- Stage 15b: Auto-merge PR ---
+        // --- Stage 15b: Post-PR architect review ---
+        if self.config.intervention.review_pr_diff {
+            ctx.current_stage = Some("architect_pr_review".into());
+
+            // Fetch PR diff from GitHub, fall back to local diff on failure.
+            let pr_review_diff = match self.ops.pr_diff(&wt_path, &pr_url).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(task_id, error = %e, "pr_diff failed, falling back to local diff");
+                    workspace.diff_full(base_branch).await.unwrap_or_default()
+                }
+            };
+
+            ctx.agent_context.previous_output = serde_json::json!({
+                "review_stage": "post_pr",
+                "pr_url": &pr_url,
+                "diff": truncate(&pr_review_diff, 4000),
+                "plan": plan_output.data,
+                "implementation": impl_output.data,
+                "security": security_output.data,
+            });
+
+            let pr_review_agent = ArchitectReviewAgent::new(Arc::clone(&self.router));
+            let pr_review_verdict = match pr_review_agent.execute(&ctx.agent_context).await {
+                Ok(o) => {
+                    self.emit(&mut ctx, EventKind::ArchitectPrReview, o.data.clone());
+                    ctx.stage_outputs
+                        .insert("architect_pr_review".into(), o.clone());
+                    o.data["verdict"].as_str().unwrap_or("merge").to_string()
+                }
+                Err(e) => {
+                    // Pre-commit review already approved; don't block on agent failure.
+                    warn!(task_id, error = %e, "post-PR architect review failed, defaulting to merge");
+                    "merge".to_string()
+                }
+            };
+
+            match pr_review_verdict.as_str() {
+                "close" => {
+                    info!(task_id, "post-PR architect review: rejected changes");
+                    let budget = self.router.budget_summary().await;
+                    return PipelineResult {
+                        status: PipelineStatus::ArchitectRejected,
+                        stage_outputs: ctx.stage_outputs,
+                        events: ctx.events,
+                        budget,
+                        pr_url: Some(pr_url),
+                        branch: Some(workspace.branch_name().into()),
+                        error: Some("post-PR architect review rejected changes".into()),
+                        outcome_context: None,
+                    };
+                }
+                "request_changes" => {
+                    info!(task_id, "post-PR architect review: changes requested");
+
+                    let review_data = ctx
+                        .stage_outputs
+                        .get("architect_pr_review")
+                        .map(|o| &o.data);
+                    let issues_summary = review_data
+                        .and_then(|d| d.get("issues"))
+                        .map(|i| i.to_string())
+                        .unwrap_or_default();
+                    let reasoning = review_data
+                        .and_then(|d| d.get("reasoning"))
+                        .and_then(|r| r.as_str())
+                        .map(String::from);
+
+                    let budget = self.router.budget_summary().await;
+                    return PipelineResult {
+                        status: PipelineStatus::Retryable,
+                        stage_outputs: ctx.stage_outputs,
+                        events: ctx.events,
+                        budget,
+                        pr_url: Some(pr_url),
+                        branch: Some(workspace.branch_name().into()),
+                        error: Some(format!(
+                            "post-PR architect requested changes: {issues_summary}"
+                        )),
+                        outcome_context: Some(OutcomeContext {
+                            approach: "PR created but post-PR architect review requested changes"
+                                .into(),
+                            obstacle: glitchlab_kernel::outcome::ObstacleKind::ArchitecturalGap {
+                                description: issues_summary,
+                            },
+                            discoveries: vec![],
+                            recommendation: reasoning,
+                            files_explored: vec![],
+                        }),
+                    };
+                }
+                _ => {
+                    // "merge" or any other value — proceed to auto-merge.
+                }
+            }
+        }
+
+        // --- Stage 15c: Auto-merge PR ---
         let mut final_status = PipelineStatus::PrCreated;
         match self.ops.merge_pr(&wt_path, &pr_url).await {
             Ok(()) => {
@@ -1193,7 +1321,7 @@ impl EngineeringPipeline {
             }
         }
 
-        // --- Stage 15c: Close bead ---
+        // --- Stage 15d: Close bead ---
         if self.config.memory.beads_enabled {
             let bd_path = self.config.memory.beads_bd_path.as_deref().unwrap_or("bd");
             match self.ops.close_bead(repo_path, bd_path, task_id).await {
@@ -1517,6 +1645,7 @@ mod tests {
         test_results: Mutex<VecDeque<Result<(), String>>>,
         create_pr_results: Mutex<VecDeque<Result<String, String>>>,
         view_pr_results: Mutex<VecDeque<Result<String, String>>>,
+        pr_diff_results: Mutex<VecDeque<Result<String, String>>>,
         merge_results: Mutex<VecDeque<Result<(), String>>>,
         close_bead_results: Mutex<VecDeque<Result<(), String>>>,
     }
@@ -1528,6 +1657,7 @@ mod tests {
                 test_results: Mutex::new(VecDeque::new()),
                 create_pr_results: Mutex::new(VecDeque::new()),
                 view_pr_results: Mutex::new(VecDeque::new()),
+                pr_diff_results: Mutex::new(VecDeque::new()),
                 merge_results: Mutex::new(VecDeque::new()),
                 close_bead_results: Mutex::new(VecDeque::new()),
             }
@@ -1590,6 +1720,20 @@ mod tests {
                     .unwrap()
                     .pop_front()
                     .unwrap_or_else(|| Ok("https://github.com/test/repo/pull/1".into()))
+            })
+        }
+
+        fn pr_diff<'a>(
+            &'a self,
+            _worktree: &'a Path,
+            _pr_url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.pr_diff_results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| Ok("diff --git a/file.rs b/file.rs\n+added line\n".into()))
             })
         }
 
@@ -4047,5 +4191,287 @@ mod tests {
             oc.recommendation.is_some(),
             "recommendation should contain architect reasoning"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-PR architect review tests
+    // -----------------------------------------------------------------------
+
+    /// Build mock responses for a full pipeline run that includes a post-PR
+    /// architect review step. The 9th response is the post-PR review verdict.
+    fn pipeline_mock_responses_with_pr_review(
+        verdict: &str,
+    ) -> Vec<glitchlab_router::RouterResponse> {
+        let mut responses = pipeline_mock_responses();
+        // 9. Post-PR architect review
+        responses.push(final_response(&format!(
+            r#"{{"verdict": "{verdict}", "confidence": 0.9, "reasoning": "post-pr review", "quality_score": 8, "issues": [{{"severity": "minor", "description": "nit"}}], "architectural_fitness": "good", "merge_strategy": "squash"}}"#
+        )));
+        responses
+    }
+
+    #[tokio::test]
+    async fn pipeline_pr_review_approve_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses_with_pr_review("merge"));
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.intervention.review_pr_diff = true;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/1".into()));
+        mock_ops
+            .pr_diff_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("diff --git a/f.rs b/f.rs\n+line\n".into()));
+        mock_ops.merge_results.lock().unwrap().push_back(Ok(()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run(
+                "test-pr-review-approve",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::PrMerged);
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://github.com/test/pr/1")
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::ArchitectPrReview),
+            "expected ArchitectPrReview event"
+        );
+        assert!(
+            result.events.iter().any(|e| e.kind == EventKind::PrMerged),
+            "expected PrMerged event"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_pr_review_request_changes_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router =
+            sequential_router_ref(pipeline_mock_responses_with_pr_review("request_changes"));
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.intervention.review_pr_diff = true;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/2".into()));
+        mock_ops
+            .pr_diff_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("diff --git a/f.rs b/f.rs\n+line\n".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run(
+                "test-pr-review-changes",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::Retryable);
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://github.com/test/pr/2"),
+            "pr_url should be preserved on request_changes"
+        );
+        assert!(result.outcome_context.is_some());
+        let oc = result.outcome_context.unwrap();
+        assert!(
+            oc.approach.contains("post-PR"),
+            "approach should mention post-PR"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_pr_review_close_rejects_with_pr_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses_with_pr_review("close"));
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.intervention.review_pr_diff = true;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/3".into()));
+        mock_ops
+            .pr_diff_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("diff --git a/f.rs b/f.rs\n+line\n".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run(
+                "test-pr-review-close",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::ArchitectRejected);
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://github.com/test/pr/3"),
+            "pr_url should be preserved on close"
+        );
+        assert!(result.error.as_ref().is_some_and(|e| e.contains("post-PR")));
+    }
+
+    #[tokio::test]
+    async fn pipeline_pr_review_diff_fetch_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses_with_pr_review("merge"));
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.intervention.review_pr_diff = true;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/4".into()));
+        // pr_diff fails → should fallback to local diff
+        mock_ops
+            .pr_diff_results
+            .lock()
+            .unwrap()
+            .push_back(Err("gh not available".into()));
+        mock_ops.merge_results.lock().unwrap().push_back(Ok(()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run(
+                "test-pr-review-fallback",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        // Should still succeed (merge verdict) using fallback diff.
+        assert_eq!(result.status, PipelineStatus::PrMerged);
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::ArchitectPrReview),
+            "expected ArchitectPrReview event even when using fallback diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_pr_review_disabled_skips_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        // Standard responses — no extra post-PR review response needed.
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.intervention.review_pr_diff = false; // disabled
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/5".into()));
+        mock_ops.merge_results.lock().unwrap().push_back(Ok(()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run(
+                "test-pr-review-disabled",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::PrMerged);
+        // No ArchitectPrReview event should exist.
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::ArchitectPrReview),
+            "ArchitectPrReview event should not be emitted when review_pr_diff is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_ops_pr_diff_without_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = RealExternalOps;
+        // `gh` likely not configured for this repo → should return an error.
+        let result = ops
+            .pr_diff(dir.path(), "https://github.com/test/pr/999")
+            .await;
+        assert!(result.is_err(), "expected error when gh is not available");
     }
 }
