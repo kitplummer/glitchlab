@@ -101,9 +101,11 @@ impl Router {
         self.providers.insert(name, provider);
     }
 
-    /// Resolve role → model string using the chooser (if present) or the
-    /// static routing map as a fallback.
-    async fn resolve_model(&self, role: &str) -> error::Result<String> {
+    /// Select a model for the given agent role.
+    ///
+    /// Uses the chooser (if present) or the static routing map as a fallback.
+    /// Returns a list of model IDs, ordered by preference.
+    pub async fn select(&self, role: &str) -> error::Result<Vec<String>> {
         if let Some(ref chooser) = self.chooser {
             let budget = self.budget.lock().await;
             let remaining = budget.dollars_remaining();
@@ -111,13 +113,14 @@ impl Router {
             drop(budget);
 
             if let Some(model) = chooser.select(role, remaining, max_budget) {
-                return Ok(model.to_string());
+                return Ok(vec![model.to_string()]);
             }
             // Fall through to static map if chooser has no match.
         }
         self.routing
             .get(role)
             .cloned()
+            .map(|s| vec![s])
             .ok_or_else(|| error::Error::Config(format!("no model configured for role `{role}`")))
     }
 
@@ -145,7 +148,9 @@ impl Router {
         }
 
         // Resolve role → model string (chooser-aware).
-        let model_string = self.resolve_model(role).await?;
+        let model_string = self.select(role).await?.into_iter().next().ok_or_else(|| {
+            error::Error::Config(format!("no model configured for role `{role}`"))
+        })?;
 
         let (provider_name, model_id) = parse_model_string(&model_string);
 
@@ -257,7 +262,9 @@ impl Router {
         }
 
         // Resolve role → model string (chooser-aware).
-        let model_string = self.resolve_model(role).await?;
+        let model_string = self.select(role).await?.into_iter().next().ok_or_else(|| {
+            error::Error::Config(format!("no model configured for role `{role}`"))
+        })?;
 
         let (provider_name, model_id) = parse_model_string(&model_string);
 
@@ -982,29 +989,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_model_uses_chooser_when_present() {
+    async fn select_uses_chooser_when_present() {
         let routing = HashMap::from([("planner".to_string(), "mock/fallback".to_string())]);
         let budget = BudgetTracker::new(100_000, 10.0);
         let router = Router::new(routing, budget).with_chooser(test_chooser());
 
-        let model = router.resolve_model("planner").await.unwrap();
+        let models = router.select("planner").await.unwrap();
         // Chooser should pick "mock/mid" (Standard tier, cheapest eligible).
-        assert_eq!(model, "mock/mid");
+        assert_eq!(models, vec!["mock/mid".to_string()]);
     }
 
     #[tokio::test]
-    async fn resolve_model_falls_back_to_static() {
+    async fn select_falls_back_to_static() {
         let routing = HashMap::from([("planner".to_string(), "mock/fallback".to_string())]);
         let budget = BudgetTracker::new(100_000, 10.0);
         // No chooser attached → uses static routing map.
         let router = Router::new(routing, budget);
 
-        let model = router.resolve_model("planner").await.unwrap();
-        assert_eq!(model, "mock/fallback");
+        let models = router.select("planner").await.unwrap();
+        assert_eq!(models, vec!["mock/fallback".to_string()]);
     }
 
     #[tokio::test]
-    async fn resolve_model_chooser_no_match_falls_to_static() {
+    async fn select_chooser_no_match_falls_to_static() {
         // Chooser with impossible requirements.
         let models = vec![ModelProfile {
             model_string: "mock/cheap".into(),
@@ -1026,8 +1033,18 @@ mod tests {
         let budget = BudgetTracker::new(100_000, 10.0);
         let router = Router::new(routing, budget).with_chooser(chooser);
 
-        let model = router.resolve_model("planner").await.unwrap();
-        assert_eq!(model, "mock/static");
+        let models = router.select("planner").await.unwrap();
+        assert_eq!(models, vec!["mock/static".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn select_unknown_role_errors() {
+        let routing = HashMap::new();
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget);
+
+        let result = router.select("nonexistent").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
