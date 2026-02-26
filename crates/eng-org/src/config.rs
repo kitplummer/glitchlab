@@ -270,6 +270,7 @@ impl Default for EngConfig {
                 pause_on_budget_exceeded: true,
                 review_pr_diff: false,
             },
+            // Workspace configuration: paths for worktrees, task data, and logs.
             workspace: WorkspaceConfig {
                 worktree_dir: ".glitchlab/worktrees".into(),
                 task_dir: ".glitchlab/tasks".into(),
@@ -325,6 +326,7 @@ impl Default for EngConfig {
                 "eval(".into(),
                 "exec(".into(),
             ],
+            // Boundary configuration: paths that the agent is not allowed to modify.
             boundaries: BoundariesConfig {
                 protected_paths: vec![],
             },
