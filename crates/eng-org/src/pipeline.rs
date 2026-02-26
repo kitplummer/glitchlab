@@ -569,120 +569,81 @@ impl EngineeringPipeline {
             };
         }
 
-        // --- Stage 3c: Architect triage ---
-        ctx.current_stage = Some("architect_triage".into());
-        ctx.agent_context.previous_output = plan_output.data.clone();
+        // --- Fast-path eligibility check ---
+        let use_fast_path = self.config.pipeline.fast_path_enabled
+            && is_fast_path_eligible(&plan_output.data, self.config.pipeline.fast_path_max_files);
 
-        // Re-load affected files so triage can check if code already exists.
-        let triage_files: Vec<String> = plan_output.data["files_likely_affected"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for file in &triage_files {
-            let full_path = repo_path.join(file);
-            if let Ok(content) = tokio::fs::read_to_string(&full_path).await {
-                let truncated = if content.len() > 8192 {
-                    format!("{}...\n[truncated]", &content[..8192])
-                } else {
-                    content
-                };
-                ctx.agent_context
-                    .file_context
-                    .insert(file.clone(), truncated);
-            }
+        if use_fast_path {
+            info!(
+                task_id,
+                "fast-path eligible — skipping triage, security, release, archivist"
+            );
         }
 
-        let triage_agent = ArchitectTriageAgent::new(Arc::clone(&self.router));
-        let triage_output = match triage_agent.execute(&ctx.agent_context).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(task_id, error = %e, "architect triage failed, continuing");
-                fallback_output(
-                    "architect_triage",
-                    serde_json::json!({
-                        "verdict": "proceed",
-                        "confidence": 0.0,
-                        "reasoning": "triage agent failed",
-                        "evidence": [],
-                        "architectural_notes": "",
-                        "suggested_changes": []
-                    }),
-                )
-            }
-        };
+        // --- Stage 3c: Architect triage (skipped on fast path) ---
+        if !use_fast_path {
+            ctx.current_stage = Some("architect_triage".into());
+            ctx.agent_context.previous_output = plan_output.data.clone();
 
-        let triage_verdict = triage_output.data["verdict"]
-            .as_str()
-            .unwrap_or("proceed")
-            .to_string();
-        self.emit(
-            &mut ctx,
-            EventKind::ArchitectTriage,
-            triage_output.data.clone(),
-        );
-        ctx.stage_outputs
-            .insert("architect_triage".into(), triage_output);
-
-        if triage_verdict == "already_done" {
-            info!(task_id, "architect triage: work already done, skipping");
-            let budget = self.router.budget_summary().await;
-            return PipelineResult {
-                status: PipelineStatus::AlreadyDone,
-                stage_outputs: ctx.stage_outputs,
-                events: ctx.events,
-                budget,
-                pr_url: None,
-                branch: None,
-                error: None,
-                outcome_context: None,
-            };
-        }
-
-        if triage_verdict == "needs_refinement" {
-            info!(task_id, "architect triage: refinement needed, replanning");
-
-            let triage_data = ctx
-                .stage_outputs
-                .get("architect_triage")
-                .map(|o| o.data.clone())
+            // Re-load affected files so triage can check if code already exists.
+            let triage_files: Vec<String> = plan_output.data["files_likely_affected"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
+            for file in &triage_files {
+                let full_path = repo_path.join(file);
+                if let Ok(content) = tokio::fs::read_to_string(&full_path).await {
+                    let truncated = if content.len() > 8192 {
+                        format!("{}...\n[truncated]", &content[..8192])
+                    } else {
+                        content
+                    };
+                    ctx.agent_context
+                        .file_context
+                        .insert(file.clone(), truncated);
+                }
+            }
 
-            ctx.agent_context.previous_output = serde_json::json!({
-                "original_plan": plan_output.data,
-                "triage_feedback": triage_data,
-                "instruction": "The architect reviewed your plan and requested refinements. Revise the plan addressing every issue in triage_feedback.suggested_changes.",
-            });
-
-            // Re-invoke planner (max 1 replan — no recursion).
-            let replan_output = match planner.execute(&ctx.agent_context).await {
+            let triage_agent = ArchitectTriageAgent::new(Arc::clone(&self.router));
+            let triage_output = match triage_agent.execute(&ctx.agent_context).await {
                 Ok(o) => o,
                 Err(e) => {
-                    return self
-                        .fail(
-                            ctx,
-                            PipelineStatus::PlanFailed,
-                            format!("replan failed: {e}"),
-                        )
-                        .await;
+                    warn!(task_id, error = %e, "architect triage failed, continuing");
+                    fallback_output(
+                        "architect_triage",
+                        serde_json::json!({
+                            "verdict": "proceed",
+                            "confidence": 0.0,
+                            "reasoning": "triage agent failed",
+                            "evidence": [],
+                            "architectural_notes": "",
+                            "suggested_changes": []
+                        }),
+                    )
                 }
             };
-            self.emit(&mut ctx, EventKind::PlanCreated, replan_output.data.clone());
-            ctx.stage_outputs
-                .insert("plan".into(), replan_output.clone());
-            plan_output = replan_output;
 
-            // Re-check for decomposition (same logic as Stage 3b).
-            if let Some(decomposition) = plan_output.data.get("decomposition")
-                && decomposition.is_array()
-                && !decomposition.as_array().unwrap().is_empty()
-            {
+            let triage_verdict = triage_output.data["verdict"]
+                .as_str()
+                .unwrap_or("proceed")
+                .to_string();
+            self.emit(
+                &mut ctx,
+                EventKind::ArchitectTriage,
+                triage_output.data.clone(),
+            );
+            ctx.stage_outputs
+                .insert("architect_triage".into(), triage_output);
+
+            if triage_verdict == "already_done" {
+                info!(task_id, "architect triage: work already done, skipping");
                 let budget = self.router.budget_summary().await;
                 return PipelineResult {
-                    status: PipelineStatus::Decomposed,
+                    status: PipelineStatus::AlreadyDone,
                     stage_outputs: ctx.stage_outputs,
                     events: ctx.events,
                     budget,
@@ -692,6 +653,58 @@ impl EngineeringPipeline {
                     outcome_context: None,
                 };
             }
+
+            if triage_verdict == "needs_refinement" {
+                info!(task_id, "architect triage: refinement needed, replanning");
+
+                let triage_data = ctx
+                    .stage_outputs
+                    .get("architect_triage")
+                    .map(|o| o.data.clone())
+                    .unwrap_or_default();
+
+                ctx.agent_context.previous_output = serde_json::json!({
+                    "original_plan": plan_output.data,
+                    "triage_feedback": triage_data,
+                    "instruction": "The architect reviewed your plan and requested refinements. Revise the plan addressing every issue in triage_feedback.suggested_changes.",
+                });
+
+                // Re-invoke planner (max 1 replan — no recursion).
+                let replan_output = match planner.execute(&ctx.agent_context).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return self
+                            .fail(
+                                ctx,
+                                PipelineStatus::PlanFailed,
+                                format!("replan failed: {e}"),
+                            )
+                            .await;
+                    }
+                };
+                self.emit(&mut ctx, EventKind::PlanCreated, replan_output.data.clone());
+                ctx.stage_outputs
+                    .insert("plan".into(), replan_output.clone());
+                plan_output = replan_output;
+
+                // Re-check for decomposition (same logic as Stage 3b).
+                if let Some(decomposition) = plan_output.data.get("decomposition")
+                    && decomposition.is_array()
+                    && !decomposition.as_array().unwrap().is_empty()
+                {
+                    let budget = self.router.budget_summary().await;
+                    return PipelineResult {
+                        status: PipelineStatus::Decomposed,
+                        stage_outputs: ctx.stage_outputs,
+                        events: ctx.events,
+                        budget,
+                        pr_url: None,
+                        branch: None,
+                        error: None,
+                        outcome_context: None,
+                    };
+                }
+            }
         }
 
         // Strip repo context from objective — the planner already consumed it;
@@ -699,9 +712,45 @@ impl EngineeringPipeline {
         // repo index occupying their context windows.
         ctx.agent_context.objective = format!("## Task\n\n{objective}");
 
-        // Clear pre-loaded file context — the implementer will load only the
-        // files the planner identified, avoiding duplicate/stale context.
+        // Pre-seed implementer with planner-identified files from the worktree.
+        let planner_files: Vec<String> = plan_output.data["files_likely_affected"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         ctx.agent_context.file_context.clear();
+        let mut preseed_total = 0usize;
+        for file in &planner_files {
+            if preseed_total >= MAX_TOTAL_BYTES {
+                break;
+            }
+            let full_path = wt_path.join(file);
+            if let Ok(content) = tokio::fs::read_to_string(&full_path).await {
+                let truncated = if content.len() > MAX_FILE_BYTES {
+                    format!("{}...\n[truncated]", &content[..MAX_FILE_BYTES])
+                } else {
+                    content
+                };
+                preseed_total += truncated.len();
+                ctx.agent_context
+                    .file_context
+                    .insert(file.clone(), truncated);
+            }
+        }
+
+        // Build lightweight Rust module map if this is a Rust project.
+        if wt_path.join("Cargo.toml").exists() {
+            let module_map = build_rust_module_map(&wt_path, &planner_files);
+            if !module_map.is_empty() {
+                ctx.agent_context
+                    .extra
+                    .insert("module_map".into(), serde_json::Value::String(module_map));
+            }
+        }
 
         // --- Stage 4: Boundary check ---
         // Extract files from ALL plan fields, not just `files_likely_affected`.
@@ -753,10 +802,6 @@ impl EngineeringPipeline {
         // --- Stage 6: Implement ---
         ctx.current_stage = Some("implement".into());
         ctx.agent_context.previous_output = plan_output.data.clone();
-
-        // Don't pre-load file contents — the implementer has read_file with
-        // line ranges and should fetch only what it needs. Pre-loading burns
-        // tokens on every turn since the initial user message is never pruned.
 
         let impl_tool_policy = ToolPolicy::new(
             self.config.allowed_tools.clone(),
@@ -919,108 +964,132 @@ impl EngineeringPipeline {
             }
         }
 
-        // --- Stage 10: Security review ---
-        ctx.current_stage = Some("security".into());
-        let diff = workspace.diff_full(base_branch).await.unwrap_or_default();
-        ctx.agent_context.previous_output = serde_json::json!({
-            "diff": truncate(&diff, 4000),
-            "plan": plan_output.data,
-            "implementation": impl_output.data,
-        });
+        // --- Stage 10: Security review (skipped on fast path) ---
+        let security_output = if use_fast_path {
+            let synthetic = fallback_output(
+                "security",
+                serde_json::json!({
+                    "verdict": "skipped",
+                    "issues": [],
+                    "summary": "skipped (fast path)"
+                }),
+            );
+            ctx.stage_outputs
+                .insert("security".into(), synthetic.clone());
+            synthetic
+        } else {
+            ctx.current_stage = Some("security".into());
+            let diff = workspace.diff_full(base_branch).await.unwrap_or_default();
+            ctx.agent_context.previous_output = serde_json::json!({
+                "diff": truncate(&diff, 4000),
+                "plan": plan_output.data,
+                "implementation": impl_output.data,
+            });
 
-        let security_agent = SecurityAgent::new(Arc::clone(&self.router));
-        let security_output = match security_agent.execute(&ctx.agent_context).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(task_id, error = %e, "security review failed");
-                fallback_output(
-                    "security",
-                    serde_json::json!({
-                        "verdict": "warn",
-                        "issues": [],
-                        "summary": "security agent failed"
-                    }),
-                )
+            let security_agent = SecurityAgent::new(Arc::clone(&self.router));
+            let output = match security_agent.execute(&ctx.agent_context).await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(task_id, error = %e, "security review failed");
+                    fallback_output(
+                        "security",
+                        serde_json::json!({
+                            "verdict": "warn",
+                            "issues": [],
+                            "summary": "security agent failed"
+                        }),
+                    )
+                }
+            };
+
+            let verdict = output.data["verdict"].as_str().unwrap_or("pass");
+            self.emit(&mut ctx, EventKind::SecurityReview, output.data.clone());
+            ctx.stage_outputs.insert("security".into(), output.clone());
+
+            if verdict == "block" {
+                return self
+                    .fail(
+                        ctx,
+                        PipelineStatus::SecurityBlocked,
+                        "security review blocked changes".into(),
+                    )
+                    .await;
             }
+            output
         };
 
-        let verdict = security_output.data["verdict"].as_str().unwrap_or("pass");
-        self.emit(
-            &mut ctx,
-            EventKind::SecurityReview,
-            security_output.data.clone(),
-        );
-        ctx.stage_outputs
-            .insert("security".into(), security_output.clone());
+        // --- Stage 11: Release assessment (skipped on fast path) ---
+        if use_fast_path {
+            let synthetic = fallback_output(
+                "release",
+                serde_json::json!({
+                    "version_bump": "patch",
+                    "reasoning": "skipped (fast path)"
+                }),
+            );
+            ctx.stage_outputs.insert("release".into(), synthetic);
+        } else {
+            ctx.current_stage = Some("release".into());
+            let diff = workspace.diff_full(base_branch).await.unwrap_or_default();
+            ctx.agent_context.previous_output = serde_json::json!({
+                "diff": truncate(&diff, 4000),
+                "plan": plan_output.data,
+            });
 
-        if verdict == "block" {
-            return self
-                .fail(
-                    ctx,
-                    PipelineStatus::SecurityBlocked,
-                    "security review blocked changes".into(),
-                )
-                .await;
+            let release_agent = ReleaseAgent::new(Arc::clone(&self.router));
+            let release_output = match release_agent.execute(&ctx.agent_context).await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(task_id, error = %e, "release assessment failed");
+                    fallback_output(
+                        "release",
+                        serde_json::json!({
+                            "version_bump": "patch",
+                            "reasoning": "release agent failed"
+                        }),
+                    )
+                }
+            };
+            self.emit(
+                &mut ctx,
+                EventKind::ReleaseAssessment,
+                release_output.data.clone(),
+            );
+            ctx.stage_outputs.insert("release".into(), release_output);
         }
 
-        // --- Stage 11: Release assessment ---
-        ctx.current_stage = Some("release".into());
-        ctx.agent_context.previous_output = serde_json::json!({
-            "diff": truncate(&diff, 4000),
-            "plan": plan_output.data,
-        });
+        // --- Stage 12: Archive / documentation (skipped on fast path) ---
+        if !use_fast_path {
+            ctx.current_stage = Some("archive".into());
+            ctx.agent_context.previous_output = serde_json::json!({
+                "plan": plan_output.data,
+                "implementation": impl_output.data,
+                "security": security_output.data,
+            });
 
-        let release_agent = ReleaseAgent::new(Arc::clone(&self.router));
-        let release_output = match release_agent.execute(&ctx.agent_context).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(task_id, error = %e, "release assessment failed");
-                fallback_output(
-                    "release",
-                    serde_json::json!({
-                        "version_bump": "patch",
-                        "reasoning": "release agent failed"
-                    }),
-                )
-            }
-        };
-        self.emit(
-            &mut ctx,
-            EventKind::ReleaseAssessment,
-            release_output.data.clone(),
-        );
-        ctx.stage_outputs.insert("release".into(), release_output);
-
-        // --- Stage 12: Archive / documentation ---
-        ctx.current_stage = Some("archive".into());
-        ctx.agent_context.previous_output = serde_json::json!({
-            "plan": plan_output.data,
-            "implementation": impl_output.data,
-            "security": security_output.data,
-        });
-
-        let archivist = ArchivistAgent::new(Arc::clone(&self.router));
-        let archive_output = match archivist.execute(&ctx.agent_context).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(task_id, error = %e, "archivist failed");
-                fallback_output(
-                    "archivist",
-                    serde_json::json!({
-                        "adr": null,
-                        "doc_updates": [],
-                        "architecture_notes": "",
-                        "should_write_adr": false
-                    }),
-                )
-            }
-        };
-        self.emit(
-            &mut ctx,
-            EventKind::DocumentationWritten,
-            archive_output.data.clone(),
-        );
-        ctx.stage_outputs.insert("archive".into(), archive_output);
+            let archivist = ArchivistAgent::new(Arc::clone(&self.router));
+            let archive_output = match archivist.execute(&ctx.agent_context).await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(task_id, error = %e, "archivist failed");
+                    fallback_output(
+                        "archivist",
+                        serde_json::json!({
+                            "adr": null,
+                            "doc_updates": [],
+                            "architecture_notes": "",
+                            "should_write_adr": false
+                        }),
+                    )
+                }
+            };
+            self.emit(
+                &mut ctx,
+                EventKind::DocumentationWritten,
+                archive_output.data.clone(),
+            );
+            ctx.stage_outputs.insert("archive".into(), archive_output);
+        }
 
         // --- Stage 12b: Auto-format (best-effort) ---
         // Run `cargo fmt` (Rust) or equivalent before committing so that
@@ -1605,6 +1674,105 @@ fn extract_all_plan_files(plan: &serde_json::Value) -> Vec<String> {
     files.sort();
     files.dedup();
     files
+}
+
+/// Determine whether the planner output qualifies for the fast path.
+///
+/// Eligible when: complexity is trivial/small, no core change required,
+/// file count within limit, and no decomposition.
+fn is_fast_path_eligible(plan_data: &serde_json::Value, max_files: usize) -> bool {
+    let complexity = plan_data["estimated_complexity"]
+        .as_str()
+        .unwrap_or("medium");
+    if complexity != "trivial" && complexity != "small" {
+        return false;
+    }
+
+    if plan_data["requires_core_change"].as_bool().unwrap_or(true) {
+        return false;
+    }
+
+    let file_count = plan_data["files_likely_affected"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if file_count > max_files || file_count == 0 {
+        return false;
+    }
+
+    // Decomposed tasks need the full pipeline.
+    if plan_data
+        .get("decomposition")
+        .is_some_and(|d| d.is_array() && !d.as_array().unwrap().is_empty())
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Build a lightweight Rust module map for the given file paths.
+///
+/// Walks up parent directories looking for `lib.rs` and `mod.rs` files,
+/// extracting only `pub mod`, `mod`, `pub use`, and `pub(crate) mod`
+/// declarations. Returns a markdown-formatted string suitable for injection
+/// into the agent context.
+fn build_rust_module_map(worktree: &Path, files: &[String]) -> String {
+    use std::collections::BTreeSet;
+
+    let mut module_files: BTreeSet<PathBuf> = BTreeSet::new();
+
+    for file in files {
+        let file_path = Path::new(file);
+        // Walk up parent directories looking for module root files.
+        let mut dir = file_path.parent();
+        while let Some(d) = dir {
+            if d.as_os_str().is_empty() {
+                break;
+            }
+            module_files.insert(d.join("lib.rs"));
+            module_files.insert(d.join("mod.rs"));
+            dir = d.parent();
+        }
+    }
+
+    let mut sections = Vec::new();
+    for mod_file in &module_files {
+        let full_path = worktree.join(mod_file);
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let mod_lines: Vec<&str> = content
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with("pub mod ")
+                    || trimmed.starts_with("mod ")
+                    || trimmed.starts_with("pub use ")
+                    || trimmed.starts_with("pub(crate) mod ")
+            })
+            .collect();
+
+        if mod_lines.is_empty() {
+            continue;
+        }
+
+        let mut section = format!("### `{}`\n", mod_file.display());
+        for line in mod_lines {
+            section.push_str(&format!("- `{}`\n", line.trim()));
+        }
+        sections.push(section);
+    }
+
+    if sections.is_empty() {
+        return String::new();
+    }
+
+    let mut result = String::from("## Rust Module Map\n\n");
+    result.push_str(&sections.join("\n"));
+    result
 }
 
 fn format_plan_summary(plan: &AgentOutput) -> String {
@@ -4992,5 +5160,167 @@ mod tests {
             result.status,
             result.error
         );
+    }
+
+    // --- is_fast_path_eligible tests ---
+
+    #[test]
+    fn fast_path_trivial_one_file() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "trivial",
+            "requires_core_change": false,
+            "files_likely_affected": ["src/lib.rs"],
+        });
+        assert!(is_fast_path_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn fast_path_small_two_files() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "small",
+            "requires_core_change": false,
+            "files_likely_affected": ["src/a.rs", "src/b.rs"],
+        });
+        assert!(is_fast_path_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn fast_path_medium_complexity_rejected() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "medium",
+            "requires_core_change": false,
+            "files_likely_affected": ["src/lib.rs"],
+        });
+        assert!(!is_fast_path_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn fast_path_core_change_rejected() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "trivial",
+            "requires_core_change": true,
+            "files_likely_affected": ["src/lib.rs"],
+        });
+        assert!(!is_fast_path_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn fast_path_too_many_files_rejected() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "trivial",
+            "requires_core_change": false,
+            "files_likely_affected": ["a.rs", "b.rs", "c.rs"],
+        });
+        assert!(!is_fast_path_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn fast_path_decomposed_rejected() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "trivial",
+            "requires_core_change": false,
+            "files_likely_affected": ["src/lib.rs"],
+            "decomposition": [{"objective": "sub-task 1"}],
+        });
+        assert!(!is_fast_path_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn fast_path_missing_fields_rejected() {
+        let plan = serde_json::json!({});
+        assert!(!is_fast_path_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn fast_path_empty_files_rejected() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "trivial",
+            "requires_core_change": false,
+            "files_likely_affected": [],
+        });
+        assert!(!is_fast_path_eligible(&plan, 2));
+    }
+
+    #[test]
+    fn fast_path_empty_decomposition_allowed() {
+        let plan = serde_json::json!({
+            "estimated_complexity": "small",
+            "requires_core_change": false,
+            "files_likely_affected": ["src/lib.rs"],
+            "decomposition": [],
+        });
+        assert!(is_fast_path_eligible(&plan, 2));
+    }
+
+    // --- build_rust_module_map tests ---
+
+    #[test]
+    fn module_map_extracts_pub_mod() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("crates/eng/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub mod agents;\nmod config;\npub(crate) mod pipeline;\nuse std::io;\nfn helper() {}\n",
+        )
+        .unwrap();
+
+        let files = vec!["crates/eng/src/agents/mod.rs".to_string()];
+        let result = build_rust_module_map(dir.path(), &files);
+
+        assert!(result.contains("## Rust Module Map"));
+        assert!(result.contains("`pub mod agents;`"));
+        assert!(result.contains("`mod config;`"));
+        assert!(result.contains("`pub(crate) mod pipeline;`"));
+        // Should not contain non-module lines.
+        assert!(!result.contains("use std::io"));
+        assert!(!result.contains("fn helper"));
+    }
+
+    #[test]
+    fn module_map_handles_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec!["nonexistent/src/lib.rs".to_string()];
+        let result = build_rust_module_map(dir.path(), &files);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn module_map_empty_for_non_rust() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<String> = vec![];
+        let result = build_rust_module_map(dir.path(), &files);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn module_map_includes_mod_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("src/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("mod.rs"),
+            "pub mod planner;\npub mod implementer;\n",
+        )
+        .unwrap();
+
+        let files = vec!["src/agents/planner.rs".to_string()];
+        let result = build_rust_module_map(dir.path(), &files);
+
+        assert!(result.contains("`pub mod planner;`"));
+        assert!(result.contains("`pub mod implementer;`"));
+    }
+
+    #[test]
+    fn module_map_skips_empty_module_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // lib.rs exists but has no module declarations.
+        std::fs::write(src.join("lib.rs"), "fn main() {}\n").unwrap();
+
+        let files = vec!["src/foo.rs".to_string()];
+        let result = build_rust_module_map(dir.path(), &files);
+        assert!(result.is_empty());
     }
 }

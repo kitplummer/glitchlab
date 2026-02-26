@@ -24,6 +24,34 @@ pub struct EngConfig {
     pub providers: HashMap<String, ProviderConfigEntry>,
     #[serde(default)]
     pub tqm: crate::tqm::TQMConfig,
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
+}
+
+/// Configuration for pipeline execution behavior (e.g. fast-path skipping).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineConfig {
+    /// When true, trivial/small tasks skip non-essential stages (triage,
+    /// security, release, archivist) to reduce token usage.
+    #[serde(default)]
+    pub fast_path_enabled: bool,
+    /// Maximum number of `files_likely_affected` entries for fast-path
+    /// eligibility. Tasks affecting more files use the full pipeline.
+    #[serde(default = "default_fast_path_max_files")]
+    pub fast_path_max_files: usize,
+}
+
+fn default_fast_path_max_files() -> usize {
+    2
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            fast_path_enabled: false,
+            fast_path_max_files: default_fast_path_max_files(),
+        }
+    }
 }
 
 /// Configuration for the memory/persistence layer.
@@ -367,6 +395,7 @@ impl Default for EngConfig {
             memory: MemoryConfig::default(),
             providers: HashMap::new(),
             tqm: crate::tqm::TQMConfig::default(),
+            pipeline: PipelineConfig::default(),
         }
     }
 }

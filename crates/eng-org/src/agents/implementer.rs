@@ -30,6 +30,9 @@ Reserve 2 turns for final verification. You WILL be terminated if you exceed bud
   Contents section below.
 - `list_files` — List files matching a glob pattern (e.g. "crates/**/*.rs", "src/*.ts").
   Use this FIRST to discover file paths — do NOT use shell commands like `find` or `ls`.
+  If a "Rust Module Map" section is present below, use it to understand module
+  relationships instead of running `list_files` on the crate structure. This saves
+  tool turns.
 - `write_file` — Create or overwrite a file.
 - `edit_file` — Replace an exact string in a file. The `old_string` must be a UNIQUE,
   EXACT match of existing content (copy it from `read_file` output). Include enough
@@ -259,6 +262,19 @@ mod tests {
         assert!(
             prompt.contains("MUST call multiple tools"),
             "prompt should be explicit about batching"
+        );
+    }
+
+    #[test]
+    fn system_prompt_contains_module_map_hint() {
+        let prompt = system_prompt(10);
+        assert!(
+            prompt.contains("Rust Module Map"),
+            "prompt should reference Rust Module Map"
+        );
+        assert!(
+            prompt.contains("saves\n  tool turns") || prompt.contains("saves tool turns"),
+            "prompt should mention saving tool turns"
         );
     }
 

@@ -408,6 +408,14 @@ pub(crate) fn build_user_message(ctx: &AgentContext) -> String {
         }
     }
 
+    // Rust module map (injected by pipeline for implementer context).
+    if let Some(serde_json::Value::String(mm)) = ctx.extra.get("module_map")
+        && !mm.is_empty()
+    {
+        msg.push_str("\n\n");
+        msg.push_str(mm);
+    }
+
     // Failure history (stored separately so ContextAssembler can drop it independently).
     if let Some(serde_json::Value::String(fh)) = ctx.extra.get("failure_history")
         && !fh.is_empty()
@@ -1604,5 +1612,30 @@ mod tests {
         ];
         prune_messages(&mut messages, 10);
         assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn build_user_message_with_module_map() {
+        let mut ctx = base_ctx();
+        ctx.extra.insert(
+            "module_map".into(),
+            serde_json::Value::String(
+                "## Rust Module Map\n\n### `src/lib.rs`\n- `pub mod agents;`\n".into(),
+            ),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(msg.contains("## Rust Module Map"));
+        assert!(msg.contains("`pub mod agents;`"));
+    }
+
+    #[test]
+    fn build_user_message_empty_module_map_omitted() {
+        let mut ctx = base_ctx();
+        ctx.extra.insert(
+            "module_map".into(),
+            serde_json::Value::String(String::new()),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(!msg.contains("Module Map"));
     }
 }

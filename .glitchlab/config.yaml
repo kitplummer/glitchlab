@@ -74,6 +74,9 @@ tqm:
   remediation_enabled: true
   remediation_priority: 2
 
+pipeline:
+  fast_path_enabled: true
+
 providers:
   gemini:
     api_key_env: GEMINI_API_KEY
