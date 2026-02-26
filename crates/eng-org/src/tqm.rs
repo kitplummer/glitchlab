@@ -48,7 +48,7 @@ pub struct TQMConfig {
 
     // -- Remediation task generation --
     /// Whether to generate remediation tasks from detected patterns.
-    #[serde(default)]
+    #[serde(default = "default_remediation_enabled")]
     pub remediation_enabled: bool,
     /// Priority for generated remediation tasks (lower = higher priority).
     #[serde(default = "default_remediation_priority")]
@@ -79,6 +79,9 @@ fn default_budget_pressure() -> f64 {
 fn default_provider_failures() -> u32 {
     3
 }
+fn default_remediation_enabled() -> bool {
+    true
+}
 fn default_remediation_priority() -> u32 {
     5
 }
@@ -94,7 +97,7 @@ impl Default for TQMConfig {
             architect_rejection_rate_threshold: default_architect_rejection(),
             budget_pressure_threshold: default_budget_pressure(),
             provider_failure_threshold: default_provider_failures(),
-            remediation_enabled: false,
+            remediation_enabled: true,
             remediation_priority: default_remediation_priority(),
         }
     }
@@ -143,6 +146,32 @@ pub struct DetectedPattern {
     pub severity: String,
     /// Task IDs affected by this pattern.
     pub affected_tasks: Vec<String>,
+}
+
+/// Structured context embedded in remediation task objectives so the Circuit
+/// agent (or any downstream consumer) can parse them programmatically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationContext {
+    pub pattern_kind: PatternKind,
+    pub severity: String,
+    pub occurrences: u32,
+    pub affected_tasks: Vec<String>,
+    pub description: String,
+    pub threshold: f64,
+}
+
+impl RemediationContext {
+    /// Build a `RemediationContext` from a `DetectedPattern`.
+    pub fn from_pattern(pattern: &DetectedPattern) -> Self {
+        Self {
+            pattern_kind: pattern.kind,
+            severity: pattern.severity.clone(),
+            occurrences: pattern.occurrences,
+            affected_tasks: pattern.affected_tasks.clone(),
+            description: pattern.description.clone(),
+            threshold: pattern.threshold,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +548,7 @@ fn check_boundary_violations(
 // ---------------------------------------------------------------------------
 
 /// Map a `PatternKind` to a short slug for use in remediation task IDs.
-fn kind_slug(kind: PatternKind) -> &'static str {
+pub(crate) fn kind_slug(kind: PatternKind) -> &'static str {
     match kind {
         PatternKind::DecompositionLoop => "decomp-loop",
         PatternKind::ScopeCreep => "scope-creep",
@@ -563,7 +592,7 @@ fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::ta
         return None;
     }
 
-    let objective = match pattern.kind {
+    let summary = match pattern.kind {
         PatternKind::DecompositionLoop => {
             let ids = pattern.affected_tasks.join(", ");
             format!("TQM: Simplify tasks stuck in decomposition loops: {ids}")
@@ -599,6 +628,11 @@ fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::ta
         PatternKind::BudgetPressure | PatternKind::ProviderFailures => return None,
     };
 
+    // Embed structured context so Circuit can parse it.
+    let remediation_ctx = RemediationContext::from_pattern(pattern);
+    let ctx_json = serde_json::to_string(&remediation_ctx).unwrap_or_default();
+    let objective = format!("{summary}\n\n<!-- remediation_context: {ctx_json} -->");
+
     let id = remediation_task_id(pattern.kind, &pattern.affected_tasks);
 
     Some(crate::taskqueue::Task {
@@ -611,7 +645,24 @@ fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::ta
         error: None,
         pr_url: None,
         outcome_context: None,
+        remediation_depth: 0,
+        is_remediation: true,
     })
+}
+
+/// Generate a remediation task at the given depth, returning `None` if depth >= max.
+pub fn generate_remediation_task_at_depth(
+    pattern: &DetectedPattern,
+    priority: u32,
+    depth: u32,
+    max_depth: u32,
+) -> Option<crate::taskqueue::Task> {
+    if depth >= max_depth {
+        return None;
+    }
+    let mut task = pattern_to_task(pattern, priority)?;
+    task.remediation_depth = depth;
+    Some(task)
 }
 
 /// Generate remediation tasks from detected patterns.
@@ -1003,7 +1054,7 @@ mod tests {
         assert!((config.architect_rejection_rate_threshold - 0.5).abs() < f64::EPSILON);
         assert!((config.budget_pressure_threshold - 0.9).abs() < f64::EPSILON);
         assert_eq!(config.provider_failure_threshold, 3);
-        assert!(!config.remediation_enabled);
+        assert!(config.remediation_enabled);
         assert_eq!(config.remediation_priority, 5);
     }
 
@@ -1069,7 +1120,8 @@ mod tests {
             "provider_failure_threshold": 3
         }"#;
         let parsed: TQMConfig = serde_json::from_str(json).unwrap();
-        assert!(!parsed.remediation_enabled);
+        // Config without remediation fields defaults remediation_enabled to `true`.
+        assert!(parsed.remediation_enabled);
         assert_eq!(parsed.remediation_priority, 5);
     }
 
@@ -1119,6 +1171,8 @@ mod tests {
         assert!(tasks[0].objective.contains("decomposition loops"));
         assert!(tasks[0].objective.contains("t1"));
         assert_eq!(tasks[0].priority, 5);
+        assert!(tasks[0].is_remediation);
+        assert!(tasks[0].objective.contains("remediation_context"));
     }
 
     #[test]
@@ -1231,7 +1285,10 @@ mod tests {
 
     #[test]
     fn dedup_returns_empty_when_disabled() {
-        let config = TQMConfig::default(); // remediation_enabled = false
+        let config = TQMConfig {
+            remediation_enabled: false,
+            ..TQMConfig::default()
+        };
         let queue = crate::taskqueue::TaskQueue::from_tasks(vec![]);
         let patterns = vec![make_pattern(PatternKind::StuckAgents, vec!["t1".into()])];
         let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue);
@@ -1256,6 +1313,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: true,
         };
         let queue = crate::taskqueue::TaskQueue::from_tasks(vec![existing]);
 
@@ -1501,5 +1560,64 @@ mod tests {
         let parsed: TQMConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.remediation_enabled);
         assert_eq!(parsed.remediation_priority, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // RemediationContext tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remediation_context_from_pattern() {
+        let pattern = make_pattern(PatternKind::StuckAgents, vec!["t1".into(), "t2".into()]);
+        let ctx = RemediationContext::from_pattern(&pattern);
+        assert_eq!(ctx.pattern_kind, PatternKind::StuckAgents);
+        assert_eq!(ctx.occurrences, 2);
+        assert_eq!(ctx.affected_tasks, vec!["t1", "t2"]);
+    }
+
+    #[test]
+    fn remediation_context_serde_roundtrip() {
+        let pattern = make_pattern(PatternKind::TestFlakiness, vec!["t1".into()]);
+        let ctx = RemediationContext::from_pattern(&pattern);
+        let json = serde_json::to_string(&ctx).unwrap();
+        let parsed: RemediationContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pattern_kind, PatternKind::TestFlakiness);
+        assert_eq!(parsed.occurrences, 1);
+    }
+
+    #[test]
+    fn pattern_to_task_sets_remediation_fields() {
+        let config = TQMConfig::default();
+        let patterns = vec![make_pattern(PatternKind::StuckAgents, vec!["t1".into()])];
+        let tasks = generate_remediation_tasks(&patterns, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].is_remediation);
+        assert_eq!(tasks[0].remediation_depth, 0);
+        // Objective should contain embedded remediation context.
+        assert!(tasks[0].objective.contains("remediation_context"));
+    }
+
+    #[test]
+    fn depth_enforcement() {
+        let pattern = make_pattern(PatternKind::StuckAgents, vec!["t1".into()]);
+
+        // depth 0, max 1 → allowed
+        let task = generate_remediation_task_at_depth(&pattern, 5, 0, 1);
+        assert!(task.is_some());
+        assert_eq!(task.unwrap().remediation_depth, 0);
+
+        // depth 1, max 1 → blocked (meta-loop guard)
+        let task = generate_remediation_task_at_depth(&pattern, 5, 1, 1);
+        assert!(task.is_none());
+
+        // depth 0, max 0 → blocked
+        let task = generate_remediation_task_at_depth(&pattern, 5, 0, 0);
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn tqm_default_remediation_enabled() {
+        let config = TQMConfig::default();
+        assert!(config.remediation_enabled);
     }
 }

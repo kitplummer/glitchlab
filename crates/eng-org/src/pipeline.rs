@@ -500,6 +500,39 @@ impl EngineeringPipeline {
         ctx.agent_context.file_context =
             read_relevant_files(repo_path, objective, &indexed_files).await;
 
+        // --- Stage 2b: Pre-planner boundary scan (deterministic, zero LLM calls) ---
+        // If the objective itself mentions file paths under protected prefixes,
+        // reject immediately. This catches the common case where the task is
+        // "modify <protected file>" and saves all downstream LLM budget.
+        if !self.config.boundaries.protected_paths.is_empty() {
+            let objective_paths = extract_file_paths_from_text(objective);
+            if !objective_paths.is_empty() {
+                let enforcer = BoundaryEnforcer::new(
+                    self.config
+                        .boundaries
+                        .protected_paths
+                        .iter()
+                        .map(PathBuf::from)
+                        .collect(),
+                );
+                let violations = enforcer.check(&objective_paths);
+                if !violations.is_empty() {
+                    let paths: Vec<String> =
+                        violations.iter().map(|p| p.display().to_string()).collect();
+                    return self
+                        .fail(
+                            ctx,
+                            PipelineStatus::BoundaryViolation,
+                            format!(
+                                "objective references protected path(s): {}",
+                                paths.join(", ")
+                            ),
+                        )
+                        .await;
+                }
+            }
+        }
+
         // --- Stage 3: Plan ---
         ctx.current_stage = Some("plan".into());
         let planner = PlannerAgent::new(Arc::clone(&self.router));
@@ -671,20 +704,18 @@ impl EngineeringPipeline {
         ctx.agent_context.file_context.clear();
 
         // --- Stage 4: Boundary check ---
+        // Extract files from ALL plan fields, not just `files_likely_affected`.
+        // This prevents the planner from gaming the top-level list while hiding
+        // protected paths inside step details.
         ctx.current_stage = Some("boundary_check".into());
-        let files_affected: Vec<String> = plan_output.data["files_likely_affected"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let files_affected = extract_all_plan_files(&plan_output.data);
 
-        let requires_core = plan_output.data["requires_core_change"]
-            .as_bool()
-            .unwrap_or(false);
-
+        // NOTE: We always enforce boundaries here (allow_core = false).
+        // The planner's `requires_core_change` flag is informational only —
+        // it tells TQM and the orchestrator *why* the task was rejected, but
+        // does NOT bypass enforcement. The only legitimate bypass is the
+        // `--allow-core` CLI flag, which clears the protected_paths list
+        // before the pipeline runs.
         let enforcer = BoundaryEnforcer::new(
             self.config
                 .boundaries
@@ -694,7 +725,7 @@ impl EngineeringPipeline {
                 .collect(),
         );
 
-        if let Err(e) = enforcer.enforce(&files_affected, requires_core) {
+        if let Err(e) = enforcer.enforce(&files_affected, false) {
             return self
                 .fail(ctx, PipelineStatus::BoundaryViolation, e.to_string())
                 .await;
@@ -1503,6 +1534,78 @@ fn build_pr_body(plan: &AgentOutput, security: &AgentOutput) -> String {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Extract file-path-like strings from free text (e.g. an objective).
+///
+/// Splits on whitespace and looks for tokens containing `/` that resemble
+/// file paths. Intentionally conservative — false negatives are acceptable
+/// (Stage 4 is the real gatekeeper), false positives are cheap (we just
+/// run them through the enforcer).
+fn extract_file_paths_from_text(text: &str) -> Vec<String> {
+    let mut paths: Vec<String> = text
+        .split_whitespace()
+        .map(|tok| {
+            tok.trim_matches(|c: char| {
+                c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == ',' || c == ':'
+            })
+        })
+        .filter(|tok| {
+            // Must contain at least one `/` and start with a path-like char
+            tok.contains('/')
+                && tok
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '.' || c == '_')
+        })
+        .map(|tok| tok.trim_end_matches('/').to_string())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Extract all file paths from a planner output, covering both
+/// `files_likely_affected` and every `steps[].files` entry.
+/// This prevents the planner from omitting protected paths from the
+/// top-level list while still referencing them in step details.
+fn extract_all_plan_files(plan: &serde_json::Value) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+
+    // 1. files_likely_affected (the primary list)
+    if let Some(arr) = plan["files_likely_affected"].as_array() {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                files.push(s.to_string());
+            }
+        }
+    }
+
+    // 2. steps[].files (per-step file lists)
+    if let Some(steps) = plan["steps"].as_array() {
+        for step in steps {
+            if let Some(step_files) = step["files"].as_array() {
+                for v in step_files {
+                    if let Some(s) = v.as_str() {
+                        files.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. decomposition[].objective — extract paths from sub-task descriptions
+    if let Some(subs) = plan["decomposition"].as_array() {
+        for sub in subs {
+            if let Some(obj) = sub["objective"].as_str() {
+                files.extend(extract_file_paths_from_text(obj));
+            }
+        }
+    }
+
+    files.sort();
+    files.dedup();
+    files
+}
 
 fn format_plan_summary(plan: &AgentOutput) -> String {
     let mut summary = String::from("## Plan Summary\n\n");
@@ -4641,5 +4744,253 @@ mod tests {
             .pr_diff(dir.path(), "https://github.com/test/pr/999")
             .await;
         assert!(result.is_err(), "expected error when gh is not available");
+    }
+
+    // --- extract_file_paths_from_text tests ---
+
+    #[test]
+    fn extract_paths_from_objective_with_explicit_file() {
+        let text = "Add Display to OutcomeKind enum in crates/kernel/src/outcome.rs";
+        let paths = extract_file_paths_from_text(text);
+        assert!(
+            paths.contains(&"crates/kernel/src/outcome.rs".to_string()),
+            "should extract crates/kernel/src/outcome.rs, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn extract_paths_from_backtick_wrapped() {
+        let text = "Modify `crates/eng-org/src/pipeline.rs` to add feature";
+        let paths = extract_file_paths_from_text(text);
+        assert!(
+            paths.contains(&"crates/eng-org/src/pipeline.rs".to_string()),
+            "should extract backtick-wrapped path, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn extract_paths_ignores_non_paths() {
+        let text = "Fix the display bug and update README";
+        let paths = extract_file_paths_from_text(text);
+        assert!(
+            paths.is_empty(),
+            "should not extract non-paths, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn extract_paths_directory_style() {
+        let text = "Changes under crates/kernel/ are forbidden";
+        let paths = extract_file_paths_from_text(text);
+        assert!(
+            paths.contains(&"crates/kernel".to_string()),
+            "should extract directory-style path, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn extract_paths_multiple() {
+        let text = "Edit src/lib.rs and crates/router/src/mod.rs";
+        let paths = extract_file_paths_from_text(text);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"src/lib.rs".to_string()));
+        assert!(paths.contains(&"crates/router/src/mod.rs".to_string()));
+    }
+
+    // --- extract_all_plan_files tests ---
+
+    #[test]
+    fn extract_plan_files_from_files_likely_affected() {
+        let plan = serde_json::json!({
+            "files_likely_affected": ["src/lib.rs", "src/main.rs"],
+            "steps": []
+        });
+        let files = extract_all_plan_files(&plan);
+        assert_eq!(files, vec!["src/lib.rs", "src/main.rs"]);
+    }
+
+    #[test]
+    fn extract_plan_files_from_steps() {
+        let plan = serde_json::json!({
+            "files_likely_affected": ["src/lib.rs"],
+            "steps": [
+                {"files": ["src/lib.rs", "crates/kernel/src/outcome.rs"]},
+                {"files": ["src/other.rs"]}
+            ]
+        });
+        let files = extract_all_plan_files(&plan);
+        assert!(
+            files.contains(&"crates/kernel/src/outcome.rs".to_string()),
+            "should include files from steps[].files, got: {files:?}"
+        );
+        assert!(files.contains(&"src/lib.rs".to_string()));
+        assert!(files.contains(&"src/other.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_plan_files_deduplicates() {
+        let plan = serde_json::json!({
+            "files_likely_affected": ["src/lib.rs"],
+            "steps": [{"files": ["src/lib.rs"]}]
+        });
+        let files = extract_all_plan_files(&plan);
+        assert_eq!(files, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn extract_plan_files_from_decomposition() {
+        let plan = serde_json::json!({
+            "files_likely_affected": [],
+            "steps": [],
+            "decomposition": [
+                {"id": "task-1", "objective": "Modify crates/kernel/src/outcome.rs"},
+                {"id": "task-2", "objective": "Update src/lib.rs"}
+            ]
+        });
+        let files = extract_all_plan_files(&plan);
+        assert!(
+            files.contains(&"crates/kernel/src/outcome.rs".to_string()),
+            "should extract paths from decomposition objectives, got: {files:?}"
+        );
+        assert!(files.contains(&"src/lib.rs".to_string()));
+    }
+
+    // --- Pre-planner boundary scan integration test ---
+
+    #[tokio::test]
+    async fn pre_planner_scan_rejects_protected_path_in_objective() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // No LLM responses needed — should reject before calling any agent.
+        let router = mock_router_ref();
+
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.boundaries.protected_paths = vec!["crates/kernel".into(), ".github".into()];
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-pre-scan",
+                "Add Display to OutcomeKind in crates/kernel/src/outcome.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::BoundaryViolation,
+            "should reject at pre-planner scan, got: {:?} error: {:?}",
+            result.status,
+            result.error
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("objective references protected path"),
+            "error should mention objective, got: {:?}",
+            result.error
+        );
+        // Budget should be near-zero — no LLM calls made.
+        assert_eq!(
+            result.budget.total_tokens, 0,
+            "no LLM tokens should be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_planner_scan_allows_non_protected_objective() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Pipeline will proceed to planner, so we need mock responses.
+        let responses = pipeline_mock_responses();
+        let router = sequential_router_ref(responses);
+
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.boundaries.protected_paths = vec!["crates/kernel".into()];
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-non-protected",
+                "Add a function to crates/eng-org/src/lib.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        // Should NOT be BoundaryViolation — the objective doesn't target a protected path.
+        assert_ne!(
+            result.status,
+            PipelineStatus::BoundaryViolation,
+            "non-protected objective should not trigger boundary violation"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage4_catches_protected_path_in_step_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Planner returns a plan where files_likely_affected is clean,
+        // but steps[].files contains a protected path.
+        let responses = vec![
+            // 1. Planner — files_likely_affected is clean, but step files are not
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "edit kernel", "files": ["crates/kernel/src/outcome.rs"], "action": "modify"}], "files_likely_affected": ["src/lib.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "ok", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.boundaries.protected_paths = vec!["crates/kernel".into()];
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-step-files",
+                // Objective doesn't mention the protected path, so pre-planner scan passes.
+                "Add Display impl for OutcomeKind",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::BoundaryViolation,
+            "Stage 4 should catch protected path in steps[].files, got: {:?} error: {:?}",
+            result.status,
+            result.error
+        );
     }
 }

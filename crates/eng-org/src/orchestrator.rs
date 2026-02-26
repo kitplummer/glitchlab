@@ -46,6 +46,10 @@ pub struct CumulativeBudget {
     total_tokens: u64,
     total_runs: u32,
     ledger_path: Option<PathBuf>,
+    /// Cumulative cost of remediation tasks only.
+    repair_cost: f64,
+    /// Fraction of total budget reserved for repair (0.0–1.0).
+    repair_budget_fraction: f64,
 }
 
 impl CumulativeBudget {
@@ -57,6 +61,8 @@ impl CumulativeBudget {
             total_tokens: 0,
             total_runs: 0,
             ledger_path: None,
+            repair_cost: 0.0,
+            repair_budget_fraction: 0.20,
         }
     }
 
@@ -69,6 +75,8 @@ impl CumulativeBudget {
             total_tokens: 0,
             total_runs: 0,
             ledger_path: Some(ledger_path.to_path_buf()),
+            repair_cost: 0.0,
+            repair_budget_fraction: 0.20,
         };
         budget.load_ledger();
         budget
@@ -166,6 +174,33 @@ impl CumulativeBudget {
     pub fn limit_dollars(&self) -> f64 {
         self.limit_dollars
     }
+
+    /// Set the repair budget fraction (builder-style).
+    pub fn with_repair_budget_fraction(mut self, fraction: f64) -> Self {
+        self.repair_budget_fraction = fraction.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Total dollars available for repair tasks.
+    pub fn repair_budget_dollars(&self) -> f64 {
+        self.limit_dollars * self.repair_budget_fraction
+    }
+
+    /// Remaining dollars available for repair tasks.
+    pub fn repair_remaining(&self) -> f64 {
+        (self.repair_budget_dollars() - self.repair_cost).max(0.0)
+    }
+
+    /// Check whether the repair budget can cover one more task at the given cost.
+    pub fn can_afford_repair(&self, per_task_dollars: f64) -> bool {
+        self.repair_remaining() >= per_task_dollars
+    }
+
+    /// Record a repair task's spend (tracks separately from feature spend).
+    pub fn record_repair(&mut self, task_id: &str, cost: f64, tokens: u64, status: &str) {
+        self.repair_cost += cost;
+        self.record(task_id, cost, tokens, status);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +212,14 @@ impl CumulativeBudget {
 pub struct QualityResult {
     pub passed: bool,
     pub details: String,
+}
+
+/// Simple string hash for generating deterministic task IDs.
+fn fxhash(s: &str) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish() as u32
 }
 
 /// Run a quality gate command (e.g. `cargo test --workspace`) in the repo.
@@ -573,11 +616,21 @@ impl Orchestrator {
             let task_id;
             let objective;
             let task_depth;
+            let task_is_remediation;
             match queue.pick_next() {
                 Some(task) => {
                     task_id = task.id.clone();
                     objective = task.objective.clone();
                     task_depth = task.decomposition_depth;
+                    task_is_remediation = task.is_remediation;
+                    // Skip remediation tasks when repair budget is exhausted.
+                    if task_is_remediation
+                        && !budget.can_afford_repair(self.config.limits.max_dollars_per_task)
+                    {
+                        info!(task_id = %task_id, "skipping remediation task: repair budget exhausted");
+                        queue.update_status(&task_id, crate::taskqueue::TaskStatus::Skipped);
+                        continue;
+                    }
                 }
                 None => {
                     info!("no more actionable tasks");
@@ -669,7 +722,11 @@ impl Orchestrator {
             let cost = pipeline_result.budget.estimated_cost;
             let tokens = pipeline_result.budget.total_tokens;
             let status_str = format!("{:?}", pipeline_result.status);
-            budget.record(&task_id, cost, tokens, &status_str);
+            if task_is_remediation {
+                budget.record_repair(&task_id, cost, tokens, &status_str);
+            } else {
+                budget.record(&task_id, cost, tokens, &status_str);
+            }
 
             result.tasks_attempted += 1;
             result.total_cost += cost;
@@ -699,17 +756,52 @@ impl Orchestrator {
                     );
                 }
                 if !new_patterns.is_empty() {
-                    let tasks = crate::tqm::generate_deduplicated_remediation_tasks(
-                        &new_patterns,
-                        &self.config.tqm,
-                        queue,
-                    );
-                    if !tasks.is_empty() {
-                        info!(
-                            count = tasks.len(),
-                            "TQM: injecting remediation tasks into queue"
+                    // Guard: skip Circuit if current task was already remediation (meta-loop)
+                    // or if repair budget is exhausted.
+                    let should_invoke_circuit = !task_is_remediation
+                        && budget.can_afford_repair(self.config.limits.max_dollars_per_task);
+
+                    if should_invoke_circuit {
+                        // Try Circuit-powered remediation first.
+                        let circuit_tasks = self
+                            .invoke_circuit_for_patterns(&new_patterns, &result, budget)
+                            .await;
+                        if !circuit_tasks.is_empty() {
+                            info!(
+                                count = circuit_tasks.len(),
+                                "TQM: Circuit injecting remediation tasks into queue"
+                            );
+                            queue.inject_tasks(circuit_tasks);
+                        } else {
+                            // Fallback to generic remediation if Circuit produced nothing.
+                            let fallback_tasks =
+                                crate::tqm::generate_deduplicated_remediation_tasks(
+                                    &new_patterns,
+                                    &self.config.tqm,
+                                    queue,
+                                );
+                            if !fallback_tasks.is_empty() {
+                                info!(
+                                    count = fallback_tasks.len(),
+                                    "TQM: fallback injecting remediation tasks into queue"
+                                );
+                                queue.inject_tasks(fallback_tasks);
+                            }
+                        }
+                    } else {
+                        // Guards failed — fall back to generic remediation.
+                        let tasks = crate::tqm::generate_deduplicated_remediation_tasks(
+                            &new_patterns,
+                            &self.config.tqm,
+                            queue,
                         );
-                        queue.inject_tasks(tasks);
+                        if !tasks.is_empty() {
+                            info!(
+                                count = tasks.len(),
+                                "TQM: injecting remediation tasks into queue"
+                            );
+                            queue.inject_tasks(tasks);
+                        }
                     }
                 }
                 detected_patterns.extend(new_patterns);
@@ -969,6 +1061,155 @@ impl Orchestrator {
         }
     }
 
+    /// Invoke the Circuit (OpsDiagnosisAgent) for detected TQM patterns.
+    ///
+    /// Returns remediation tasks extracted from Circuit's output. If Circuit
+    /// fails or escalates, returns an empty vec (caller should fall back).
+    async fn invoke_circuit_for_patterns(
+        &self,
+        patterns: &[crate::tqm::DetectedPattern],
+        run_result: &OrchestratorResult,
+        budget: &CumulativeBudget,
+    ) -> Vec<crate::taskqueue::Task> {
+        use crate::agents::ops::OpsDiagnosisAgent;
+        use glitchlab_kernel::agent::{Agent, AgentContext};
+
+        // Build a lightweight router for the Circuit agent.
+        let budget_tracker = BudgetTracker::new(
+            self.config.limits.max_tokens_per_task,
+            self.config.limits.max_dollars_per_task,
+        );
+        let provider_inits = self.config.resolve_providers();
+        let mut router =
+            Router::with_providers(self.config.routing_map(), budget_tracker, provider_inits);
+        if let Some(chooser) = self.config.build_chooser() {
+            router = router.with_chooser(chooser);
+        }
+        let router = Arc::new(router);
+
+        let patterns_json = serde_json::to_string(patterns).unwrap_or_default();
+        let budget_summary = serde_json::json!({
+            "total_cost": budget.total_cost(),
+            "remaining": budget.remaining_dollars(),
+            "repair_remaining": budget.repair_remaining(),
+            "tasks_attempted": run_result.tasks_attempted,
+            "tasks_failed": run_result.tasks_failed,
+        });
+
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("budget_summary".into(), budget_summary);
+
+        let objective = format!(
+            "Diagnose the following TQM-detected patterns and produce specific remediation tasks.\n\n\
+             ## Detected Patterns\n\n{patterns_json}\n\n\
+             ## Run Summary\n\n\
+             Tasks attempted: {}, succeeded: {}, failed: {}, deferred: {}\n\
+             Total cost: ${:.2}, remaining: ${:.2}",
+            run_result.tasks_attempted,
+            run_result.tasks_succeeded,
+            run_result.tasks_failed,
+            run_result.tasks_deferred,
+            budget.total_cost(),
+            budget.remaining_dollars(),
+        );
+
+        let ctx = AgentContext {
+            task_id: "circuit-diagnosis".into(),
+            objective,
+            repo_path: String::new(),
+            working_dir: String::new(),
+            constraints: vec![
+                "Never suggest changes to crates/kernel".into(),
+                "Each remediation task should touch at most 2 files".into(),
+            ],
+            acceptance_criteria: vec![],
+            risk_level: "low".into(),
+            file_context: std::collections::HashMap::new(),
+            previous_output: serde_json::Value::Null,
+            extra,
+        };
+
+        let agent = OpsDiagnosisAgent::new(router);
+        let output = match agent.execute(&ctx).await {
+            Ok(out) => out,
+            Err(e) => {
+                warn!(error = %e, "Circuit agent failed, falling back to generic remediation");
+                return Vec::new();
+            }
+        };
+
+        // Parse Circuit output and convert to tasks.
+        Self::circuit_output_to_tasks(
+            &output.data,
+            &self.config.tqm,
+            self.config.limits.max_remediation_depth,
+        )
+    }
+
+    /// Convert Circuit agent output JSON into remediation tasks.
+    ///
+    /// Filters by scope (`within_scope: true`) and escalation (`escalate: false`).
+    fn circuit_output_to_tasks(
+        output: &serde_json::Value,
+        tqm_config: &crate::tqm::TQMConfig,
+        max_remediation_depth: u32,
+    ) -> Vec<crate::taskqueue::Task> {
+        // If escalation is requested or scope is out of bounds, skip.
+        if output
+            .get("escalate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+        {
+            info!("Circuit escalated — skipping task generation");
+            return Vec::new();
+        }
+        if let Some(scope) = output.get("scope_assessment")
+            && !scope
+                .get("within_scope")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        {
+            info!("Circuit: out of scope — skipping task generation");
+            return Vec::new();
+        }
+
+        let priority = output
+            .get("suggested_priority")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(tqm_config.remediation_priority as u64) as u32;
+
+        let remediation_tasks = match output.get("remediation_tasks").and_then(|v| v.as_array()) {
+            Some(tasks) => tasks,
+            None => return Vec::new(),
+        };
+
+        if max_remediation_depth == 0 {
+            return Vec::new();
+        }
+
+        remediation_tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, task_val)| {
+                let objective = task_val.get("objective")?.as_str()?;
+                let id = format!("circuit-fix-{i}-{:08x}", fxhash(objective));
+                Some(crate::taskqueue::Task {
+                    id,
+                    objective: objective.into(),
+                    priority,
+                    status: crate::taskqueue::TaskStatus::Pending,
+                    depends_on: vec![],
+                    decomposition_depth: 0,
+                    error: None,
+                    pr_url: None,
+                    outcome_context: None,
+                    remediation_depth: 1,
+                    is_remediation: true,
+                })
+            })
+            .collect()
+    }
+
     /// Handle a decomposed pipeline result: check depth, extract sub-tasks, update queue.
     ///
     /// Returns `true` if decomposition succeeded (sub-tasks injected),
@@ -1072,6 +1313,8 @@ impl Orchestrator {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             });
         }
 
@@ -1222,6 +1465,50 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Repair budget tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn repair_budget_defaults() {
+        let budget = CumulativeBudget::new(100.0);
+        assert!((budget.repair_budget_dollars() - 20.0).abs() < f64::EPSILON);
+        assert!((budget.repair_remaining() - 20.0).abs() < f64::EPSILON);
+        assert!(budget.can_afford_repair(10.0));
+    }
+
+    #[test]
+    fn can_afford_repair() {
+        let budget = CumulativeBudget::new(100.0).with_repair_budget_fraction(0.10);
+        // 100 * 0.10 = $10 repair budget
+        assert!((budget.repair_budget_dollars() - 10.0).abs() < f64::EPSILON);
+        assert!(budget.can_afford_repair(10.0));
+        assert!(!budget.can_afford_repair(10.01));
+    }
+
+    #[test]
+    fn record_repair_tracks_separately() {
+        let mut budget = CumulativeBudget::new(100.0).with_repair_budget_fraction(0.20);
+        budget.record_repair("fix-1", 5.0, 1000, "Completed");
+        // Total cost should reflect the repair.
+        assert!((budget.total_cost() - 5.0).abs() < f64::EPSILON);
+        // Repair remaining should decrease.
+        assert!((budget.repair_remaining() - 15.0).abs() < f64::EPSILON);
+        // Another repair of $16 should not be affordable.
+        assert!(!budget.can_afford_repair(16.0));
+        // But $15 exactly is.
+        assert!(budget.can_afford_repair(15.0));
+    }
+
+    #[test]
+    fn repair_budget_fraction_clamped() {
+        let budget = CumulativeBudget::new(100.0).with_repair_budget_fraction(1.5);
+        assert!((budget.repair_budget_dollars() - 100.0).abs() < f64::EPSILON);
+
+        let budget = CumulativeBudget::new(100.0).with_repair_budget_fraction(-0.5);
+        assert!((budget.repair_budget_dollars() - 0.0).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
     // QualityGate tests
     // -----------------------------------------------------------------------
 
@@ -1300,6 +1587,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(0.10); // less than per-task $0.50
@@ -1336,6 +1625,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
             Task {
                 id: "b".into(),
@@ -1347,6 +1638,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
         ];
         let mut queue = TaskQueue::from_tasks(tasks);
@@ -1422,6 +1715,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }
     }
 
@@ -2228,6 +2523,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -2261,6 +2558,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -2305,6 +2604,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -2632,5 +2933,126 @@ mod tests {
         assert_eq!(t4.status, TaskStatus::Pending);
         let t5 = queue.tasks().iter().find(|t| t.id == "sf5").unwrap();
         assert_eq!(t5.status, TaskStatus::Pending);
+    }
+
+    // -----------------------------------------------------------------------
+    // Circuit integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn circuit_output_to_tasks_basic() {
+        let output = serde_json::json!({
+            "diagnosis": "boundary check missing",
+            "root_cause": "protected path not checked in pipeline",
+            "remediation_tasks": [
+                {
+                    "objective": "Add protected-path check in pipeline.rs execute()",
+                    "target_files": ["crates/eng-org/src/pipeline.rs"],
+                    "estimated_complexity": "small",
+                    "rationale": "The boundary check is missing"
+                }
+            ],
+            "scope_assessment": { "within_scope": true, "modifies_kernel": false },
+            "suggested_priority": 2,
+            "confidence": "high",
+            "escalate": false
+        });
+
+        let tqm_config = crate::tqm::TQMConfig::default();
+        let tasks = Orchestrator::circuit_output_to_tasks(&output, &tqm_config, 1);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].is_remediation);
+        assert_eq!(tasks[0].remediation_depth, 1);
+        assert_eq!(tasks[0].priority, 2);
+        assert!(tasks[0].id.starts_with("circuit-fix-"));
+    }
+
+    #[test]
+    fn circuit_escalation_skips() {
+        let output = serde_json::json!({
+            "diagnosis": "unclear",
+            "root_cause": "unknown",
+            "remediation_tasks": [],
+            "scope_assessment": { "within_scope": true, "modifies_kernel": false },
+            "suggested_priority": 5,
+            "confidence": "low",
+            "escalate": true
+        });
+
+        let tqm_config = crate::tqm::TQMConfig::default();
+        let tasks = Orchestrator::circuit_output_to_tasks(&output, &tqm_config, 1);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn circuit_out_of_scope_skips() {
+        let output = serde_json::json!({
+            "diagnosis": "kernel bug",
+            "root_cause": "kernel issue",
+            "remediation_tasks": [
+                { "objective": "fix kernel", "target_files": ["crates/kernel/src/lib.rs"] }
+            ],
+            "scope_assessment": { "within_scope": false, "modifies_kernel": true },
+            "suggested_priority": 1,
+            "confidence": "high",
+            "escalate": false
+        });
+
+        let tqm_config = crate::tqm::TQMConfig::default();
+        let tasks = Orchestrator::circuit_output_to_tasks(&output, &tqm_config, 1);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn meta_loop_guard() {
+        // max_remediation_depth = 0 → no remediation tasks generated
+        let output = serde_json::json!({
+            "diagnosis": "test",
+            "root_cause": "test",
+            "remediation_tasks": [
+                { "objective": "fix something", "target_files": ["foo.rs"] }
+            ],
+            "scope_assessment": { "within_scope": true, "modifies_kernel": false },
+            "suggested_priority": 2,
+            "confidence": "high",
+            "escalate": false
+        });
+
+        let tqm_config = crate::tqm::TQMConfig::default();
+        let tasks = Orchestrator::circuit_output_to_tasks(&output, &tqm_config, 0);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn fallback_on_circuit_failure() {
+        // When Circuit output is garbage / missing escalate, defaults to escalate=true
+        let output = serde_json::json!({ "garbage": true });
+        let tqm_config = crate::tqm::TQMConfig::default();
+        let tasks = Orchestrator::circuit_output_to_tasks(&output, &tqm_config, 1);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn repair_budget_skip() {
+        // Remediation task should be skipped if repair budget is exhausted.
+        let tasks = vec![crate::taskqueue::Task {
+            id: "fix-1".into(),
+            objective: "Remediation".into(),
+            priority: 1,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 1,
+            is_remediation: true,
+        }];
+        let queue = TaskQueue::from_tasks(tasks);
+        let next = queue.pick_next().unwrap();
+        // Simulate budget exhaustion check:
+        let budget = CumulativeBudget::new(0.01).with_repair_budget_fraction(0.01);
+        assert!(!budget.can_afford_repair(0.50)); // per-task cost exceeds repair budget
+        assert!(next.is_remediation);
     }
 }

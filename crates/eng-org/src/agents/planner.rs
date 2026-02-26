@@ -80,6 +80,11 @@ Rules:
 - List ALL files that will be touched.
 - If the task is ambiguous, choose the simplest interpretation.
 - If the task requires changes to protected paths, set requires_core_change to true.
+  Protected paths CANNOT be modified — the tool dispatcher will reject all writes.
+  If the ENTIRE task requires modifying only protected paths, return an empty `steps`
+  array with `risk_notes` explaining which paths are protected and why the task is
+  infeasible. If only PART of the task touches protected paths, decompose it so that
+  the feasible parts can proceed independently.
 - When in doubt, DECOMPOSE. Small sub-tasks are always better than one big task that exceeds budget.
 - CRITICAL: Output ONLY the raw JSON object. No text before or after it.
   No markdown code fences. No explanations. Just the JSON."#;

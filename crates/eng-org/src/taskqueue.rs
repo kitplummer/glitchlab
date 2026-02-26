@@ -58,6 +58,14 @@ pub struct Task {
     pub pr_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_context: Option<OutcomeContext>,
+    /// Remediation depth: 0 for normal tasks, incremented for fix tasks.
+    /// Tasks at `max_remediation_depth` will not spawn further remediation.
+    #[serde(default)]
+    pub remediation_depth: u32,
+    /// Whether this task is a remediation (ops-fix) task. Remediation tasks
+    /// are sorted before feature work in the queue.
+    #[serde(default)]
+    pub is_remediation: bool,
 }
 
 fn default_priority() -> u32 {
@@ -142,7 +150,7 @@ impl TaskQueue {
                     .iter()
                     .all(|dep| completed_ids.contains(dep.as_str()))
             })
-            .min_by_key(|t| t.priority)
+            .min_by_key(|t| (!t.is_remediation, t.priority))
     }
 
     /// Update the status of a task by ID.
@@ -330,6 +338,8 @@ fn bead_to_task(bead: Bead) -> Task {
         error: None,
         pr_url,
         outcome_context: None,
+        remediation_depth: 0,
+        is_remediation: false,
     }
 }
 
@@ -353,6 +363,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
             Task {
                 id: "task-2".into(),
@@ -364,6 +376,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
             Task {
                 id: "task-3".into(),
@@ -375,6 +389,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
         ]
     }
@@ -428,6 +444,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
             Task {
                 id: "b".into(),
@@ -439,6 +457,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -581,6 +601,8 @@ mod tests {
             error: Some("oops".into()),
             pr_url: Some("https://example.com/pr/1".into()),
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         };
         let yaml = serde_yaml::to_string(&task).unwrap();
         let parsed: Task = serde_yaml::from_str(&yaml).unwrap();
@@ -604,6 +626,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
             Task {
                 id: "b".into(),
@@ -615,6 +639,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
             Task {
                 id: "c".into(),
@@ -626,6 +652,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -650,6 +678,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         queue.inject_tasks(new_tasks);
         assert_eq!(queue.tasks().len(), 4);
@@ -886,6 +916,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
             Task {
                 id: "p1".into(),
@@ -897,6 +929,8 @@ mod tests {
                 error: None,
                 pr_url: None,
                 outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -917,6 +951,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert_eq!(queue.actionable_count(), 1);
@@ -934,6 +970,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         let s = queue.summary();
@@ -987,6 +1025,8 @@ mod tests {
                 recommendation: Some("try B".into()),
                 files_explored: vec!["a.rs".into()],
             }),
+            remediation_depth: 0,
+            is_remediation: false,
         };
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("outcome_context"));
@@ -1039,6 +1079,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: Task = serde_json::from_str(&json).unwrap();
@@ -1074,6 +1116,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(queue.has_pending_with_prefix("tqm-stuck-agents"));
@@ -1091,6 +1135,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
@@ -1108,6 +1154,8 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
@@ -1125,8 +1173,129 @@ mod tests {
             error: None,
             pr_url: None,
             outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Remediation field tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pick_next_prioritizes_remediation() {
+        let tasks = vec![
+            Task {
+                id: "feature-1".into(),
+                objective: "Feature work".into(),
+                priority: 1, // higher priority number-wise
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
+            },
+            Task {
+                id: "fix-1".into(),
+                objective: "Remediation task".into(),
+                priority: 5, // lower priority number-wise, but is_remediation=true
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 1,
+                is_remediation: true,
+            },
+        ];
+        let queue = TaskQueue::from_tasks(tasks);
+        let next = queue.pick_next().unwrap();
+        assert_eq!(next.id, "fix-1", "remediation tasks should be picked first");
+    }
+
+    #[test]
+    fn task_remediation_fields_default_serde() {
+        // Tasks serialised before remediation fields existed should default correctly.
+        let json = r#"{"id":"old","objective":"old task","priority":1,"status":"pending"}"#;
+        let parsed: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.remediation_depth, 0);
+        assert!(!parsed.is_remediation);
+    }
+
+    #[test]
+    fn remediation_still_respects_deps() {
+        let tasks = vec![
+            Task {
+                id: "dep-1".into(),
+                objective: "Dependency".into(),
+                priority: 10,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
+            },
+            Task {
+                id: "fix-blocked".into(),
+                objective: "Blocked remediation".into(),
+                priority: 1,
+                status: TaskStatus::Pending,
+                depends_on: vec!["dep-1".into()],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 1,
+                is_remediation: true,
+            },
+        ];
+        let queue = TaskQueue::from_tasks(tasks);
+        // fix-blocked depends on dep-1 which is pending, so dep-1 should be picked.
+        let next = queue.pick_next().unwrap();
+        assert_eq!(next.id, "dep-1");
+    }
+
+    #[test]
+    fn remediation_tasks_sorted_by_priority_within_group() {
+        let tasks = vec![
+            Task {
+                id: "fix-low".into(),
+                objective: "Low priority fix".into(),
+                priority: 10,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 1,
+                is_remediation: true,
+            },
+            Task {
+                id: "fix-high".into(),
+                objective: "High priority fix".into(),
+                priority: 2,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 1,
+                is_remediation: true,
+            },
+        ];
+        let queue = TaskQueue::from_tasks(tasks);
+        let next = queue.pick_next().unwrap();
+        assert_eq!(next.id, "fix-high");
     }
 }

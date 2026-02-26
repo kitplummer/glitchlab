@@ -34,11 +34,20 @@ Output schema (valid JSON only, no markdown, no commentary):
   "suggested_changes": ["<optional suggestions if needs_refinement>"]
 }
 
+## Protected paths
+
+Some paths in the repository are protected by project policy and CANNOT be modified by
+the tool dispatcher. If the plan's `files_likely_affected` includes ANY protected path,
+the implementation WILL fail. In this case, return verdict "needs_refinement" with
+`suggested_changes` explaining that the protected paths must be excluded and the task
+decomposed or declared infeasible.
+
 Rules:
 - verdict "already_done" means the planned work already exists in the codebase.
 - verdict "needs_refinement" means the plan has issues but isn't fundamentally wrong.
 - verdict "proceed" means the plan is sound and should be implemented.
 - When uncertain, prefer "proceed" — don't block work unnecessarily.
+- If the plan touches protected paths, ALWAYS return "needs_refinement".
 - Produce valid JSON only."#;
 
 pub struct ArchitectTriageAgent {

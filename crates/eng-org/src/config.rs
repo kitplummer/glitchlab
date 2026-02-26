@@ -68,6 +68,10 @@ pub struct RoutingConfig {
     #[serde(default = "default_architect_model")]
     pub architect_review: String,
 
+    /// Ops diagnosis (Circuit) agent — diagnoses TQM patterns mid-run.
+    #[serde(default = "default_ops_diagnosis_model")]
+    pub ops_diagnosis: String,
+
     /// Model pool for cost-aware chooser. When non-empty, enables
     /// the `ModelChooser` for dynamic model selection.
     #[serde(default)]
@@ -90,6 +94,10 @@ fn default_cost_quality_threshold() -> f64 {
     0.5
 }
 
+fn default_ops_diagnosis_model() -> String {
+    "anthropic/claude-haiku-4-5-20251001".into()
+}
+
 fn default_max_stuck_turns() -> u32 {
     3
 }
@@ -108,6 +116,14 @@ fn default_restart_intensity_window_secs() -> u64 {
 
 fn default_max_total_tasks() -> u32 {
     200
+}
+
+fn default_max_remediation_depth() -> u32 {
+    1
+}
+
+fn default_repair_budget_fraction() -> f64 {
+    0.20
 }
 
 /// Configuration for a model in the cost-aware pool.
@@ -164,6 +180,13 @@ pub struct LimitsConfig {
     /// Prevents unbounded task proliferation from decomposition loops.
     #[serde(default = "default_max_total_tasks")]
     pub max_total_tasks: u32,
+    /// Maximum remediation depth. Remediation tasks at this depth will not
+    /// spawn further remediation (meta-loop guard).
+    #[serde(default = "default_max_remediation_depth")]
+    pub max_remediation_depth: u32,
+    /// Fraction of total budget reserved for repair/remediation tasks (0.0–1.0).
+    #[serde(default = "default_repair_budget_fraction")]
+    pub repair_budget_fraction: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +242,7 @@ impl Default for EngConfig {
                 archivist: "anthropic/claude-haiku-4-5-20251001".into(),
                 architect_triage: default_architect_model(),
                 architect_review: default_architect_model(),
+                ops_diagnosis: default_ops_diagnosis_model(),
                 models: Vec::new(),
                 roles: HashMap::new(),
                 cost_quality_threshold: default_cost_quality_threshold(),
@@ -236,6 +260,8 @@ impl Default for EngConfig {
                 restart_intensity_max_failures: 5,
                 restart_intensity_window_secs: 300,
                 max_total_tasks: default_max_total_tasks(),
+                max_remediation_depth: default_max_remediation_depth(),
+                repair_budget_fraction: default_repair_budget_fraction(),
             },
             intervention: InterventionConfig {
                 pause_after_plan: true,
@@ -379,6 +405,7 @@ impl EngConfig {
                 "architect_review".into(),
                 self.routing.architect_review.clone(),
             ),
+            ("ops_diagnosis".into(), self.routing.ops_diagnosis.clone()),
         ])
     }
 
@@ -601,7 +628,8 @@ mod tests {
         assert!(map.contains_key("archivist"));
         assert!(map.contains_key("architect_triage"));
         assert!(map.contains_key("architect_review"));
-        assert_eq!(map.len(), 8);
+        assert!(map.contains_key("ops_diagnosis"));
+        assert_eq!(map.len(), 9);
     }
 
     #[test]
@@ -1399,5 +1427,25 @@ base_url: http://localhost:8080
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed: EngConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed.providers.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Repair / remediation config tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_default_repair_fields() {
+        let config = EngConfig::default();
+        assert_eq!(config.limits.max_remediation_depth, 1);
+        assert!((config.limits.repair_budget_fraction - 0.20).abs() < f64::EPSILON);
+        assert!(config.routing.ops_diagnosis.contains("haiku"));
+    }
+
+    #[test]
+    fn routing_map_includes_ops_diagnosis() {
+        let config = EngConfig::default();
+        let map = config.routing_map();
+        assert!(map.contains_key("ops_diagnosis"));
+        assert!(map["ops_diagnosis"].contains("haiku"));
     }
 }
