@@ -1,0 +1,36 @@
+services:
+  dolt:
+    image: dolthub/dolt-sql-server:latest
+    container_name: glitchlab-dolt
+    ports:
+      - "3306:3306"
+    volumes:
+      - dolt-data:/var/lib/dolt
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        mkdir -p /var/lib/dolt/glitchlab &&
+        cd /var/lib/dolt/glitchlab &&
+        [ -d .dolt ] || dolt init --name glitchlab --email glitchlab@localhost &&
+        printf 'log_level: info\nlistener:\n  host: 0.0.0.0\n  port: 3306\ndata_dir: /var/lib/dolt\n' > /var/lib/dolt/server.yaml &&
+        dolt sql-server --config /var/lib/dolt/server.yaml &
+        SERVER_PID=$$! &&
+        sleep 2 &&
+        dolt sql -q "CREATE USER IF NOT EXISTS 'glitchlab'@'%' IDENTIFIED BY 'glitchlab'; GRANT ALL PRIVILEGES ON *.* TO 'glitchlab'@'%';" 2>/dev/null;
+        wait $$SERVER_PID
+    restart: unless-stopped
+
+  glitchlab:
+    image: ubuntu:latest
+    volumes:
+      - .:/glitchlab
+    working_dir: /glitchlab
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    command: ["./target/release/glitchlab", "--org", "ops", "--help"]
+    depends_on:
+      - dolt
+
+volumes:
+  dolt-data:
