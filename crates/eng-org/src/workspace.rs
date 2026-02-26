@@ -428,6 +428,16 @@ mod tests {
             .current_dir(&repo_root)
             .status()
             .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&repo_root)
+            .output()
+            .unwrap();
         std::fs::write(repo_root.join("README.md"), "initial readme content").unwrap();
         std::process::Command::new("git")
             .args(["add", "README.md"])
