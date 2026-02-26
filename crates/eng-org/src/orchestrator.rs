@@ -542,293 +542,303 @@ impl Orchestrator {
             dominant_failure_pattern: None,
         };
 
-        let mut remediation_pass_done = false;
+        let mut detected_patterns: Vec<crate::tqm::DetectedPattern> = vec![];
 
+        // --- Task loop ---
         loop {
-            // --- Inner task loop ---
-            loop {
-                // --- Check budget ---
-                let per_task_dollars = self.config.limits.max_dollars_per_task;
-                if !budget.can_afford(per_task_dollars) {
-                    info!(
-                        remaining = budget.remaining_dollars(),
-                        per_task = per_task_dollars,
-                        "budget exhausted"
-                    );
-                    result.cease_reason = CeaseReason::BudgetExhausted;
+            // --- Check budget ---
+            let per_task_dollars = self.config.limits.max_dollars_per_task;
+            if !budget.can_afford(per_task_dollars) {
+                info!(
+                    remaining = budget.remaining_dollars(),
+                    per_task = per_task_dollars,
+                    "budget exhausted"
+                );
+                result.cease_reason = CeaseReason::BudgetExhausted;
+                break;
+            }
+
+            // --- Check max total tasks ---
+            if queue.len() > self.config.limits.max_total_tasks as usize {
+                warn!(
+                    total = queue.len(),
+                    max = self.config.limits.max_total_tasks,
+                    "task queue exceeded max_total_tasks, halting"
+                );
+                result.cease_reason = CeaseReason::SystemicFailure;
+                break;
+            }
+
+            // --- Pick next task ---
+            let task_id;
+            let objective;
+            let task_depth;
+            match queue.pick_next() {
+                Some(task) => {
+                    task_id = task.id.clone();
+                    objective = task.objective.clone();
+                    task_depth = task.decomposition_depth;
+                }
+                None => {
+                    info!("no more actionable tasks");
+                    result.cease_reason = CeaseReason::AllTasksDone;
                     break;
                 }
+            }
 
-                // --- Pick next task ---
-                let task_id;
-                let objective;
-                let task_depth;
-                match queue.pick_next() {
-                    Some(task) => {
-                        task_id = task.id.clone();
-                        objective = task.objective.clone();
-                        task_depth = task.decomposition_depth;
-                    }
-                    None => {
-                        info!("no more actionable tasks");
-                        result.cease_reason = CeaseReason::AllTasksDone;
-                        break;
-                    }
+            // --- Check attempt limit ---
+            if tracker.count(&task_id) >= max_attempts {
+                info!(
+                    task_id = %task_id,
+                    attempts = tracker.count(&task_id),
+                    max = max_attempts,
+                    "max attempts exceeded, marking failed"
+                );
+                queue.update_status(&task_id, TaskStatus::Failed);
+                queue.set_error(&task_id, format!("exceeded max attempts ({max_attempts})"));
+                let _ = queue.save();
+                result.tasks_attempted += 1;
+                result.tasks_failed += 1;
+                result.run_results.push(TaskRunResult {
+                    task_id: task_id.clone(),
+                    status: "max_attempts_exceeded".into(),
+                    cost: 0.0,
+                    tokens: 0,
+                    pr_url: None,
+                    error: Some(format!("exceeded max attempts ({max_attempts})")),
+                    outcome_context: None,
+                });
+                if let Some(dominant) =
+                    intensity_monitor.record_failure(FailureCategory::MaxAttemptsExceeded)
+                {
+                    warn!(?dominant, "restart intensity exceeded");
+                    result.cease_reason = CeaseReason::SystemicFailure;
+                    result.dominant_failure_pattern = Some(dominant);
+                    break;
                 }
+                continue;
+            }
 
-                // --- Check attempt limit ---
-                if tracker.count(&task_id) >= max_attempts {
-                    info!(
-                        task_id = %task_id,
-                        attempts = tracker.count(&task_id),
-                        max = max_attempts,
-                        "max attempts exceeded, marking failed"
-                    );
+            // --- Mark in progress ---
+            queue.update_status(&task_id, TaskStatus::InProgress);
+            let _ = queue.save();
+
+            info!(task_id = %task_id, "starting task");
+
+            // --- Create fresh router + pipeline for this task ---
+            let attempt_contexts = tracker.contexts(&task_id);
+            let pipeline_result = match self
+                .create_and_run_pipeline(&task_id, &objective, params, attempt_contexts)
+                .await
+            {
+                Ok(pr) => pr,
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "pipeline setup failed");
                     queue.update_status(&task_id, TaskStatus::Failed);
-                    queue.set_error(&task_id, format!("exceeded max attempts ({max_attempts})"));
+                    queue.set_error(&task_id, e.to_string());
                     let _ = queue.save();
+
                     result.tasks_attempted += 1;
                     result.tasks_failed += 1;
                     result.run_results.push(TaskRunResult {
                         task_id: task_id.clone(),
-                        status: "max_attempts_exceeded".into(),
+                        status: "setup_error".into(),
                         cost: 0.0,
                         tokens: 0,
                         pr_url: None,
-                        error: Some(format!("exceeded max attempts ({max_attempts})")),
+                        error: Some(e.to_string()),
                         outcome_context: None,
                     });
+
                     if let Some(dominant) =
-                        intensity_monitor.record_failure(FailureCategory::MaxAttemptsExceeded)
+                        intensity_monitor.record_failure(FailureCategory::SetupError)
                     {
                         warn!(?dominant, "restart intensity exceeded");
                         result.cease_reason = CeaseReason::SystemicFailure;
                         result.dominant_failure_pattern = Some(dominant);
                         break;
                     }
-                    continue;
-                }
-
-                // --- Mark in progress ---
-                queue.update_status(&task_id, TaskStatus::InProgress);
-                let _ = queue.save();
-
-                info!(task_id = %task_id, "starting task");
-
-                // --- Create fresh router + pipeline for this task ---
-                let attempt_contexts = tracker.contexts(&task_id);
-                let pipeline_result = match self
-                    .create_and_run_pipeline(&task_id, &objective, params, attempt_contexts)
-                    .await
-                {
-                    Ok(pr) => pr,
-                    Err(e) => {
-                        warn!(task_id = %task_id, error = %e, "pipeline setup failed");
-                        queue.update_status(&task_id, TaskStatus::Failed);
-                        queue.set_error(&task_id, e.to_string());
-                        let _ = queue.save();
-
-                        result.tasks_attempted += 1;
-                        result.tasks_failed += 1;
-                        result.run_results.push(TaskRunResult {
-                            task_id: task_id.clone(),
-                            status: "setup_error".into(),
-                            cost: 0.0,
-                            tokens: 0,
-                            pr_url: None,
-                            error: Some(e.to_string()),
-                            outcome_context: None,
-                        });
-
-                        if let Some(dominant) =
-                            intensity_monitor.record_failure(FailureCategory::SetupError)
-                        {
-                            warn!(?dominant, "restart intensity exceeded");
-                            result.cease_reason = CeaseReason::SystemicFailure;
-                            result.dominant_failure_pattern = Some(dominant);
-                            break;
-                        }
-                        if params.stop_on_failure {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-
-                // --- Record spend ---
-                let cost = pipeline_result.budget.estimated_cost;
-                let tokens = pipeline_result.budget.total_tokens;
-                let status_str = format!("{:?}", pipeline_result.status);
-                budget.record(&task_id, cost, tokens, &status_str);
-
-                result.tasks_attempted += 1;
-                result.total_cost += cost;
-                result.total_tokens += tokens;
-
-                let run_result = TaskRunResult {
-                    task_id: task_id.clone(),
-                    status: status_str,
-                    cost,
-                    tokens,
-                    pr_url: pipeline_result.pr_url.clone(),
-                    error: pipeline_result.error.clone(),
-                    outcome_context: pipeline_result.outcome_context.clone(),
-                };
-                result.run_results.push(run_result);
-
-                // --- Outcome-aware status routing ---
-
-                // Handle decomposition specially (needs sub-task extraction).
-                if pipeline_result.status == PipelineStatus::Decomposed {
-                    let max_depth = self.config.limits.max_decomposition_depth;
-                    Self::handle_decomposition(
-                        queue,
-                        &mut result,
-                        &task_id,
-                        task_depth,
-                        max_depth,
-                        &pipeline_result.stage_outputs,
-                    );
-                    continue;
-                }
-
-                let routing = Self::route_outcome(&pipeline_result);
-                queue.update_status(&task_id, routing.task_status.clone());
-
-                match routing.counter {
-                    OutcomeCounter::Succeeded => result.tasks_succeeded += 1,
-                    OutcomeCounter::Failed => {
-                        result.tasks_failed += 1;
-                        let category = pipeline_status_to_failure_category(pipeline_result.status);
-                        if let Some(dominant) = intensity_monitor.record_failure(category) {
-                            warn!(?dominant, "restart intensity exceeded");
-                            result.cease_reason = CeaseReason::SystemicFailure;
-                            result.dominant_failure_pattern = Some(dominant);
-                        }
-                    }
-                    OutcomeCounter::Deferred => result.tasks_deferred += 1,
-                    OutcomeCounter::Escalated => result.tasks_escalated += 1,
-                    OutcomeCounter::None => {}
-                }
-
-                if let Some(ref url) = pipeline_result.pr_url {
-                    queue.set_pr_url(&task_id, url.clone());
-                }
-                if let Some(ref err) = pipeline_result.error {
-                    queue.set_error(&task_id, err.clone());
-                }
-                if let Some(ctx) = pipeline_result.outcome_context.clone() {
-                    if routing.save_context {
-                        queue.set_outcome_context(&task_id, ctx.clone());
-                    }
-                    if routing.track_attempt {
-                        tracker.record(&task_id, ctx);
-                    }
-                }
-
-                if routing.task_status == TaskStatus::Deferred {
-                    let _ = queue.save();
-                    info!(task_id = %task_id, "task deferred, will retry later");
-                    continue;
-                }
-
-                let _ = queue.save();
-
-                if result.cease_reason == CeaseReason::SystemicFailure {
-                    break;
-                }
-
-                let succeeded = matches!(
-                    pipeline_result.status,
-                    PipelineStatus::PrCreated
-                        | PipelineStatus::Committed
-                        | PipelineStatus::PrMerged
-                        | PipelineStatus::AlreadyDone
-                );
-
-                info!(
-                    task_id = %task_id,
-                    succeeded,
-                    cost,
-                    tokens,
-                    remaining_budget = budget.remaining_dollars(),
-                    "task complete"
-                );
-
-                // --- Quality gate (only after successful tasks) ---
-                if succeeded && let Some(ref gate_cmd) = params.quality_gate_command {
-                    let qr = run_quality_gate(gate_cmd, &params.repo_path).await;
-                    if !qr.passed {
-                        warn!(
-                            task_id = %task_id,
-                            details = %qr.details,
-                            "quality gate failed — halting orchestrator"
-                        );
-                        result.cease_reason = CeaseReason::QualityGateFailed;
+                    if params.stop_on_failure {
                         break;
                     }
+                    continue;
                 }
+            };
 
-                // --- Stop on failure (optional) ---
-                if !succeeded && params.stop_on_failure {
-                    info!(task_id = %task_id, "stopping on failure (stop_on_failure=true)");
+            // --- Record spend ---
+            let cost = pipeline_result.budget.estimated_cost;
+            let tokens = pipeline_result.budget.total_tokens;
+            let status_str = format!("{:?}", pipeline_result.status);
+            budget.record(&task_id, cost, tokens, &status_str);
+
+            result.tasks_attempted += 1;
+            result.total_cost += cost;
+            result.total_tokens += tokens;
+
+            let run_result = TaskRunResult {
+                task_id: task_id.clone(),
+                status: status_str,
+                cost,
+                tokens,
+                pr_url: pipeline_result.pr_url.clone(),
+                error: pipeline_result.error.clone(),
+                outcome_context: pipeline_result.outcome_context.clone(),
+            };
+            result.run_results.push(run_result);
+
+            // --- Inline TQM: detect patterns mid-run ---
+            if self.config.tqm.remediation_enabled {
+                let new_patterns =
+                    crate::tqm::analyze_incremental(&result, &self.config.tqm, &detected_patterns);
+                for pattern in &new_patterns {
+                    warn!(
+                        kind = ?pattern.kind,
+                        severity = %pattern.severity,
+                        occurrences = pattern.occurrences,
+                        "TQM: pattern detected mid-run"
+                    );
+                }
+                if !new_patterns.is_empty() {
+                    let tasks = crate::tqm::generate_deduplicated_remediation_tasks(
+                        &new_patterns,
+                        &self.config.tqm,
+                        queue,
+                    );
+                    if !tasks.is_empty() {
+                        info!(
+                            count = tasks.len(),
+                            "TQM: injecting remediation tasks into queue"
+                        );
+                        queue.inject_tasks(tasks);
+                    }
+                }
+                detected_patterns.extend(new_patterns);
+            }
+
+            // --- Outcome-aware status routing ---
+
+            // Handle decomposition specially (needs sub-task extraction).
+            if pipeline_result.status == PipelineStatus::Decomposed {
+                let max_depth = self.config.limits.max_decomposition_depth;
+                Self::handle_decomposition(
+                    queue,
+                    &mut result,
+                    &task_id,
+                    task_depth,
+                    max_depth,
+                    &pipeline_result.stage_outputs,
+                );
+                continue;
+            }
+
+            let routing = Self::route_outcome(&pipeline_result);
+            queue.update_status(&task_id, routing.task_status.clone());
+
+            match routing.counter {
+                OutcomeCounter::Succeeded => result.tasks_succeeded += 1,
+                OutcomeCounter::Failed => {
+                    result.tasks_failed += 1;
+                    let category = pipeline_status_to_failure_category(pipeline_result.status);
+                    if let Some(dominant) = intensity_monitor.record_failure(category) {
+                        warn!(?dominant, "restart intensity exceeded");
+                        result.cease_reason = CeaseReason::SystemicFailure;
+                        result.dominant_failure_pattern = Some(dominant);
+                    }
+                }
+                OutcomeCounter::Deferred => result.tasks_deferred += 1,
+                OutcomeCounter::Escalated => result.tasks_escalated += 1,
+                OutcomeCounter::None => {}
+            }
+
+            if let Some(ref url) = pipeline_result.pr_url {
+                queue.set_pr_url(&task_id, url.clone());
+            }
+            if let Some(ref err) = pipeline_result.error {
+                queue.set_error(&task_id, err.clone());
+            }
+            if let Some(ctx) = pipeline_result.outcome_context.clone() {
+                if routing.save_context {
+                    queue.set_outcome_context(&task_id, ctx.clone());
+                }
+                if routing.track_attempt {
+                    tracker.record(&task_id, ctx);
+                }
+            }
+
+            if routing.task_status == TaskStatus::Deferred {
+                let _ = queue.save();
+                info!(task_id = %task_id, "task deferred, will retry later");
+                continue;
+            }
+
+            let _ = queue.save();
+
+            if result.cease_reason == CeaseReason::SystemicFailure {
+                break;
+            }
+
+            let succeeded = matches!(
+                pipeline_result.status,
+                PipelineStatus::PrCreated
+                    | PipelineStatus::Committed
+                    | PipelineStatus::PrMerged
+                    | PipelineStatus::AlreadyDone
+            );
+
+            info!(
+                task_id = %task_id,
+                succeeded,
+                cost,
+                tokens,
+                remaining_budget = budget.remaining_dollars(),
+                "task complete"
+            );
+
+            // --- Quality gate (only after successful tasks) ---
+            if succeeded && let Some(ref gate_cmd) = params.quality_gate_command {
+                let qr = run_quality_gate(gate_cmd, &params.repo_path).await;
+                if !qr.passed {
+                    warn!(
+                        task_id = %task_id,
+                        details = %qr.details,
+                        "quality gate failed — halting orchestrator"
+                    );
+                    result.cease_reason = CeaseReason::QualityGateFailed;
                     break;
                 }
             }
 
-            result.duration = start_time.elapsed();
-
-            // --- TQM post-run analysis ---
-            let tqm_patterns = crate::tqm::analyze(&result, &self.config.tqm);
-            for pattern in &tqm_patterns {
-                match pattern.severity.as_str() {
-                    "critical" => warn!(
-                        kind = ?pattern.kind,
-                        occurrences = pattern.occurrences,
-                        affected = ?pattern.affected_tasks,
-                        "{}", pattern.description
-                    ),
-                    "warning" => warn!(
-                        kind = ?pattern.kind,
-                        occurrences = pattern.occurrences,
-                        "{}", pattern.description
-                    ),
-                    _ => info!(
-                        kind = ?pattern.kind,
-                        occurrences = pattern.occurrences,
-                        "{}", pattern.description
-                    ),
-                }
-            }
-
-            // --- Remediation task generation ---
-            if remediation_pass_done {
+            // --- Stop on failure (optional) ---
+            if !succeeded && params.stop_on_failure {
+                info!(task_id = %task_id, "stopping on failure (stop_on_failure=true)");
                 break;
             }
+        }
 
-            let remediation = crate::tqm::generate_deduplicated_remediation_tasks(
-                &tqm_patterns,
-                &self.config.tqm,
-                queue,
-            );
-            if remediation.is_empty() {
-                break;
+        result.duration = start_time.elapsed();
+
+        // --- TQM end-of-run summary ---
+        let tqm_patterns = crate::tqm::analyze(&result, &self.config.tqm);
+        for pattern in &tqm_patterns {
+            match pattern.severity.as_str() {
+                "critical" => warn!(
+                    kind = ?pattern.kind,
+                    occurrences = pattern.occurrences,
+                    affected = ?pattern.affected_tasks,
+                    "{}", pattern.description
+                ),
+                "warning" => warn!(
+                    kind = ?pattern.kind,
+                    occurrences = pattern.occurrences,
+                    "{}", pattern.description
+                ),
+                _ => info!(
+                    kind = ?pattern.kind,
+                    occurrences = pattern.occurrences,
+                    "{}", pattern.description
+                ),
             }
-
-            info!(count = remediation.len(), "TQM generated remediation tasks");
-
-            if self.config.tqm.remediation_in_run
-                && result.cease_reason == CeaseReason::AllTasksDone
-            {
-                queue.inject_tasks(remediation);
-                remediation_pass_done = true;
-                continue; // re-enter inner task loop
-            } else {
-                queue.inject_tasks(remediation);
-                let _ = queue.save();
-                break;
-            }
-        } // end outer loop
+        }
 
         info!(
             tasks_attempted = result.tasks_attempted,
@@ -2505,6 +2515,82 @@ mod tests {
     // -----------------------------------------------------------------------
     // Orchestrator systemic failure integration test
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn orchestrator_inline_tqm_injects_remediation() {
+        // This test verifies that when remediation_enabled is true, the inline
+        // TQM check can detect patterns and inject remediation tasks mid-run.
+        // Tasks fail (no API keys) with Error status. With threshold=1, the
+        // stuck_agents detector fires after the first failure, injecting a
+        // remediation task into the queue.
+        let mut config = EngConfig::default();
+        config.tqm.remediation_enabled = true;
+        config.tqm.stuck_agents_threshold = 1;
+        // Set restart intensity high so it doesn't halt before TQM fires.
+        config.limits.restart_intensity_max_failures = 20;
+        config.limits.max_fix_attempts = 1;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        let tasks = vec![
+            pending_task("tqm1", "task A"),
+            pending_task("tqm2", "task B"),
+            pending_task("tqm3", "task C"),
+        ];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut budget = CumulativeBudget::new(100.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: false,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+        // Tasks should have been attempted (and failed due to no API keys).
+        assert!(result.tasks_attempted >= 1);
+        // Check that TQM remediation tasks were injected into the queue.
+        let has_tqm_task = queue.tasks().iter().any(|t| t.id.starts_with("tqm-"));
+        assert!(has_tqm_task, "expected TQM remediation tasks in queue");
+    }
+
+    #[tokio::test]
+    async fn orchestrator_max_total_tasks_halts() {
+        let mut config = EngConfig::default();
+        config.limits.max_total_tasks = 5; // set very low
+
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        // 6 tasks exceeds the limit of 5
+        let tasks = vec![
+            pending_task("mt1", "task 1"),
+            pending_task("mt2", "task 2"),
+            pending_task("mt3", "task 3"),
+            pending_task("mt4", "task 4"),
+            pending_task("mt5", "task 5"),
+            pending_task("mt6", "task 6"),
+        ];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut budget = CumulativeBudget::new(100.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: false,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+        assert_eq!(result.cease_reason, CeaseReason::SystemicFailure);
+        assert_eq!(result.tasks_attempted, 0);
+    }
 
     #[tokio::test]
     async fn orchestrator_systemic_failure_halts() {

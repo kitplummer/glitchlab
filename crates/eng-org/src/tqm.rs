@@ -50,9 +50,6 @@ pub struct TQMConfig {
     /// Whether to generate remediation tasks from detected patterns.
     #[serde(default)]
     pub remediation_enabled: bool,
-    /// Whether to execute remediation tasks in the current run (vs. saving for next run).
-    #[serde(default)]
-    pub remediation_in_run: bool,
     /// Priority for generated remediation tasks (lower = higher priority).
     #[serde(default = "default_remediation_priority")]
     pub remediation_priority: u32,
@@ -98,7 +95,6 @@ impl Default for TQMConfig {
             budget_pressure_threshold: default_budget_pressure(),
             provider_failure_threshold: default_provider_failures(),
             remediation_enabled: false,
-            remediation_in_run: false,
             remediation_priority: default_remediation_priority(),
         }
     }
@@ -165,6 +161,45 @@ pub fn analyze(result: &OrchestratorResult, config: &TQMConfig) -> Vec<DetectedP
     check_architect_rejection_rate(result, config, &mut patterns);
     check_budget_pressure(result, config, &mut patterns);
     check_provider_failures(result, config, &mut patterns);
+
+    patterns
+}
+
+/// Incremental variant of [`analyze`] for use during a live orchestrator run.
+///
+/// Runs the same detectors but filters out patterns whose `kind` already
+/// appears in `previous_patterns`, so that each pattern fires at most once
+/// per orchestrator run.
+///
+/// Also applies a minimum-sample guard to the architect rejection rate
+/// detector: it is skipped when `result.tasks_attempted < 5` to avoid
+/// false positives early in the run.
+pub fn analyze_incremental(
+    result: &OrchestratorResult,
+    config: &TQMConfig,
+    previous_patterns: &[DetectedPattern],
+) -> Vec<DetectedPattern> {
+    let already_detected: std::collections::HashSet<PatternKind> =
+        previous_patterns.iter().map(|p| p.kind).collect();
+
+    let mut patterns = Vec::new();
+
+    check_decomposition_loops(result, config, &mut patterns);
+    check_scope_creep(result, config, &mut patterns);
+    check_model_degradation(result, config, &mut patterns);
+    check_stuck_agents(result, config, &mut patterns);
+    check_test_flakiness(result, config, &mut patterns);
+
+    // Minimum sample guard: skip architect rejection rate when too few tasks attempted.
+    if result.tasks_attempted >= 5 {
+        check_architect_rejection_rate(result, config, &mut patterns);
+    }
+
+    check_budget_pressure(result, config, &mut patterns);
+    check_provider_failures(result, config, &mut patterns);
+
+    // Filter out patterns whose kind was already detected in a previous call.
+    patterns.retain(|p| !already_detected.contains(&p.kind));
 
     patterns
 }
@@ -928,7 +963,6 @@ mod tests {
         assert!((config.budget_pressure_threshold - 0.9).abs() < f64::EPSILON);
         assert_eq!(config.provider_failure_threshold, 3);
         assert!(!config.remediation_enabled);
-        assert!(!config.remediation_in_run);
         assert_eq!(config.remediation_priority, 5);
     }
 
@@ -994,7 +1028,6 @@ mod tests {
         }"#;
         let parsed: TQMConfig = serde_json::from_str(json).unwrap();
         assert!(!parsed.remediation_enabled);
-        assert!(!parsed.remediation_in_run);
         assert_eq!(parsed.remediation_priority, 5);
     }
 
@@ -1208,5 +1241,119 @@ mod tests {
         ];
         let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue);
         assert_eq!(tasks.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // analyze_incremental tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn incremental_detects_new_pattern() {
+        let mut result = empty_result();
+        result.tasks_attempted = 3;
+        result.run_results = vec![
+            run_result("t1", "Decomposed"),
+            run_result("t1", "Decomposed"),
+            run_result("t1", "Decomposed"),
+        ];
+        let config = TQMConfig::default();
+        let previous: Vec<DetectedPattern> = vec![];
+
+        let patterns = analyze_incremental(&result, &config, &previous);
+        assert!(
+            patterns
+                .iter()
+                .any(|p| p.kind == PatternKind::DecompositionLoop)
+        );
+    }
+
+    #[test]
+    fn incremental_skips_already_detected_kind() {
+        let mut result = empty_result();
+        result.tasks_attempted = 3;
+        result.run_results = vec![
+            run_result("t1", "Decomposed"),
+            run_result("t1", "Decomposed"),
+            run_result("t1", "Decomposed"),
+        ];
+        let config = TQMConfig::default();
+        // Pretend DecompositionLoop was already detected.
+        let previous = vec![make_pattern(
+            PatternKind::DecompositionLoop,
+            vec!["t1".into()],
+        )];
+
+        let patterns = analyze_incremental(&result, &config, &previous);
+        assert!(
+            !patterns
+                .iter()
+                .any(|p| p.kind == PatternKind::DecompositionLoop)
+        );
+    }
+
+    #[test]
+    fn incremental_rejection_rate_skipped_when_sample_too_small() {
+        let mut result = empty_result();
+        result.tasks_attempted = 4; // below the min-sample guard of 5
+        result.run_results = vec![
+            run_result("t1", "ArchitectRejected"),
+            run_result("t2", "ArchitectRejected"),
+            run_result("t3", "ArchitectRejected"),
+            run_result("t4", "ArchitectRejected"),
+        ];
+        let config = TQMConfig::default();
+        let previous: Vec<DetectedPattern> = vec![];
+
+        let patterns = analyze_incremental(&result, &config, &previous);
+        assert!(
+            !patterns
+                .iter()
+                .any(|p| p.kind == PatternKind::ArchitectRejectionRate)
+        );
+    }
+
+    #[test]
+    fn incremental_rejection_rate_fires_with_sufficient_sample() {
+        let mut result = empty_result();
+        result.tasks_attempted = 6;
+        result.run_results = vec![
+            run_result("t1", "ArchitectRejected"),
+            run_result("t2", "ArchitectRejected"),
+            run_result("t3", "ArchitectRejected"),
+            run_result("t4", "PrCreated"),
+            run_result("t5", "PrCreated"),
+            run_result("t6", "PrCreated"),
+        ];
+        let config = TQMConfig::default(); // threshold 0.5
+        let previous: Vec<DetectedPattern> = vec![];
+
+        let patterns = analyze_incremental(&result, &config, &previous);
+        assert!(
+            patterns
+                .iter()
+                .any(|p| p.kind == PatternKind::ArchitectRejectionRate)
+        );
+    }
+
+    #[test]
+    fn config_backward_compat_without_remediation_in_run() {
+        // Configs that still have the old remediation_in_run field should still parse
+        // (serde ignores unknown fields with deny_unknown_fields not set).
+        let json = r#"{
+            "decomposition_loop_threshold": 3,
+            "scope_creep_threshold": 3,
+            "model_degradation_threshold": 3,
+            "stuck_agents_threshold": 3,
+            "test_flakiness_threshold": 2,
+            "architect_rejection_rate_threshold": 0.5,
+            "budget_pressure_threshold": 0.9,
+            "provider_failure_threshold": 3,
+            "remediation_enabled": true,
+            "remediation_in_run": true,
+            "remediation_priority": 5
+        }"#;
+        let parsed: TQMConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.remediation_enabled);
+        assert_eq!(parsed.remediation_priority, 5);
     }
 }
