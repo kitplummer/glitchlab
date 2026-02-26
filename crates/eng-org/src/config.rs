@@ -257,19 +257,38 @@ impl Default for EngConfig {
                 cost_quality_threshold: default_cost_quality_threshold(),
             },
             limits: LimitsConfig {
+                // Maximum number of times to attempt to fix a failed task. (Range: 1-5)
                 max_fix_attempts: 2,
+                // Maximum number of tokens allowed for a single task. (Range: 10,000-500,000)
                 max_tokens_per_task: 120_000,
+                // Maximum dollar cost allowed for a single task. (Range: 0.10-10.00)
                 max_dollars_per_task: 0.50,
+                // When true, the orchestrator will pause and wait for human approval after generating a plan.
                 require_plan_review: true,
+                // When true, the orchestrator will pause and wait for human approval after creating a PR.
                 require_pr_review: true,
+                // Maximum number of tool turns allowed for a single task. (Range: 5-50)
                 max_tool_turns: 15,
+                // Maximum duration in seconds for a single pipeline run. (Range: 300-3600)
                 max_pipeline_duration_secs: 600,
+                // Maximum recent turns to check for stuck detection. When tool results
+                // repeat within this window, or all-error turns reach this count, the
+                // tool-use loop terminates early.
                 max_stuck_turns: 3,
+                // Maximum decomposition depth. Tasks at this depth will not be decomposed
+                // further; instead they are marked as failed. Prevents infinite decomposition loops.
                 max_decomposition_depth: 3,
+                // Number of task failures within the window that triggers a systemic halt.
                 restart_intensity_max_failures: 5,
+                // Time window in seconds for restart intensity tracking.
                 restart_intensity_window_secs: 300,
+                // Maximum total tasks in the queue before the orchestrator halts.
+                // Prevents unbounded task proliferation from decomposition loops.
                 max_total_tasks: default_max_total_tasks(),
+                // Maximum remediation depth. Remediation tasks at this depth will not
+                // spawn further remediation (meta-loop guard).
                 max_remediation_depth: default_max_remediation_depth(),
+                // Fraction of total budget reserved for repair/remediation tasks (0.0–1.0).
                 repair_budget_fraction: default_repair_budget_fraction(),
             },
             intervention: InterventionConfig {
