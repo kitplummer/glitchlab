@@ -28,28 +28,28 @@ pub struct EngConfig {
     pub pipeline: PipelineConfig,
 }
 
-/// Configuration for pipeline execution behavior (e.g. fast-path skipping).
+/// Configuration for pipeline execution behavior (e.g. short-circuit skipping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     /// When true, trivial/small tasks skip non-essential stages (triage,
     /// security, release, archivist) to reduce token usage.
     #[serde(default)]
-    pub fast_path_enabled: bool,
-    /// Maximum number of `files_likely_affected` entries for fast-path
+    pub short_circuit_enabled: bool,
+    /// Maximum number of `files_likely_affected` entries for short-circuit
     /// eligibility. Tasks affecting more files use the full pipeline.
-    #[serde(default = "default_fast_path_max_files")]
-    pub fast_path_max_files: usize,
+    #[serde(default = "default_short_circuit_max_files")]
+    pub short_circuit_max_files: usize,
 }
 
-fn default_fast_path_max_files() -> usize {
+fn default_short_circuit_max_files() -> usize {
     2
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            fast_path_enabled: false,
-            fast_path_max_files: default_fast_path_max_files(),
+            short_circuit_enabled: false,
+            short_circuit_max_files: default_short_circuit_max_files(),
         }
     }
 }

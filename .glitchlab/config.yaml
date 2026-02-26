@@ -75,7 +75,7 @@ tqm:
   remediation_priority: 2
 
 pipeline:
-  fast_path_enabled: true
+  short_circuit_enabled: true
 
 providers:
   gemini:

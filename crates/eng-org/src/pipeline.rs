@@ -569,19 +569,22 @@ impl EngineeringPipeline {
             };
         }
 
-        // --- Fast-path eligibility check ---
-        let use_fast_path = self.config.pipeline.fast_path_enabled
-            && is_fast_path_eligible(&plan_output.data, self.config.pipeline.fast_path_max_files);
+        // --- Short-circuit eligibility check ---
+        let use_short_circuit = self.config.pipeline.short_circuit_enabled
+            && is_short_circuit_eligible(
+                &plan_output.data,
+                self.config.pipeline.short_circuit_max_files,
+            );
 
-        if use_fast_path {
+        if use_short_circuit {
             info!(
                 task_id,
-                "fast-path eligible — skipping triage, security, release, archivist"
+                "short-circuit eligible — skipping triage, security, release, archivist"
             );
         }
 
-        // --- Stage 3c: Architect triage (skipped on fast path) ---
-        if !use_fast_path {
+        // --- Stage 3c: Architect triage (skipped on short circuit) ---
+        if !use_short_circuit {
             ctx.current_stage = Some("architect_triage".into());
             ctx.agent_context.previous_output = plan_output.data.clone();
 
@@ -964,14 +967,14 @@ impl EngineeringPipeline {
             }
         }
 
-        // --- Stage 10: Security review (skipped on fast path) ---
-        let security_output = if use_fast_path {
+        // --- Stage 10: Security review (skipped on short circuit) ---
+        let security_output = if use_short_circuit {
             let synthetic = fallback_output(
                 "security",
                 serde_json::json!({
                     "verdict": "skipped",
                     "issues": [],
-                    "summary": "skipped (fast path)"
+                    "summary": "skipped (short circuit)"
                 }),
             );
             ctx.stage_outputs
@@ -1018,13 +1021,13 @@ impl EngineeringPipeline {
             output
         };
 
-        // --- Stage 11: Release assessment (skipped on fast path) ---
-        if use_fast_path {
+        // --- Stage 11: Release assessment (skipped on short circuit) ---
+        if use_short_circuit {
             let synthetic = fallback_output(
                 "release",
                 serde_json::json!({
                     "version_bump": "patch",
-                    "reasoning": "skipped (fast path)"
+                    "reasoning": "skipped (short circuit)"
                 }),
             );
             ctx.stage_outputs.insert("release".into(), synthetic);
@@ -1058,8 +1061,8 @@ impl EngineeringPipeline {
             ctx.stage_outputs.insert("release".into(), release_output);
         }
 
-        // --- Stage 12: Archive / documentation (skipped on fast path) ---
-        if !use_fast_path {
+        // --- Stage 12: Archive / documentation (skipped on short circuit) ---
+        if !use_short_circuit {
             ctx.current_stage = Some("archive".into());
             ctx.agent_context.previous_output = serde_json::json!({
                 "plan": plan_output.data,
@@ -1676,11 +1679,11 @@ fn extract_all_plan_files(plan: &serde_json::Value) -> Vec<String> {
     files
 }
 
-/// Determine whether the planner output qualifies for the fast path.
+/// Determine whether the planner output qualifies for short-circuit mode.
 ///
 /// Eligible when: complexity is trivial/small, no core change required,
 /// file count within limit, and no decomposition.
-fn is_fast_path_eligible(plan_data: &serde_json::Value, max_files: usize) -> bool {
+fn is_short_circuit_eligible(plan_data: &serde_json::Value, max_files: usize) -> bool {
     let complexity = plan_data["estimated_complexity"]
         .as_str()
         .unwrap_or("medium");
@@ -5162,94 +5165,94 @@ mod tests {
         );
     }
 
-    // --- is_fast_path_eligible tests ---
+    // --- short_circuit eligibility tests ---
 
     #[test]
-    fn fast_path_trivial_one_file() {
+    fn short_circuit_trivial_one_file() {
         let plan = serde_json::json!({
             "estimated_complexity": "trivial",
             "requires_core_change": false,
             "files_likely_affected": ["src/lib.rs"],
         });
-        assert!(is_fast_path_eligible(&plan, 2));
+        assert!(is_short_circuit_eligible(&plan, 2));
     }
 
     #[test]
-    fn fast_path_small_two_files() {
+    fn short_circuit_small_two_files() {
         let plan = serde_json::json!({
             "estimated_complexity": "small",
             "requires_core_change": false,
             "files_likely_affected": ["src/a.rs", "src/b.rs"],
         });
-        assert!(is_fast_path_eligible(&plan, 2));
+        assert!(is_short_circuit_eligible(&plan, 2));
     }
 
     #[test]
-    fn fast_path_medium_complexity_rejected() {
+    fn short_circuit_medium_complexity_rejected() {
         let plan = serde_json::json!({
             "estimated_complexity": "medium",
             "requires_core_change": false,
             "files_likely_affected": ["src/lib.rs"],
         });
-        assert!(!is_fast_path_eligible(&plan, 2));
+        assert!(!is_short_circuit_eligible(&plan, 2));
     }
 
     #[test]
-    fn fast_path_core_change_rejected() {
+    fn short_circuit_core_change_rejected() {
         let plan = serde_json::json!({
             "estimated_complexity": "trivial",
             "requires_core_change": true,
             "files_likely_affected": ["src/lib.rs"],
         });
-        assert!(!is_fast_path_eligible(&plan, 2));
+        assert!(!is_short_circuit_eligible(&plan, 2));
     }
 
     #[test]
-    fn fast_path_too_many_files_rejected() {
+    fn short_circuit_too_many_files_rejected() {
         let plan = serde_json::json!({
             "estimated_complexity": "trivial",
             "requires_core_change": false,
             "files_likely_affected": ["a.rs", "b.rs", "c.rs"],
         });
-        assert!(!is_fast_path_eligible(&plan, 2));
+        assert!(!is_short_circuit_eligible(&plan, 2));
     }
 
     #[test]
-    fn fast_path_decomposed_rejected() {
+    fn short_circuit_decomposed_rejected() {
         let plan = serde_json::json!({
             "estimated_complexity": "trivial",
             "requires_core_change": false,
             "files_likely_affected": ["src/lib.rs"],
             "decomposition": [{"objective": "sub-task 1"}],
         });
-        assert!(!is_fast_path_eligible(&plan, 2));
+        assert!(!is_short_circuit_eligible(&plan, 2));
     }
 
     #[test]
-    fn fast_path_missing_fields_rejected() {
+    fn short_circuit_missing_fields_rejected() {
         let plan = serde_json::json!({});
-        assert!(!is_fast_path_eligible(&plan, 2));
+        assert!(!is_short_circuit_eligible(&plan, 2));
     }
 
     #[test]
-    fn fast_path_empty_files_rejected() {
+    fn short_circuit_empty_files_rejected() {
         let plan = serde_json::json!({
             "estimated_complexity": "trivial",
             "requires_core_change": false,
             "files_likely_affected": [],
         });
-        assert!(!is_fast_path_eligible(&plan, 2));
+        assert!(!is_short_circuit_eligible(&plan, 2));
     }
 
     #[test]
-    fn fast_path_empty_decomposition_allowed() {
+    fn short_circuit_empty_decomposition_allowed() {
         let plan = serde_json::json!({
             "estimated_complexity": "small",
             "requires_core_change": false,
             "files_likely_affected": ["src/lib.rs"],
             "decomposition": [],
         });
-        assert!(is_fast_path_eligible(&plan, 2));
+        assert!(is_short_circuit_eligible(&plan, 2));
     }
 
     // --- build_rust_module_map tests ---
