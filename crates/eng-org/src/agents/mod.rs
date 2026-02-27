@@ -362,6 +362,13 @@ pub(crate) fn render_obstacle_kind(obstacle: &ObstacleKind) -> String {
         ObstacleKind::ParseFailure { model, raw_snippet } => {
             format!("Parse failure ({model}): {raw_snippet}")
         }
+        ObstacleKind::SchemaMismatch {
+            model,
+            expected_schema,
+            validation_error,
+        } => {
+            format!("Schema mismatch ({model}): expected {expected_schema}, {validation_error}")
+        }
         ObstacleKind::Unknown { detail } => {
             format!("Unknown obstacle: {detail}")
         }
