@@ -139,6 +139,10 @@ pub struct RoutingConfig {
     #[serde(default = "default_ops_diagnosis_model")]
     pub ops_diagnosis: String,
 
+    /// CISO (Sentinel) agent — strategic risk analysis in the review phase.
+    #[serde(default = "default_ciso_model")]
+    pub ciso: String,
+
     /// Model pool for cost-aware chooser. When non-empty, enables
     /// the `ModelChooser` for dynamic model selection.
     #[serde(default)]
@@ -162,6 +166,10 @@ fn default_cost_quality_threshold() -> f64 {
 }
 
 fn default_ops_diagnosis_model() -> String {
+    "anthropic/claude-haiku-4-5-20251001".into()
+}
+
+fn default_ciso_model() -> String {
     "anthropic/claude-haiku-4-5-20251001".into()
 }
 
@@ -319,6 +327,8 @@ impl Default for EngConfig {
                 architect_review: default_architect_model(),
                 // Ops diagnosis agent model (provider/model-name).
                 ops_diagnosis: default_ops_diagnosis_model(),
+                // CISO (Sentinel) agent model (provider/model-name).
+                ciso: default_ciso_model(),
                 models: Vec::new(),
                 roles: HashMap::new(),
                 cost_quality_threshold: default_cost_quality_threshold(),
@@ -509,6 +519,7 @@ impl EngConfig {
                 self.routing.architect_review.clone(),
             ),
             ("ops_diagnosis".into(), self.routing.ops_diagnosis.clone()),
+            ("ciso".into(), self.routing.ciso.clone()),
         ])
     }
 
@@ -732,7 +743,8 @@ mod tests {
         assert!(map.contains_key("architect_triage"));
         assert!(map.contains_key("architect_review"));
         assert!(map.contains_key("ops_diagnosis"));
-        assert_eq!(map.len(), 9);
+        assert!(map.contains_key("ciso"));
+        assert_eq!(map.len(), 10);
     }
 
     #[test]

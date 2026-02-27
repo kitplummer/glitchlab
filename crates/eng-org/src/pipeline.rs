@@ -1395,6 +1395,64 @@ impl EngineeringPipeline {
             output
         };
 
+        // --- Stage 10b: CISO risk analysis (skipped on short circuit) ---
+        if !use_short_circuit {
+            ctx.current_stage = Some("ciso".into());
+            let ciso_diff = workspace.diff_full(base_branch).await.unwrap_or_default();
+            ctx.agent_context.previous_output = serde_json::json!({
+                "diff": truncate(&ciso_diff, 4000),
+                "plan": plan_output.data,
+                "implementation": impl_output.data,
+                "security": security_output.data,
+            });
+
+            let ciso_agent = crate::agents::ciso::CisoAgent::new(Arc::clone(&self.router));
+            let ciso_output = match ciso_agent.execute(&ctx.agent_context).await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(task_id, error = %e, "CISO risk analysis failed");
+                    fallback_output(
+                        "ciso",
+                        serde_json::json!({
+                            "risk_verdict": "accept",
+                            "risk_score": 0,
+                            "blast_radius": "unknown",
+                            "aggregate_assessment": "CISO agent failed — defaulting to accept",
+                            "trust_boundary_crossings": [],
+                            "data_flow_concerns": [],
+                            "compliance_flags": [],
+                            "operational_risk": {
+                                "rollback_complexity": "unknown",
+                                "monitoring_gaps": [],
+                                "failure_modes": []
+                            },
+                            "conditions": [],
+                            "escalation_reason": null
+                        }),
+                    )
+                }
+            };
+
+            let risk_verdict = ciso_output.data["risk_verdict"]
+                .as_str()
+                .unwrap_or("accept");
+            self.emit(&mut ctx, EventKind::CisoReview, ciso_output.data.clone());
+            ctx.stage_outputs.insert("ciso".into(), ciso_output.clone());
+
+            if risk_verdict == "escalate" {
+                let reason = ciso_output.data["escalation_reason"]
+                    .as_str()
+                    .unwrap_or("CISO flagged for human review");
+                return self
+                    .fail(
+                        ctx,
+                        PipelineStatus::Escalated,
+                        format!("CISO escalation: {reason}"),
+                    )
+                    .await;
+            }
+        }
+
         // --- Stage 11: Release assessment (skipped on short circuit) ---
         if use_short_circuit {
             let synthetic = fallback_output(
@@ -2498,15 +2556,19 @@ mod tests {
             ),
             // 5. Security
             final_response(r#"{"verdict": "pass", "issues": [], "summary": "no issues"}"#),
-            // 6. Release
+            // 6. CISO
+            final_response(
+                r#"{"risk_verdict": "accept", "risk_score": 2, "blast_radius": "isolated", "trust_boundary_crossings": [], "data_flow_concerns": [], "compliance_flags": [], "operational_risk": {"rollback_complexity": "trivial", "monitoring_gaps": [], "failure_modes": []}, "aggregate_assessment": "low risk", "conditions": [], "escalation_reason": null}"#,
+            ),
+            // 7. Release
             final_response(
                 r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
             ),
-            // 7. Archivist
+            // 8. Archivist
             final_response(
                 r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
             ),
-            // 8. Architect review — merge
+            // 9. Architect review — merge
             final_response(
                 r#"{"verdict": "merge", "confidence": 0.9, "reasoning": "looks good", "quality_score": 8, "issues": [], "architectural_fitness": "good", "merge_strategy": "squash"}"#,
             ),
@@ -3625,15 +3687,19 @@ mod tests {
             ),
             // 5. Security
             final_response(r#"{"verdict": "pass", "issues": [], "summary": "ok"}"#),
-            // 6. Release
+            // 6. CISO
+            final_response(
+                r#"{"risk_verdict": "accept", "risk_score": 2, "blast_radius": "isolated", "trust_boundary_crossings": [], "data_flow_concerns": [], "compliance_flags": [], "operational_risk": {"rollback_complexity": "trivial", "monitoring_gaps": [], "failure_modes": []}, "aggregate_assessment": "low risk", "conditions": [], "escalation_reason": null}"#,
+            ),
+            // 7. Release
             final_response(
                 r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
             ),
-            // 7. Archivist
+            // 8. Archivist
             final_response(
                 r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
             ),
-            // 8. Architect review — close
+            // 9. Architect review — close
             final_response(
                 r#"{"verdict": "close", "confidence": 0.8, "reasoning": "fundamentally wrong", "quality_score": 2, "issues": [], "architectural_fitness": "poor", "merge_strategy": "squash"}"#,
             ),
@@ -3695,15 +3761,19 @@ mod tests {
             ),
             // 5. Security
             final_response(r#"{"verdict": "pass", "issues": [], "summary": "ok"}"#),
-            // 6. Release
+            // 6. CISO
+            final_response(
+                r#"{"risk_verdict": "accept", "risk_score": 2, "blast_radius": "isolated", "trust_boundary_crossings": [], "data_flow_concerns": [], "compliance_flags": [], "operational_risk": {"rollback_complexity": "trivial", "monitoring_gaps": [], "failure_modes": []}, "aggregate_assessment": "low risk", "conditions": [], "escalation_reason": null}"#,
+            ),
+            // 7. Release
             final_response(
                 r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
             ),
-            // 7. Archivist
+            // 8. Archivist
             final_response(
                 r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
             ),
-            // 8. Architect review — request_changes
+            // 9. Architect review — request_changes
             final_response(
                 r#"{"verdict": "request_changes", "confidence": 0.7, "reasoning": "needs tests", "quality_score": 5, "issues": [{"severity": "medium", "description": "no tests", "suggestion": "add unit tests"}], "architectural_fitness": "acceptable", "merge_strategy": "squash"}"#,
             ),
@@ -4878,15 +4948,19 @@ mod tests {
             ),
             // 6. Security
             final_response(r#"{"verdict": "pass", "issues": [], "summary": "ok"}"#),
-            // 7. Release
+            // 7. CISO
+            final_response(
+                r#"{"risk_verdict": "accept", "risk_score": 2, "blast_radius": "isolated", "trust_boundary_crossings": [], "data_flow_concerns": [], "compliance_flags": [], "operational_risk": {"rollback_complexity": "trivial", "monitoring_gaps": [], "failure_modes": []}, "aggregate_assessment": "low risk", "conditions": [], "escalation_reason": null}"#,
+            ),
+            // 8. Release
             final_response(
                 r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
             ),
-            // 8. Archivist
+            // 9. Archivist
             final_response(
                 r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
             ),
-            // 9. Architect review — merge
+            // 10. Architect review — merge
             final_response(
                 r#"{"verdict": "merge", "confidence": 0.9, "reasoning": "good", "quality_score": 8, "issues": [], "architectural_fitness": "good", "merge_strategy": "squash"}"#,
             ),
@@ -4965,15 +5039,19 @@ mod tests {
             ),
             // 5. Security
             final_response(r#"{"verdict": "pass", "issues": [], "summary": "ok"}"#),
-            // 6. Release
+            // 6. CISO
+            final_response(
+                r#"{"risk_verdict": "accept", "risk_score": 2, "blast_radius": "isolated", "trust_boundary_crossings": [], "data_flow_concerns": [], "compliance_flags": [], "operational_risk": {"rollback_complexity": "trivial", "monitoring_gaps": [], "failure_modes": []}, "aggregate_assessment": "low risk", "conditions": [], "escalation_reason": null}"#,
+            ),
+            // 7. Release
             final_response(
                 r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
             ),
-            // 7. Archivist
+            // 8. Archivist
             final_response(
                 r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
             ),
-            // 8. Architect review — request_changes with issues
+            // 9. Architect review — request_changes with issues
             final_response(
                 r#"{"verdict": "request_changes", "confidence": 0.7, "reasoning": "needs tests and error handling", "quality_score": 4, "issues": [{"severity": "high", "description": "no tests", "suggestion": "add unit tests"}, {"severity": "medium", "description": "no error handling", "suggestion": "add Result return type"}], "architectural_fitness": "poor", "merge_strategy": "squash"}"#,
             ),
@@ -5047,7 +5125,7 @@ mod tests {
         verdict: &str,
     ) -> Vec<glitchlab_router::RouterResponse> {
         let mut responses = pipeline_mock_responses();
-        // 9. Post-PR architect review
+        // 10. Post-PR architect review
         responses.push(final_response(&format!(
             r#"{{"verdict": "{verdict}", "confidence": 0.9, "reasoning": "post-pr review", "quality_score": 8, "issues": [{{"severity": "minor", "description": "nit"}}], "architectural_fitness": "good", "merge_strategy": "squash"}}"#
         )));
@@ -5898,6 +5976,7 @@ mod tests {
         // All stages should be present when short circuit is off.
         assert!(result.stage_outputs.contains_key("architect_triage"));
         assert!(result.stage_outputs.contains_key("security"));
+        assert!(result.stage_outputs.contains_key("ciso"));
         assert!(result.stage_outputs.contains_key("release"));
         assert!(result.stage_outputs.contains_key("archive"));
 
@@ -5990,15 +6069,19 @@ mod tests {
             ),
             // 5. Security
             final_response(r#"{"verdict": "pass", "issues": [], "summary": "no issues"}"#),
-            // 6. Release
+            // 6. CISO
+            final_response(
+                r#"{"risk_verdict": "accept", "risk_score": 2, "blast_radius": "isolated", "trust_boundary_crossings": [], "data_flow_concerns": [], "compliance_flags": [], "operational_risk": {"rollback_complexity": "trivial", "monitoring_gaps": [], "failure_modes": []}, "aggregate_assessment": "low risk", "conditions": [], "escalation_reason": null}"#,
+            ),
+            // 7. Release
             final_response(
                 r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
             ),
-            // 7. Archivist
+            // 8. Archivist
             final_response(
                 r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
             ),
-            // 8. Architect review — merge
+            // 9. Architect review — merge
             final_response(
                 r#"{"verdict": "merge", "confidence": 0.9, "reasoning": "good", "quality_score": 8, "issues": [], "architectural_fitness": "good", "merge_strategy": "squash"}"#,
             ),

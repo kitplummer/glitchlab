@@ -29,7 +29,16 @@ tasks:
   status: failed
   depends_on: []
   decomposition_depth: 0
-  error: 'budget exceeded: token limit exceeded: 47019 / 35000 tokens used'
+  error: 'budget exceeded: token limit exceeded: 77784 / 73448 tokens used'
+  outcome_context:
+    approach: direct implementation
+    obstacle:
+      kind: model_limitation
+      model: unknown
+      error_class: budget_exceeded
+    discoveries: []
+    recommendation: Try a different implementation approach or simpler plan
+    files_explored: []
   remediation_depth: 0
   is_remediation: false
 - id: canary-size-l-provider-error-diagnostics
@@ -83,7 +92,16 @@ tasks:
   status: failed
   depends_on: []
   decomposition_depth: 1
-  error: 'budget exceeded: token limit exceeded: 39676 / 35000 tokens used'
+  error: 'budget exceeded: token limit exceeded: 67619 / 65000 tokens used'
+  outcome_context:
+    approach: direct implementation
+    obstacle:
+      kind: model_limitation
+      model: unknown
+      error_class: budget_exceeded
+    discoveries: []
+    recommendation: Try a different implementation approach or simpler plan
+    files_explored: []
   remediation_depth: 0
   is_remediation: false
   files_hint:
@@ -125,11 +143,11 @@ tasks:
 - id: extract-provider-error-diagnostics-part3
   objective: Register the new `provider_diagnostics` module in `crates/router/src/lib.rs` and add comprehensive unit tests for the `classify_error` function in `crates/router/src/provider_diagnostics.rs`.
   priority: 50
-  status: failed
+  status: completed
   depends_on:
   - extract-provider-error-diagnostics-part2
   decomposition_depth: 1
-  error: 'budget exceeded: token limit exceeded: 40005 / 35000 tokens used'
+  pr_url: https://github.com/kitplummer/glitchlab/pull/73
   remediation_depth: 0
   is_remediation: false
   files_hint:
@@ -141,7 +159,7 @@ tasks:
   status: failed
   depends_on: []
   decomposition_depth: 1
-  error: 'budget exceeded: token limit exceeded: 52678 / 35000 tokens used'
+  error: 'debugger failed: budget exceeded: token limit exceeded: 83527 / 65000 tokens used'
   remediation_depth: 0
   is_remediation: false
   files_hint:

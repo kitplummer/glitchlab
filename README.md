@@ -12,14 +12,15 @@ When things go wrong, the system detects anti-patterns (decomposition loops, stu
 
 ## Agent Roster
 
-Nine agents, each with a persona and a job:
+Ten agents, each with a persona and a job:
 
 | Agent | Persona | Role | Default Model |
 |-------|---------|------|---------------|
 | Planner | Professor Zap | Decompose objectives into execution plans | gemini-2.5-flash |
 | Implementer | Patch | Write code and tests (tool-use loop, 15 turns) | gemini-2.5-pro |
 | Debugger | Reroute | Fix failing tests and builds | claude-sonnet-4 |
-| Security | Firewall Frankie | Review changes for vulnerabilities | gemini-2.5-flash |
+| Security | Firewall Frankie | Code-level vulnerability scanning | gemini-2.5-flash |
+| CISO | Sentinel | Strategic risk analysis: blast radius, trust boundaries, compliance | gemini-2.5-flash |
 | Release | Semver Sam | Determine semantic version bump | gemini-2.5-flash |
 | Archivist | Nova | Generate ADRs and documentation | gemini-2.5-flash |
 | Architect (Triage) | Blueprint | Pre-impl: check if work is already done | gemini-2.5-flash |
@@ -91,7 +92,7 @@ Every task passes through these phases:
 | **Decompose** | If needed: split into sub-tasks, each a full task with its own lifecycle | (parent ends here) |
 | **Implement** | Tool-use loop: read files, write code, run commands (bulk of the budget) | ~65% |
 | **Test + Debug** | Run test suite, fix failures (up to N attempts via debugger agent) | ~15% |
-| **Review** | Security scan, architect diff review, release assessment, documentation | ~10% |
+| **Review** | Security scan, CISO risk analysis, architect diff review, release assessment, documentation | ~10% |
 | **Deliver** | Commit, open PR, auto-merge (configurable) | ~2% |
 
 For a **Medium** task (the most common size), this budget is approximately **65K tokens across 9 tool turns** for the implementer, plus overhead for the surrounding agents. A typical M task consumes **$0.10–$0.30** end to end.
@@ -124,12 +125,13 @@ The engineering pipeline runs 15+ stages per task:
 8. **Test execution** — Run the project's test suite
 9. **Debug loop** — Up to N attempts to fix failures
 10. **Security review** — Scan for vulnerabilities before PR
-11. **Architect review** — Diff review with approval/rejection
-12. **Release assessment** — Semantic version bump determination
-13. **Documentation** — ADR generation
-14. **Commit + PR** — Open PR with structured description
-15. **Auto-merge** — Merge on approval (configurable)
-16. **TQM analysis** — Detect anti-patterns, feed back into queue
+11. **CISO risk analysis** — Strategic risk: blast radius, trust boundaries, compliance
+12. **Architect review** — Diff review with approval/rejection
+13. **Release assessment** — Semantic version bump determination
+14. **Documentation** — ADR generation
+15. **Commit + PR** — Open PR with structured description
+16. **Auto-merge** — Merge on approval (configurable)
+17. **TQM analysis** — Detect anti-patterns, feed back into queue
 
 When a task fails, the pipeline captures structured **OutcomeContext** (what approach was tried, what obstacle was hit, what was discovered). This context is fed into the AttemptTracker so that retries start with knowledge of prior failures instead of repeating blind.
 

@@ -214,6 +214,7 @@ pub enum EventKind {
     TestsFailed,
     DebugAttempt,
     SecurityReview,
+    CisoReview,
     ReleaseAssessment,
     DocumentationWritten,
     Committed,
