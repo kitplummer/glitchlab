@@ -74,25 +74,64 @@ glitchlab batch --repo ~/your-project --budget 100.0
 glitchlab status --repo ~/your-project
 ```
 
-## Pipeline
+## What Is a "Task"?
+
+A **task** in GLITCHLAB is the complete lifecycle of turning an objective into delivered code. It is not just implementation — it is the full flow:
+
+```
+Objective → Plan → Triage → [Decompose] → Implement → Test → Debug → Review → Deliver
+```
+
+Every task passes through these phases:
+
+| Phase | What Happens | Token Budget Share |
+|-------|-------------|-------------------|
+| **Plan** | Planner decomposes objective into steps, identifies files, assesses complexity | ~5% |
+| **Triage** | Architect checks if work exists, assigns t-shirt size (S/M/L), gates XL tasks | ~3% |
+| **Decompose** | If needed: split into sub-tasks, each a full task with its own lifecycle | (parent ends here) |
+| **Implement** | Tool-use loop: read files, write code, run commands (bulk of the budget) | ~65% |
+| **Test + Debug** | Run test suite, fix failures (up to N attempts via debugger agent) | ~15% |
+| **Review** | Security scan, architect diff review, release assessment, documentation | ~10% |
+| **Deliver** | Commit, open PR, auto-merge (configurable) | ~2% |
+
+For a **Medium** task (the most common size), this budget is approximately **65K tokens across 9 tool turns** for the implementer, plus overhead for the surrounding agents. A typical M task consumes **$0.10–$0.30** end to end.
+
+When a task is **decomposed**, the parent task ends at the Decompose phase and spawns child tasks. Each child is a full task with its own Plan→Deliver lifecycle. Decomposition adds overhead (workspace setup, context assembly, planner calls per sub-task), so it is only triggered when:
+- Complexity is medium or large
+- The task touches **4+ files AND requires 5+ steps**
+- No single implementer pass could complete it within 9 tool turns
+
+### Task Sizes
+
+| Size | Token Budget | Tool Turns | Typical Scope |
+|------|-------------|------------|---------------|
+| **S** | 20K | 4 | 1 file, ≤2 edits, mechanical change |
+| **M** | 65K | 9 | 1–3 files, requires understanding |
+| **L** | 60K | 12 | 2–3 files, requires design decisions |
+| **XL** | — | — | Must decompose into S/M/L sub-tasks |
+
+## Pipeline Stages
 
 The engineering pipeline runs 15+ stages per task:
 
 1. **Task pickup** — Priority queue with remediation-first scheduling
-2. **Architect triage** — Skip work that's already done
+2. **Architect triage** — Skip work that's already done, assign size
 3. **Workspace creation** — Isolated git worktree per task
 4. **Boundary check** — Protected-path enforcement (kernel, .github, etc.)
 5. **Planning** — LLM decomposes the objective into steps
-6. **Implementation** — Tool-use loop: write code, read files, run commands
-7. **Test execution** — Run the project's test suite
-8. **Debug loop** — Up to N attempts to fix failures
-9. **Security review** — Scan for vulnerabilities before PR
-10. **Architect review** — Diff review with approval/rejection
-11. **Release assessment** — Semantic version bump determination
-12. **Documentation** — ADR generation
-13. **Commit + PR** — Open PR with structured description
-14. **Auto-merge** — Merge on approval (configurable)
-15. **TQM analysis** — Detect anti-patterns, feed back into queue
+6. **Decomposition guard** — Strip spurious decomposition from small/medium tasks
+7. **Implementation** — Tool-use loop: write code, read files, run commands
+8. **Test execution** — Run the project's test suite
+9. **Debug loop** — Up to N attempts to fix failures
+10. **Security review** — Scan for vulnerabilities before PR
+11. **Architect review** — Diff review with approval/rejection
+12. **Release assessment** — Semantic version bump determination
+13. **Documentation** — ADR generation
+14. **Commit + PR** — Open PR with structured description
+15. **Auto-merge** — Merge on approval (configurable)
+16. **TQM analysis** — Detect anti-patterns, feed back into queue
+
+When a task fails, the pipeline captures structured **OutcomeContext** (what approach was tried, what obstacle was hit, what was discovered). This context is fed into the AttemptTracker so that retries start with knowledge of prior failures instead of repeating blind.
 
 ## Self-Repair Loop
 
@@ -194,13 +233,16 @@ tqm:
 
 You only pay for LLM API tokens. The orchestrator runs on your machine.
 
-| Run Type | Typical Cost |
-|----------|-------------|
-| Single task (Display impl, small fix) | $0.10 - $0.50 |
-| Batch run (30 tasks, self-improvement) | $10 - $20 |
-| Full batch with repair budget | $15 - $100 |
+| Run Type | Typical Cost | Notes |
+|----------|-------------|-------|
+| Single task — S (rename, config tweak) | $0.02 - $0.10 | 1 agent pass, minimal overhead |
+| Single task — M (bug fix, add function) | $0.10 - $0.30 | Full lifecycle: plan → deliver |
+| Single task — L (new module, refactor) | $0.20 - $0.50 | Design decisions + review |
+| Decomposed task (XL split into 3 sub-tasks) | $0.40 - $1.50 | Parent + 3 child lifecycles |
+| Batch run (30 tasks, self-improvement) | $10 - $20 | Includes TQM + remediation |
+| Full batch with repair budget | $15 - $100 | 20% budget reserved for repair |
 
-Budget governance is enforced at every stage. The `CumulativeBudget` tracker splits spending into feature work and repair allocations. Tasks that exceed their budget are halted, not retried.
+Budget governance is enforced at every stage. The `CumulativeBudget` tracker splits spending into feature work and repair allocations (default 80/20 split). Tasks that exceed their budget are halted, not retried.
 
 ## Human Intervention Points
 
