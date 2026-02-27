@@ -2153,7 +2153,7 @@ fn compute_file_sizes(file_context: &HashMap<String, String>) -> Vec<(String, us
         .iter()
         .map(|(path, content)| (path.clone(), content.lines().count()))
         .collect();
-    sizes.sort_by(|a, b| b.1.cmp(&a.1)); // largest first
+    sizes.sort_by_key(|a| std::cmp::Reverse(a.1)); // largest first
     sizes
 }
 
