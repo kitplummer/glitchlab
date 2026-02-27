@@ -320,6 +320,7 @@ pub struct AgentOutput {
 
     /// True if the output was constructed from a fallback/default
     /// because the LLM response couldn't be parsed.
+    /// This allows downstream consumers to handle parse failures gracefully.
     #[serde(default)]
     pub parse_error: bool,
 }
