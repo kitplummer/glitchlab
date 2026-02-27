@@ -3,7 +3,6 @@
 
 boundaries:
   protected_paths:
-    - "crates/kernel"
     - ".github"
     - ".githooks"
     - "CLAUDE.md"
@@ -12,7 +11,7 @@ boundaries:
 limits:
   max_tool_turns: 12
   max_tokens_per_task: 60000
-  max_dollars_per_task: 0.50
+  max_dollars_per_task: 1.00
   max_total_tasks: 200
   max_remediation_depth: 1
   repair_budget_fraction: 0.20
@@ -40,12 +39,14 @@ routing:
     - model: "anthropic/claude-sonnet-4-20250514"
       tier: premium
       capabilities: [tool_use, code, long_context, vision]
-    - model: "openai/gpt-4o"
-      tier: premium
-      capabilities: [tool_use, code, long_context, vision]
-    - model: "openai/gpt-4o-mini"
-      tier: standard
-      capabilities: [tool_use, code]
+    # OpenAI models disabled — no OPENAI_API_KEY configured.
+    # Re-enable when key is available.
+    # - model: "openai/gpt-4o"
+    #   tier: premium
+    #   capabilities: [tool_use, code, long_context, vision]
+    # - model: "openai/gpt-4o-mini"
+    #   tier: standard
+    #   capabilities: [tool_use, code]
 
   roles:
     planner:

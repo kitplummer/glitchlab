@@ -531,6 +531,24 @@ impl EngineeringPipeline {
                 .insert("previous_attempts".into(), val);
         }
 
+        // Inject codebase knowledge early so ALL agents (planner included) get it.
+        // Prefer a hand-curated file if present; fall back to auto-generated.
+        let repo_root = Path::new(&ctx.agent_context.repo_path);
+        let knowledge_path = repo_root.join(".glitchlab/codebase-context.md");
+        let knowledge = if knowledge_path.exists() {
+            tokio::fs::read_to_string(&knowledge_path)
+                .await
+                .unwrap_or_default()
+        } else {
+            codebase_knowledge.clone()
+        };
+        if !knowledge.is_empty() {
+            ctx.agent_context.extra.insert(
+                "codebase_knowledge".into(),
+                serde_json::Value::String(knowledge),
+            );
+        }
+
         // Feed relevant source files into agent context.
         ctx.agent_context.file_context =
             read_relevant_files(repo_path, objective, &indexed_files).await;
@@ -966,25 +984,6 @@ impl EngineeringPipeline {
                     .extra
                     .insert("module_map".into(), serde_json::Value::String(module_map));
             }
-        }
-
-        // Inject codebase knowledge — a persistent, structured summary of the
-        // project that eliminates the implementer's cold-start exploration.
-        // Prefer a hand-curated file if present; fall back to auto-generated.
-        let repo_root = Path::new(&ctx.agent_context.repo_path);
-        let knowledge_path = repo_root.join(".glitchlab/codebase-context.md");
-        let knowledge = if knowledge_path.exists() {
-            tokio::fs::read_to_string(&knowledge_path)
-                .await
-                .unwrap_or_default()
-        } else {
-            codebase_knowledge.clone()
-        };
-        if !knowledge.is_empty() {
-            ctx.agent_context.extra.insert(
-                "codebase_knowledge".into(),
-                serde_json::Value::String(knowledge),
-            );
         }
 
         // --- Stage 4: Boundary check ---
