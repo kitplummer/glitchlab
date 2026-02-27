@@ -19,6 +19,15 @@ pub struct ProviderDiagnostic {
     pub status_code: Option<u16>,
 }
 
+pub fn classify_error(status_code: Option<u16>) -> ErrorCategory {
+    match status_code {
+        Some(code) if (400..=499).contains(&code) => ErrorCategory::BadRequest,
+        Some(code) if (500..=599).contains(&code) => ErrorCategory::ProviderInternal,
+        None => ErrorCategory::Network,
+        _ => ErrorCategory::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +58,62 @@ mod tests {
         );
         assert_eq!(format!("{:?}", ErrorCategory::Network), "Network");
         assert_eq!(format!("{:?}", ErrorCategory::Unknown), "Unknown");
+    }
+
+    #[test]
+    fn test_classify_error() {
+        assert_eq!(
+            classify_error(Some(400)),
+            ErrorCategory::BadRequest,
+            "Status code 400 should be BadRequest"
+        );
+        assert_eq!(
+            classify_error(Some(404)),
+            ErrorCategory::BadRequest,
+            "Status code 404 should be BadRequest"
+        );
+        assert_eq!(
+            classify_error(Some(499)),
+            ErrorCategory::BadRequest,
+            "Status code 499 should be BadRequest"
+        );
+
+        assert_eq!(
+            classify_error(Some(500)),
+            ErrorCategory::ProviderInternal,
+            "Status code 500 should be ProviderInternal"
+        );
+        assert_eq!(
+            classify_error(Some(503)),
+            ErrorCategory::ProviderInternal,
+            "Status code 503 should be ProviderInternal"
+        );
+        assert_eq!(
+            classify_error(Some(599)),
+            ErrorCategory::ProviderInternal,
+            "Status code 599 should be ProviderInternal"
+        );
+
+        assert_eq!(
+            classify_error(None),
+            ErrorCategory::Network,
+            "None status code should be Network error"
+        );
+
+        assert_eq!(
+            classify_error(Some(200)),
+            ErrorCategory::Unknown,
+            "Status code 200 should be Unknown"
+        );
+        assert_eq!(
+            classify_error(Some(302)),
+            ErrorCategory::Unknown,
+            "Status code 302 should be Unknown"
+        );
+        assert_eq!(
+            classify_error(Some(101)),
+            ErrorCategory::Unknown,
+            "Status code 101 should be Unknown"
+        );
     }
 }
