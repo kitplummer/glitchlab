@@ -2,7 +2,7 @@
 
 **The Agentic Dev Engine — Build Weird. Ship Clean.**
 
-A local-first, repo-agnostic, multi-agent development engine that evolves codebases under strict governance. Forked from [adjective-rob/glitchlab](https://github.com/adjective-rob/glitchlab) — Rob's original Python prototype — and rewritten in Rust.
+A local-first, repo-agnostic, multi-agent development engine that evolves codebases under strict governance. Forked from [adjective-rob/glitchlab](https://github.com/adjective-rob/glitchlab) and rewritten in Rust.
 
 ## What It Does
 
