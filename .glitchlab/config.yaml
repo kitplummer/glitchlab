@@ -20,8 +20,8 @@ limits:
 routing:
   # Static fallbacks
   planner: "gemini/gemini-2.5-flash"
-  implementer: "gemini/gemini-2.5-pro"
-  debugger: "openai/gpt-4o"
+  implementer: "anthropic/claude-sonnet-4-20250514"
+  debugger: "anthropic/claude-sonnet-4-20250514"
   security: "gemini/gemini-2.5-flash"
   release: "gemini/gemini-2.5-flash"
   archivist: "gemini/gemini-2.5-flash"
@@ -51,8 +51,8 @@ routing:
     planner:
       min_tier: standard
     implementer:
-      min_tier: standard_plus
-      requires: [tool_use]
+      min_tier: premium
+      requires: [tool_use, code]
     debugger:
       min_tier: standard
       requires: [tool_use]

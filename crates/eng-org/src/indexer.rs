@@ -245,6 +245,211 @@ pub(crate) fn is_test_file(path: &str) -> bool {
         || lower_name.ends_with(".spec.js")
 }
 
+// ---------------------------------------------------------------------------
+// Codebase Knowledge
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes for the codebase knowledge segment.
+const KNOWLEDGE_MAX_BYTES: usize = 6 * 1024;
+
+/// Build a structured codebase knowledge summary from the repo index.
+///
+/// This produces a persistent, compact overview of the project that agents
+/// can consume without re-exploring the codebase. Think of it as a
+/// CLAUDE.md for automated agents — it answers "what is this project and
+/// where are things?" so the implementer doesn't burn tool turns on
+/// `list_files` and `read_file` calls to orient itself.
+pub fn build_codebase_knowledge(index: &RepoIndex, repo_path: &Path) -> String {
+    let mut kb = String::with_capacity(KNOWLEDGE_MAX_BYTES);
+
+    kb.push_str("## Codebase Knowledge\n\n");
+    kb.push_str("Use this context to orient yourself. Do NOT re-explore files described here.\n\n");
+
+    // --- Project type and layout ---
+    let is_rust = index.key_files.iter().any(|f| f.ends_with("Cargo.toml"));
+    let is_node = index.key_files.iter().any(|f| f.ends_with("package.json"));
+    let is_python = index
+        .key_files
+        .iter()
+        .any(|f| f.ends_with("pyproject.toml"));
+    let is_go = index.key_files.iter().any(|f| f.ends_with("go.mod"));
+
+    if is_rust {
+        kb.push_str("**Project type:** Rust workspace\n");
+        append_rust_workspace_info(&mut kb, index, repo_path);
+    } else if is_node {
+        kb.push_str("**Project type:** Node.js\n");
+    } else if is_python {
+        kb.push_str("**Project type:** Python\n");
+    } else if is_go {
+        kb.push_str("**Project type:** Go\n");
+    }
+
+    // --- Directory layout ---
+    if !index.directories.is_empty() {
+        kb.push_str(&format!(
+            "**Top-level dirs:** {}\n",
+            index.directories.join(", ")
+        ));
+    }
+
+    // --- File statistics ---
+    if !index.languages.is_empty() {
+        let mut langs: Vec<_> = index.languages.iter().collect();
+        langs.sort_by(|a, b| b.1.cmp(a.1));
+        let lang_summary: Vec<_> = langs
+            .iter()
+            .take(5)
+            .map(|(ext, count)| format!("{ext}({count})"))
+            .collect();
+        kb.push_str(&format!(
+            "**Files:** {} total — {}\n",
+            index.total_files,
+            lang_summary.join(", ")
+        ));
+    }
+
+    // --- Test commands ---
+    if is_rust {
+        kb.push_str("**Test command:** `cargo test --workspace`\n");
+        kb.push_str("**Lint command:** `cargo clippy --all-targets -- -D warnings`\n");
+        kb.push_str("**Format command:** `cargo fmt --check`\n");
+    } else if is_node {
+        kb.push_str("**Test command:** `npm test`\n");
+    } else if is_python {
+        kb.push_str("**Test command:** `python -m pytest`\n");
+    } else if is_go {
+        kb.push_str("**Test command:** `go test ./...`\n");
+    }
+
+    kb.push('\n');
+
+    // --- Key source files (grouped by directory) ---
+    let source_files: Vec<&str> = index
+        .files
+        .iter()
+        .filter(|f| {
+            let ext = Path::new(f)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            matches!(ext, "rs" | "py" | "ts" | "tsx" | "js" | "go" | "java")
+        })
+        .map(String::as_str)
+        .collect();
+
+    if !source_files.is_empty() {
+        kb.push_str("### Source files\n\n");
+        // Group by first two path components for readability.
+        let mut groups: std::collections::BTreeMap<String, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for file in &source_files {
+            let parts: Vec<&str> = file.split('/').collect();
+            let group = if parts.len() >= 2 {
+                format!("{}/{}", parts[0], parts[1])
+            } else {
+                parts[0].to_string()
+            };
+            groups.entry(group).or_default().push(file);
+        }
+
+        for (group, files) in &groups {
+            if kb.len() > KNOWLEDGE_MAX_BYTES - 200 {
+                kb.push_str("\n(truncated)\n");
+                break;
+            }
+            kb.push_str(&format!("**{group}/**: "));
+            let names: Vec<&str> = files
+                .iter()
+                .filter_map(|f| Path::new(f).file_name().and_then(|n| n.to_str()))
+                .collect();
+            kb.push_str(&names.join(", "));
+            kb.push('\n');
+        }
+    }
+
+    // Enforce size limit.
+    if kb.len() > KNOWLEDGE_MAX_BYTES {
+        kb.truncate(KNOWLEDGE_MAX_BYTES - 20);
+        kb.push_str("\n(truncated)\n");
+    }
+
+    kb
+}
+
+/// Append Rust workspace details — crate names, purposes, and key modules.
+fn append_rust_workspace_info(kb: &mut String, index: &RepoIndex, repo_path: &Path) {
+    // Find all Cargo.toml files to identify workspace members.
+    let cargo_tomls: Vec<&str> = index
+        .key_files
+        .iter()
+        .filter(|f| f.ends_with("Cargo.toml"))
+        .map(String::as_str)
+        .collect();
+
+    if cargo_tomls.len() <= 1 {
+        return;
+    }
+
+    kb.push_str("**Workspace crates:**\n");
+    for toml_path in &cargo_tomls {
+        // Skip root Cargo.toml.
+        if *toml_path == "Cargo.toml" {
+            continue;
+        }
+
+        let crate_dir = Path::new(toml_path).parent().unwrap_or(Path::new(""));
+        let crate_name = crate_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+
+        // Try to read the first line of lib.rs or main.rs for a doc comment.
+        let purpose = read_crate_purpose(repo_path, crate_dir);
+        if let Some(desc) = purpose {
+            kb.push_str(&format!(
+                "- **{crate_name}** ({crate_dir}) — {desc}\n",
+                crate_dir = crate_dir.display()
+            ));
+        } else {
+            kb.push_str(&format!("- **{crate_name}** ({})\n", crate_dir.display()));
+        }
+
+        // List source files in this crate's src/.
+        let src_prefix = format!("{}/src/", crate_dir.display());
+        let crate_files: Vec<&str> = index
+            .files
+            .iter()
+            .filter(|f| f.starts_with(&src_prefix) && f.ends_with(".rs"))
+            .filter_map(|f| f.strip_prefix(&src_prefix))
+            .collect();
+
+        if !crate_files.is_empty() && crate_files.len() <= 20 {
+            kb.push_str(&format!("  modules: {}\n", crate_files.join(", ")));
+        }
+    }
+    kb.push('\n');
+}
+
+/// Read the first doc comment from a crate's lib.rs or main.rs.
+fn read_crate_purpose(repo_path: &Path, crate_dir: &Path) -> Option<String> {
+    for entry in &["src/lib.rs", "src/main.rs"] {
+        let path = repo_path.join(crate_dir).join(entry);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines().take(10) {
+                let trimmed = line.trim();
+                if let Some(doc) = trimmed.strip_prefix("//!") {
+                    let doc = doc.trim();
+                    if !doc.is_empty() {
+                        return Some(doc.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +682,84 @@ mod tests {
 
         let index = build_index(dir.path()).await.unwrap();
         assert!(index.key_files.contains(&"compose.yaml".to_string()));
+    }
+
+    #[test]
+    fn codebase_knowledge_rust_workspace() {
+        let index = RepoIndex {
+            root: "/tmp/repo".into(),
+            total_files: 8,
+            languages: HashMap::from([("rs".into(), 6), ("toml".into(), 2)]),
+            files: vec![
+                "crates/kernel/src/lib.rs".into(),
+                "crates/kernel/src/agent.rs".into(),
+                "crates/router/src/lib.rs".into(),
+                "crates/router/src/router.rs".into(),
+                "crates/cli/src/main.rs".into(),
+                "Cargo.toml".into(),
+                "crates/kernel/Cargo.toml".into(),
+                "crates/router/Cargo.toml".into(),
+            ],
+            directories: vec!["crates".into()],
+            key_files: vec![
+                "Cargo.toml".into(),
+                "crates/kernel/Cargo.toml".into(),
+                "crates/router/Cargo.toml".into(),
+            ],
+            test_files: vec![],
+        };
+
+        let kb = build_codebase_knowledge(&index, Path::new("/nonexistent"));
+        assert!(kb.contains("Codebase Knowledge"));
+        assert!(kb.contains("Rust workspace"));
+        assert!(kb.contains("Workspace crates"));
+        assert!(kb.contains("kernel"));
+        assert!(kb.contains("router"));
+        assert!(kb.contains("cargo test"));
+        assert!(kb.contains("Source files"));
+    }
+
+    #[test]
+    fn codebase_knowledge_non_rust() {
+        let index = RepoIndex {
+            root: "/tmp/repo".into(),
+            total_files: 3,
+            languages: HashMap::from([("py".into(), 2), ("toml".into(), 1)]),
+            files: vec![
+                "src/main.py".into(),
+                "src/utils.py".into(),
+                "pyproject.toml".into(),
+            ],
+            directories: vec!["src".into()],
+            key_files: vec!["pyproject.toml".into()],
+            test_files: vec![],
+        };
+
+        let kb = build_codebase_knowledge(&index, Path::new("/nonexistent"));
+        assert!(kb.contains("Python"));
+        assert!(kb.contains("pytest"));
+        assert!(!kb.contains("Rust"));
+    }
+
+    #[test]
+    fn codebase_knowledge_respects_size_limit() {
+        // Create a large index that would exceed the 6KB limit.
+        let files: Vec<String> = (0..500)
+            .map(|i| format!("src/module_{i}/component_{i}.rs"))
+            .collect();
+        let index = RepoIndex {
+            root: "/tmp/repo".into(),
+            total_files: 500,
+            languages: HashMap::from([("rs".into(), 500)]),
+            files,
+            directories: vec!["src".into()],
+            key_files: vec!["Cargo.toml".into()],
+            test_files: vec![],
+        };
+
+        let kb = build_codebase_knowledge(&index, Path::new("/nonexistent"));
+        assert!(kb.len() <= KNOWLEDGE_MAX_BYTES);
+        assert!(kb.contains("truncated"));
     }
 
     #[test]

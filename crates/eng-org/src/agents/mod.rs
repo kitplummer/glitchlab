@@ -403,6 +403,15 @@ pub(crate) fn render_previous_attempts(attempts: &[OutcomeContext]) -> String {
 pub(crate) fn build_user_message(ctx: &AgentContext) -> String {
     let mut msg = ctx.objective.clone();
 
+    // Codebase knowledge — persistent project-level orientation that
+    // eliminates cold-start file exploration by the implementer.
+    if let Some(serde_json::Value::String(kb)) = ctx.extra.get("codebase_knowledge")
+        && !kb.is_empty()
+    {
+        msg.push_str("\n\n## Codebase Overview\n\n");
+        msg.push_str(kb);
+    }
+
     // Previous stage output (the critical fix for agent context blindness).
     if !ctx.previous_output.is_null() {
         msg.push_str("\n\n## Previous Stage Output\n\n");
@@ -1655,5 +1664,37 @@ mod tests {
         );
         let msg = build_user_message(&ctx);
         assert!(!msg.contains("Module Map"));
+    }
+
+    #[test]
+    fn build_user_message_with_codebase_knowledge() {
+        let mut ctx = base_ctx();
+        ctx.extra.insert(
+            "codebase_knowledge".into(),
+            serde_json::Value::String(
+                "Rust workspace with 5 crates: kernel, router, memory, eng-org, cli.".into(),
+            ),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(msg.contains("## Codebase Overview"));
+        assert!(msg.contains("Rust workspace with 5 crates"));
+        // Codebase overview should appear before file contents
+        let overview_pos = msg.find("## Codebase Overview").unwrap();
+        let objective_pos = msg.find(&ctx.objective).unwrap();
+        assert!(
+            overview_pos > objective_pos,
+            "overview should follow objective"
+        );
+    }
+
+    #[test]
+    fn build_user_message_empty_codebase_knowledge_omitted() {
+        let mut ctx = base_ctx();
+        ctx.extra.insert(
+            "codebase_knowledge".into(),
+            serde_json::Value::String(String::new()),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(!msg.contains("Codebase Overview"));
     }
 }

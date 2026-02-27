@@ -477,17 +477,19 @@ impl EngineeringPipeline {
         );
 
         // --- Stage 2: Index + context enrichment ---
-        let (repo_context, indexed_files) = match indexer::build_index(repo_path).await {
-            Ok(index) => {
-                let ctx_str = index.to_agent_context(100);
-                let files = index.files.clone();
-                (ctx_str, files)
-            }
-            Err(e) => {
-                warn!(task_id, error = %e, "indexer failed, continuing");
-                (String::new(), Vec::new())
-            }
-        };
+        let (repo_context, indexed_files, codebase_knowledge) =
+            match indexer::build_index(repo_path).await {
+                Ok(index) => {
+                    let ctx_str = index.to_agent_context(100);
+                    let files = index.files.clone();
+                    let knowledge = indexer::build_codebase_knowledge(&index, Path::new(repo_path));
+                    (ctx_str, files, knowledge)
+                }
+                Err(e) => {
+                    warn!(task_id, error = %e, "indexer failed, continuing");
+                    (String::new(), Vec::new(), String::new())
+                }
+            };
 
         let failure_context = self.history.failure_context(5).await.unwrap_or_default();
 
@@ -964,6 +966,25 @@ impl EngineeringPipeline {
                     .extra
                     .insert("module_map".into(), serde_json::Value::String(module_map));
             }
+        }
+
+        // Inject codebase knowledge — a persistent, structured summary of the
+        // project that eliminates the implementer's cold-start exploration.
+        // Prefer a hand-curated file if present; fall back to auto-generated.
+        let repo_root = Path::new(&ctx.agent_context.repo_path);
+        let knowledge_path = repo_root.join(".glitchlab/codebase-context.md");
+        let knowledge = if knowledge_path.exists() {
+            tokio::fs::read_to_string(&knowledge_path)
+                .await
+                .unwrap_or_default()
+        } else {
+            codebase_knowledge.clone()
+        };
+        if !knowledge.is_empty() {
+            ctx.agent_context.extra.insert(
+                "codebase_knowledge".into(),
+                serde_json::Value::String(knowledge),
+            );
         }
 
         // --- Stage 4: Boundary check ---
