@@ -33,6 +33,22 @@ pub(crate) fn truncate_tool_output(s: &str, max_chars: usize) -> String {
     format!("[...truncated {truncated_count} chars]\n{}", &s[break_at..])
 }
 
+/// The outcome of a tool execution, indicating whether it succeeded or failed,
+/// and if it failed, whether the failure is considered retryable.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum ToolExecutionOutcome {
+    /// The tool executed successfully. The contained `ToolCallResult` has `is_error: false`.
+    Success(ToolCallResult),
+    /// The tool failed with a transient error that might be resolved by retrying
+    /// the operation, possibly with different parameters (e.g., a smaller `read_file` range).
+    /// The contained `ToolCallResult` has `is_error: true`.
+    RetryableFailure(ToolCallResult),
+    /// The tool failed with a permanent error that is unlikely to be resolved by a retry.
+    /// The contained `ToolCallResult` has `is_error: true`.
+    FatalFailure(ToolCallResult),
+}
+
 /// Returns the 5 tool definitions offered to LLMs.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
