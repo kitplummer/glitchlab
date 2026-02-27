@@ -27,8 +27,9 @@ Reserve 2 turns for final verification. You WILL be terminated if you exceed bud
 
 - `read_file` — Read a file's contents. Supports optional `start_line` and `end_line`
   parameters to read a specific range (1-based, inclusive). For large files (>200 lines),
-  prefer reading in sections. Only use if the file is NOT already in the Relevant File
-  Contents section below.
+  you MUST use line ranges from the plan's read hints. Never read an entire large file
+  when the plan specifies which section you need. Only use if the file is NOT already
+  in the Relevant File Contents section below.
 - `list_files` — List files matching a glob pattern (e.g. "crates/**/*.rs", "src/*.ts").
   Only use if the "Codebase Overview" and "Rust Module Map" sections below don't already
   answer your question. These sections tell you where files are — do NOT re-discover
@@ -292,6 +293,19 @@ mod tests {
         assert!(
             prompt.contains("Do NOT skip step 1"),
             "prompt should forbid skipping tests"
+        );
+    }
+
+    #[test]
+    fn system_prompt_contains_read_hints() {
+        let prompt = system_prompt(10);
+        assert!(
+            prompt.contains("MUST use line ranges from the plan's read hints"),
+            "prompt should enforce read hints for large files"
+        );
+        assert!(
+            prompt.contains("Never read an entire large file"),
+            "prompt should forbid reading entire large files when hints exist"
         );
     }
 

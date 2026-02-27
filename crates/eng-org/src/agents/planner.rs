@@ -35,9 +35,24 @@ Output schema:
 
 ## Token budget constraint
 
-The implementer has a STRICT budget of ~50K tokens per task (~9 tool turns).
+The implementer has a STRICT budget of ~120K tokens per task (~9 tool turns).
 A single file read costs 1-3K tokens. A test + build cycle costs 3-5K tokens.
 Each turn costs ~3-5K tokens. Budget is tight — do not explore.
+
+## File-size-aware complexity
+
+File count alone does NOT determine complexity. A 2-file task touching a
+1000-line file is harder than a 4-file task touching four 30-line files.
+
+When assessing complexity, consider the total lines across affected files:
+- <200 lines total: fits comfortably in one pass
+- 200-500 lines: tight but feasible in one pass with precise read hints
+- 500+ lines: likely needs decomposition OR very precise line-range scoping
+
+In your `steps`, include a `read_hint` for each file specifying which section
+the implementer needs: e.g. "Read lines 100-180 of router.rs (the Router struct
+and its impl block)". This prevents the implementer from reading entire large
+files and burning budget on irrelevant context.
 
 ## Task decomposition
 
@@ -53,7 +68,8 @@ sub-task overhead (workspace setup, context assembly) that exceeds the work itse
 
 You MUST decompose ONLY when ALL of these conditions are true:
 - estimated_complexity is "medium" or "large"
-- The task would touch 4+ files AND require 5+ steps
+- The task would touch 4+ files AND require 5+ steps,
+  OR the total lines across affected files exceeds 500
 - No single implementer pass could complete it within 9 tool turns
 
 When decomposing, set `estimated_complexity` to "medium" or "large" and add a `decomposition` array:
@@ -191,5 +207,37 @@ mod tests {
         ctx.previous_output = serde_json::json!({"prior": "data"});
         let output = agent.execute(&ctx).await.unwrap();
         assert_eq!(output.metadata.agent, "planner");
+    }
+
+    #[test]
+    fn system_prompt_contains_file_size_awareness() {
+        assert!(
+            SYSTEM_PROMPT.contains("File-size-aware complexity"),
+            "prompt should have file-size-aware section"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("File count alone does NOT determine complexity"),
+            "prompt should warn about file count"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("500+ lines"),
+            "prompt should mention 500+ lines threshold"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("read_hint"),
+            "prompt should mention read_hint for steps"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("total lines across affected files exceeds 500"),
+            "decomposition conditions should include line count"
+        );
+    }
+
+    #[test]
+    fn system_prompt_contains_budget() {
+        assert!(
+            SYSTEM_PROMPT.contains("~120K tokens"),
+            "prompt should reference 120K budget"
+        );
     }
 }

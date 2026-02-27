@@ -553,6 +553,13 @@ impl EngineeringPipeline {
         ctx.agent_context.file_context =
             read_relevant_files(repo_path, objective, &indexed_files).await;
 
+        // Inject file-size metadata so the planner can reason about token cost.
+        let file_sizes = compute_file_sizes(&ctx.agent_context.file_context);
+        if !file_sizes.is_empty() {
+            let size_hint = format_file_size_hint(&file_sizes);
+            ctx.agent_context.constraints.push(size_hint);
+        }
+
         // --- Stage 2b: Pre-planner boundary scan (deterministic, zero LLM calls) ---
         // If the objective itself mentions file paths under protected prefixes,
         // reject immediately. This catches the common case where the task is
@@ -709,6 +716,76 @@ impl EngineeringPipeline {
                     error: None,
                     outcome_context: None,
                 };
+            }
+
+            // --- Stage 3b2: Budget estimation gate ---
+            // Estimate whether the plan fits within the task's token budget.
+            // If it would exceed 80%, force the planner to decompose.
+            let plan_files: Vec<String> = plan_output.data["files_likely_affected"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let step_count = plan_output.data["steps"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(1);
+            let estimated = estimate_plan_tokens(repo_path, &plan_files, step_count).await;
+            let budget = TaskSize::M.max_tokens() as usize; // default pre-triage size
+
+            // 70% threshold — conservative. An unnecessary decomposition costs ~21K
+            // overhead. A budget failure wastes the full 120K. Err on the side of
+            // decomposing.
+            if estimated > (budget * 70 / 100) {
+                warn!(
+                    task_id,
+                    estimated,
+                    budget,
+                    "plan estimated to exceed 80% of budget — forcing decomposition"
+                );
+                ctx.agent_context.previous_output = serde_json::json!({
+                    "original_plan": plan_output.data,
+                    "instruction": format!(
+                        "This plan would consume ~{estimated} tokens (budget: {budget}). \
+                         Decompose into smaller sub-tasks. Each sub-task should read only \
+                         the specific sections of files it needs (use line-range hints)."
+                    ),
+                });
+                let replan = PlannerAgent::new(Arc::clone(&self.router));
+                match replan.execute(&ctx.agent_context).await {
+                    Ok(new_plan) => {
+                        plan_output = new_plan;
+                        self.emit(&mut ctx, EventKind::PlanCreated, plan_output.data.clone());
+                        ctx.stage_outputs.insert("plan".into(), plan_output.clone());
+                        // Check if replan decomposed
+                        if plan_output
+                            .data
+                            .get("decomposition")
+                            .is_some_and(|d| d.is_array() && !d.as_array().unwrap().is_empty())
+                        {
+                            return PipelineResult {
+                                status: PipelineStatus::Decomposed,
+                                stage_outputs: ctx.stage_outputs,
+                                events: ctx.events,
+                                budget: self.router.budget_summary().await,
+                                pr_url: None,
+                                branch: None,
+                                error: None,
+                                outcome_context: None,
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            task_id,
+                            error = %e,
+                            "budget-aware replan failed, continuing with original"
+                        );
+                    }
+                }
             }
         }
 
@@ -2041,6 +2118,67 @@ async fn read_relevant_files(
     }
 
     result
+}
+
+/// Compute line counts for files already loaded in agent context.
+fn compute_file_sizes(file_context: &HashMap<String, String>) -> Vec<(String, usize)> {
+    let mut sizes: Vec<(String, usize)> = file_context
+        .iter()
+        .map(|(path, content)| (path.clone(), content.lines().count()))
+        .collect();
+    sizes.sort_by(|a, b| b.1.cmp(&a.1)); // largest first
+    sizes
+}
+
+/// Tokens per line of source code.
+///
+/// Code averages ~32 chars/line, tokenizers average ~4 chars/token → ~8 tokens/line.
+/// This is deliberately conservative: overestimating is cheap (an extra decomposition
+/// costs ~21K overhead), underestimating is expensive (a budget failure wastes 120K).
+const TOKENS_PER_LINE: usize = 8;
+
+/// Format file sizes as a planner constraint string.
+fn format_file_size_hint(sizes: &[(String, usize)]) -> String {
+    let mut hint = String::from(
+        "File sizes (the implementer must read these files into its context window):\n",
+    );
+    let mut total_lines = 0usize;
+    for (path, lines) in sizes {
+        let est_tokens = lines * TOKENS_PER_LINE;
+        total_lines += lines;
+        hint.push_str(&format!("- {path}: {lines} lines (~{est_tokens} tokens)\n"));
+    }
+    let total_tokens = total_lines * TOKENS_PER_LINE;
+    hint.push_str(&format!(
+        "Total file context: ~{total_lines} lines (~{total_tokens} tokens/turn, amplified across ~9 TDD turns).\n\
+         Implementer budget: ~120K tokens for ~9 turns.\n\
+         If total lines exceed 500, decompose so each sub-task scopes to specific \
+         line ranges (e.g. 'lines 100-250 of router.rs')."
+    ));
+    hint
+}
+
+/// Estimate the token cost of executing a plan.
+///
+/// Models how multi-turn LLM conversations actually work: file content read in
+/// turn 1 stays in the conversation history and is re-sent as input on every
+/// subsequent turn. A 1400-line file isn't 11K tokens — it's 11K tokens × 9
+/// turns = ~100K tokens. This is why "small" file-count tasks blow budget.
+async fn estimate_plan_tokens(repo_path: &Path, files: &[String], step_count: usize) -> usize {
+    let mut file_tokens = 0usize;
+    for file in files {
+        let full_path = repo_path.join(file);
+        if let Ok(content) = tokio::fs::read_to_string(&full_path).await {
+            file_tokens += content.lines().count() * TOKENS_PER_LINE;
+        }
+    }
+    let system_prompt = 4_000; // system prompt, re-sent every turn
+    let per_turn_overhead = 3_000; // tool call framing, response overhead
+    let turns = step_count.max(4) + 2; // steps + test + verify turns
+
+    // Each turn pays: system prompt + all file context + turn overhead.
+    // This models the conversation history growth that causes budget blowouts.
+    turns * (system_prompt + file_tokens + per_turn_overhead)
 }
 
 fn build_pr_body(plan: &AgentOutput, security: &AgentOutput) -> String {
@@ -3485,6 +3623,121 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    // --- compute_file_sizes / format_file_size_hint / estimate_plan_tokens tests ---
+
+    #[test]
+    fn compute_file_sizes_returns_sorted_by_largest() {
+        let mut ctx = HashMap::new();
+        ctx.insert("small.rs".into(), "line1\nline2\n".into());
+        ctx.insert("big.rs".into(), "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n".into());
+
+        let sizes = compute_file_sizes(&ctx);
+        assert_eq!(sizes.len(), 2);
+        // Largest first.
+        assert_eq!(sizes[0].0, "big.rs");
+        assert_eq!(sizes[0].1, 10);
+        assert_eq!(sizes[1].0, "small.rs");
+        assert_eq!(sizes[1].1, 2);
+    }
+
+    #[test]
+    fn format_file_size_hint_output() {
+        let sizes = vec![
+            ("src/router.rs".into(), 1400usize),
+            ("Cargo.toml".into(), 30usize),
+        ];
+        let hint = format_file_size_hint(&sizes);
+        assert!(
+            hint.contains("src/router.rs: 1400 lines (~11200 tokens)"),
+            "should list router.rs with 8 tokens/line: {hint}"
+        );
+        assert!(
+            hint.contains("Cargo.toml: 30 lines (~240 tokens)"),
+            "should list Cargo.toml: {hint}"
+        );
+        assert!(
+            hint.contains("Total file context: ~1430 lines"),
+            "should sum lines: {hint}"
+        );
+        assert!(
+            hint.contains("Implementer budget: ~120K tokens"),
+            "should mention budget: {hint}"
+        );
+        assert!(
+            hint.contains("If total lines exceed 500"),
+            "should mention decomposition threshold: {hint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_plan_tokens_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100-line file → 800 file tokens per turn (8 tokens/line)
+        let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        tokio::fs::create_dir_all(dir.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("src/lib.rs"), &content)
+            .await
+            .unwrap();
+
+        let files = vec!["src/lib.rs".to_string()];
+        let estimated = estimate_plan_tokens(dir.path(), &files, 3).await;
+
+        // turns = max(3,4)+2 = 6
+        // per_turn = system(4K) + file_tokens(800) + overhead(3K) = 7,800
+        // total = 6 * 7,800 = 46,800
+        let file_tokens = 100 * TOKENS_PER_LINE;
+        let turns = 6;
+        let expected = turns * (4_000 + file_tokens + 3_000);
+        assert_eq!(
+            estimated, expected,
+            "should calculate correct token estimate"
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_plan_tokens_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let files = vec!["nonexistent.rs".to_string()];
+        let estimated = estimate_plan_tokens(dir.path(), &files, 2).await;
+
+        // Missing files contribute 0 file tokens.
+        // turns = max(2,4)+2 = 6, per_turn = 4K + 0 + 3K = 7K
+        // total = 6 * 7K = 42K
+        let turns = 6;
+        let expected = turns * (4_000 + 3_000);
+        assert_eq!(
+            estimated, expected,
+            "missing files should contribute 0 tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_plan_tokens_catches_known_failure() {
+        // Calibration: the canary failure was a 1405-line file that blew
+        // 124K/120K budget. The estimator MUST flag this.
+        let dir = tempfile::tempdir().unwrap();
+        let content: String = (0..1405).map(|i| format!("// line {i}\n")).collect();
+        tokio::fs::create_dir_all(dir.path().join("crates/router/src"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("crates/router/src/router.rs"), &content)
+            .await
+            .unwrap();
+
+        let files = vec!["crates/router/src/router.rs".to_string()];
+        let estimated = estimate_plan_tokens(dir.path(), &files, 3).await;
+
+        let budget = TaskSize::M.max_tokens() as usize; // 120K
+        let threshold = budget * 70 / 100; // 84K — matches the conservative gate
+        assert!(
+            estimated > threshold,
+            "1405-line file must exceed 70% budget gate: estimated={estimated}, threshold={threshold}"
+        );
+    }
+
     // --- E2E pipeline test with Rust workspace structure ---
 
     #[tokio::test]
@@ -3878,6 +4131,173 @@ mod tests {
         // No implementation should have been attempted.
         assert!(!result.stage_outputs.contains_key("implement"));
         assert!(!result.stage_outputs.contains_key("architect_triage"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_budget_gate_forces_decomposition() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Mirrors the actual canary failure: a 1400-line file that blew 124K/120K.
+        // With the amplification-aware estimator (8 tok/line × 6 turns):
+        //   6 * (4K + 11200 + 3K) = 6 * 18200 = 109,200 > 84K (70% of 120K)
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let big_content: String = (0..1_400).map(|i| format!("// line {i}\n")).collect();
+        std::fs::write(dir.path().join("src/big.rs"), &big_content).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add big file"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let responses = vec![
+            // 1. Planner — small complexity, but references a huge file
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add tracing"}, {"step_number": 2, "description": "add metrics"}, {"step_number": 3, "description": "test"}], "files_likely_affected": ["src/big.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": ["test tracing"], "estimated_complexity": "small", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Budget-aware replan — produces decomposition
+            final_response(
+                r#"{"steps": [], "files_likely_affected": ["src/big.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "medium", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "p1", "objective": "add tracing to lines 1-200", "files_likely_affected": ["src/big.rs"]}, {"id": "p2", "objective": "add metrics to lines 300-400", "files_likely_affected": ["src/big.rs"]}]}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-budget-gate",
+                "Add tracing to src/big.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::Decomposed,
+            "budget gate should force decomposition, got {:?}, error: {:?}",
+            result.status,
+            result.error,
+        );
+        // Should have 2 PlanCreated events (original + budget-aware replan).
+        let plan_created_count = result
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::PlanCreated)
+            .count();
+        assert_eq!(
+            plan_created_count, 2,
+            "expected 2 PlanCreated events (original + budget replan), got {plan_created_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_budget_gate_passes_small_plan() {
+        // A plan with small files should pass the budget gate and proceed normally.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Create a small file — well under budget threshold.
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/small.rs"),
+            "pub fn hello() -> &'static str { \"hi\" }\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add small file"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let responses = vec![
+            // 1. Planner — small task, small file (should NOT trigger budget gate)
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature"}], "files_likely_affected": ["src/small.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": ["test"], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Implementer — write_file
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/small.rs", "content": "pub fn hello() -> &'static str { \"hi\" }\npub fn world() {}\n"}),
+            }]),
+            // 3. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/small.rs"], "tests_added": [], "commit_message": "feat: add world", "summary": "done", "tests_passing": true}"#,
+            ),
+            // 4. Security
+            final_response(r#"{"verdict": "pass", "issues": [], "summary": "ok"}"#),
+            // 5. CISO
+            final_response(
+                r#"{"risk_verdict": "accept", "risk_score": 2, "blast_radius": "isolated", "trust_boundary_crossings": [], "data_flow_concerns": [], "compliance_flags": [], "operational_risk": {"rollback_complexity": "trivial", "monitoring_gaps": [], "failure_modes": []}, "aggregate_assessment": "low risk", "conditions": [], "escalation_reason": null}"#,
+            ),
+            // 6. Release
+            final_response(
+                r#"{"version_bump": "patch", "reasoning": "test", "changelog_entry": "", "breaking_changes": []}"#,
+            ),
+            // 7. Archivist
+            final_response(
+                r#"{"adr": null, "doc_updates": [], "architecture_notes": "", "should_write_adr": false}"#,
+            ),
+            // 8. Architect review — approve
+            final_response(
+                r#"{"verdict": "approve", "confidence": 0.9, "reasoning": "looks good", "quality_score": 8, "issues": [], "architectural_fitness": "good", "merge_strategy": "squash"}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-budget-pass",
+                "Add world function to src/small.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        // Should NOT be decomposed — budget estimate is well under threshold.
+        assert_ne!(
+            result.status,
+            PipelineStatus::Decomposed,
+            "small plan should not trigger budget gate decomposition"
+        );
+        // Should have exactly 1 PlanCreated event (no replan).
+        let plan_created_count = result
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::PlanCreated)
+            .count();
+        assert_eq!(
+            plan_created_count, 1,
+            "expected 1 PlanCreated event (no budget replan), got {plan_created_count}"
+        );
     }
 
     #[tokio::test]
