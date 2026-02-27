@@ -36,6 +36,16 @@ pub struct ZephyrPolicy {
     pub credential_scopes: HashMap<String, Vec<String>>,
     /// A map of agent roles to the approval gates they must pass for certain actions.
     pub approval_gates: HashMap<String, Vec<ApprovalGate>>,
+    /// Defines policies related to boundary violations, such as protected paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundaries: Option<BoundaryPolicy>,
+}
+
+/// Defines policies related to boundary violations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BoundaryPolicy {
+    /// A list of file paths that are protected from modification by agents.
+    pub protected_paths: Vec<String>,
 }
 
 #[cfg(test)]
@@ -73,6 +83,7 @@ mod tests {
             autonomy_levels,
             credential_scopes,
             approval_gates,
+            boundaries: None,
         };
 
         // Test serialization to YAML
@@ -101,5 +112,31 @@ mod tests {
         assert!(schema_json.contains("approval_gates"));
         assert!(schema_json.contains("AutonomyLevel"));
         assert!(schema_json.contains("ApprovalGate"));
+    }
+
+    #[test]
+    fn test_boundary_policy_deserialization() {
+        let yaml_string = r#"
+tool_allowlist: {}
+autonomy_levels: {}
+credential_scopes: {}
+approval_gates: {}
+boundaries:
+  protected_paths:
+    - "/src/main.rs"
+    - "/config/settings.yaml"
+"#;
+        let policy: ZephyrPolicy = serde_yaml::from_str(yaml_string)
+            .expect("Failed to deserialize ZephyrPolicy with BoundaryPolicy");
+
+        assert!(policy.boundaries.is_some());
+        let boundaries = policy.boundaries.unwrap();
+        assert_eq!(
+            boundaries.protected_paths,
+            vec![
+                "/src/main.rs".to_string(),
+                "/config/settings.yaml".to_string()
+            ]
+        );
     }
 }
