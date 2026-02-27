@@ -8,9 +8,10 @@ use std::fmt;
 /// Model quality/cost tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ModelTier {
-    Economy,  // Flash Lite, Haiku, local
-    Standard, // Flash, Sonnet, GPT-4o-mini
-    Premium,  // Pro, Opus, GPT-4o
+    Economy,      // Flash Lite, Haiku, local
+    Standard,     // Flash, GPT-4o-mini
+    StandardPlus, // Pro, Sonnet — better structured output than Standard
+    Premium,      // Opus, GPT-4o
 }
 
 impl ModelTier {
@@ -19,6 +20,7 @@ impl ModelTier {
         match s.to_lowercase().as_str() {
             "economy" => Some(Self::Economy),
             "standard" => Some(Self::Standard),
+            "standard_plus" => Some(Self::StandardPlus),
             "premium" => Some(Self::Premium),
             _ => None,
         }
@@ -27,7 +29,8 @@ impl ModelTier {
     /// Downgrade a tier by one level. Economy stays Economy.
     fn downgrade(self) -> Self {
         match self {
-            Self::Premium => Self::Standard,
+            Self::Premium => Self::StandardPlus,
+            Self::StandardPlus => Self::Standard,
             Self::Standard => Self::Economy,
             Self::Economy => Self::Economy,
         }
@@ -39,6 +42,7 @@ impl fmt::Display for ModelTier {
         let s = match self {
             Self::Economy => "economy",
             Self::Standard => "standard",
+            Self::StandardPlus => "standard_plus",
             Self::Premium => "premium",
         };
         write!(f, "{}", s)
@@ -172,6 +176,36 @@ impl ModelChooser {
     /// Check if the model pool is empty.
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
+    }
+
+    /// Select a model one tier above the current one for the same role.
+    ///
+    /// Finds the cheapest eligible model whose tier is strictly higher than
+    /// `current_tier`, while still satisfying the role's capability requirements.
+    /// Returns `None` if no higher-tier model is available.
+    pub fn escalate(&self, role: &str, current_tier: ModelTier) -> Option<&str> {
+        let pref = self.role_preferences.get(role).cloned().unwrap_or_default();
+
+        // Models are sorted by cost ascending — first match above current tier wins.
+        self.models
+            .iter()
+            .filter(|m| {
+                m.tier > current_tier
+                    && pref
+                        .required_capabilities
+                        .iter()
+                        .all(|cap| m.capabilities.contains(cap))
+            })
+            .map(|m| m.model_string.as_str())
+            .next()
+    }
+
+    /// Look up the tier for a model string. Returns `None` if unknown.
+    pub fn tier_of(&self, model_string: &str) -> Option<ModelTier> {
+        self.models
+            .iter()
+            .find(|m| m.model_string == model_string)
+            .map(|m| m.tier)
     }
 
     /// Fallback to the cheapest available model regardless of role preferences.
@@ -385,7 +419,8 @@ mod tests {
     #[test]
     fn model_tier_ordering() {
         assert!(ModelTier::Economy < ModelTier::Standard);
-        assert!(ModelTier::Standard < ModelTier::Premium);
+        assert!(ModelTier::Standard < ModelTier::StandardPlus);
+        assert!(ModelTier::StandardPlus < ModelTier::Premium);
         assert!(ModelTier::Economy < ModelTier::Premium);
     }
 
@@ -400,6 +435,10 @@ mod tests {
             Some(ModelTier::Standard)
         );
         assert_eq!(
+            ModelTier::from_str_loose("standard_plus"),
+            Some(ModelTier::StandardPlus)
+        );
+        assert_eq!(
             ModelTier::from_str_loose("Premium"),
             Some(ModelTier::Premium)
         );
@@ -408,7 +447,8 @@ mod tests {
 
     #[test]
     fn model_tier_downgrade() {
-        assert_eq!(ModelTier::Premium.downgrade(), ModelTier::Standard);
+        assert_eq!(ModelTier::Premium.downgrade(), ModelTier::StandardPlus);
+        assert_eq!(ModelTier::StandardPlus.downgrade(), ModelTier::Standard);
         assert_eq!(ModelTier::Standard.downgrade(), ModelTier::Economy);
         assert_eq!(ModelTier::Economy.downgrade(), ModelTier::Economy);
     }
@@ -448,6 +488,56 @@ mod tests {
     }
 
     #[test]
+    fn escalate_selects_higher_tier() {
+        let chooser = test_chooser(0.7);
+        // Implementer currently on Standard → escalate should pick Premium (claude)
+        let escalated = chooser.escalate("implementer", ModelTier::Standard);
+        assert_eq!(escalated, Some("anthropic/claude-sonnet-4-20250514"));
+    }
+
+    #[test]
+    fn escalate_returns_none_at_top_tier() {
+        let chooser = test_chooser(0.7);
+        // Already on Premium → no higher tier available
+        let escalated = chooser.escalate("implementer", ModelTier::Premium);
+        assert_eq!(escalated, None);
+    }
+
+    #[test]
+    fn escalate_respects_capabilities() {
+        let roles = HashMap::from([(
+            "special".into(),
+            RolePreference {
+                min_tier: ModelTier::Economy,
+                required_capabilities: HashSet::from(["vision".into()]),
+            },
+        )]);
+        let chooser = ModelChooser::new(test_models(), roles, 0.5);
+        // Only Premium model (claude) has vision — escalate from Economy should find it
+        let escalated = chooser.escalate("special", ModelTier::Economy);
+        assert_eq!(escalated, Some("anthropic/claude-sonnet-4-20250514"));
+    }
+
+    #[test]
+    fn tier_of_known_model() {
+        let chooser = test_chooser(0.7);
+        assert_eq!(
+            chooser.tier_of("gemini/gemini-2.5-flash"),
+            Some(ModelTier::Standard)
+        );
+        assert_eq!(
+            chooser.tier_of("gemini/gemini-2.5-flash-lite"),
+            Some(ModelTier::Economy)
+        );
+    }
+
+    #[test]
+    fn tier_of_unknown_model() {
+        let chooser = test_chooser(0.7);
+        assert_eq!(chooser.tier_of("unknown/model"), None);
+    }
+
+    #[test]
     fn role_preference_default() {
         let pref = RolePreference::default();
         assert_eq!(pref.min_tier, ModelTier::Economy);
@@ -458,6 +548,7 @@ mod tests {
     fn model_tier_display() {
         assert_eq!(ModelTier::Economy.to_string(), "economy");
         assert_eq!(ModelTier::Standard.to_string(), "standard");
+        assert_eq!(ModelTier::StandardPlus.to_string(), "standard_plus");
         assert_eq!(ModelTier::Premium.to_string(), "premium");
     }
 }

@@ -408,6 +408,7 @@ pub enum FailureCategory {
     SetupError,
     PlanFailed,
     ImplementationFailed,
+    ParseError,
     TestsFailed,
     ArchitectRejected,
     MaxAttemptsExceeded,
@@ -422,6 +423,7 @@ impl fmt::Display for FailureCategory {
             FailureCategory::SetupError => write!(f, "setup error"),
             FailureCategory::PlanFailed => write!(f, "plan failed"),
             FailureCategory::ImplementationFailed => write!(f, "implementation failed"),
+            FailureCategory::ParseError => write!(f, "parse error"),
             FailureCategory::TestsFailed => write!(f, "tests failed"),
             FailureCategory::ArchitectRejected => write!(f, "architect rejected"),
             FailureCategory::MaxAttemptsExceeded => write!(f, "max attempts exceeded"),
@@ -437,6 +439,7 @@ pub fn pipeline_status_to_failure_category(status: PipelineStatus) -> FailureCat
     match status {
         PipelineStatus::PlanFailed => FailureCategory::PlanFailed,
         PipelineStatus::ImplementationFailed => FailureCategory::ImplementationFailed,
+        PipelineStatus::ParseError => FailureCategory::ParseError,
         PipelineStatus::TestsFailed => FailureCategory::TestsFailed,
         PipelineStatus::ArchitectRejected => FailureCategory::ArchitectRejected,
         PipelineStatus::BudgetExceeded => FailureCategory::BudgetExceeded,
@@ -1143,6 +1146,12 @@ impl Orchestrator {
                 track_attempt: true,
             },
             PipelineStatus::ArchitectRejected => OutcomeRouting {
+                task_status: TaskStatus::Deferred,
+                counter: OutcomeCounter::Deferred,
+                save_context: true,
+                track_attempt: true,
+            },
+            PipelineStatus::ParseError => OutcomeRouting {
                 task_status: TaskStatus::Deferred,
                 counter: OutcomeCounter::Deferred,
                 save_context: true,
@@ -2586,6 +2595,16 @@ mod tests {
         assert_eq!(routing.counter, OutcomeCounter::Succeeded);
         assert!(!routing.save_context);
         assert!(!routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_parse_error() {
+        let pr = make_pipeline_result(PipelineStatus::ParseError);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Deferred);
+        assert_eq!(routing.counter, OutcomeCounter::Deferred);
+        assert!(routing.save_context);
+        assert!(routing.track_attempt);
     }
 
     #[test]

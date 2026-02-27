@@ -35,6 +35,11 @@ pub struct Router {
     /// Optional cost-aware model chooser. When present, takes precedence
     /// over the static `routing` map for model resolution.
     chooser: Option<ModelChooser>,
+
+    /// Temporary per-role model overrides. Takes highest precedence in
+    /// model resolution (above chooser and static routing). Used for
+    /// model escalation retries.
+    overrides: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Router {
@@ -86,6 +91,7 @@ impl Router {
             providers,
             budget: Arc::new(Mutex::new(budget)),
             chooser: None,
+            overrides: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -124,6 +130,11 @@ impl Router {
         role: &str,
         fallbacks: &[String],
     ) -> error::Result<String> {
+        // Check temporary overrides first (highest precedence).
+        if let Some(model) = self.overrides.lock().await.get(role) {
+            return Ok(model.clone());
+        }
+
         if let Some(ref chooser) = self.chooser {
             let budget = self.budget.lock().await;
             let remaining = budget.dollars_remaining();
@@ -421,6 +432,31 @@ impl Router {
     /// Resize the token budget (e.g. after triage assigns a task size).
     pub async fn resize_budget(&self, max_tokens: u64) {
         self.budget.lock().await.max_tokens = max_tokens;
+    }
+
+    /// Try to escalate the model for a role to a higher tier.
+    ///
+    /// Looks up the current model's tier and asks the chooser for the next
+    /// tier up. Returns the escalated model string, or `None` if no
+    /// higher-tier model is available.
+    pub async fn escalate_model(&self, role: &str) -> Option<String> {
+        let chooser = self.chooser.as_ref()?;
+        // Clear any existing override so resolve_model returns the base model.
+        self.overrides.lock().await.remove(role);
+        let current_model = self.resolve_model(role).await.ok()?;
+        let current_tier = chooser.tier_of(&current_model)?;
+        chooser.escalate(role, current_tier).map(String::from)
+    }
+
+    /// Set a temporary model override for a role. Takes highest precedence
+    /// in model resolution (above chooser and static routing).
+    pub async fn set_model_override(&self, role: &str, model: String) {
+        self.overrides.lock().await.insert(role.to_string(), model);
+    }
+
+    /// Clear a temporary model override for a role.
+    pub async fn clear_model_override(&self, role: &str) {
+        self.overrides.lock().await.remove(role);
     }
 }
 
@@ -1259,5 +1295,82 @@ mod tests {
 
         let summary = router.budget_summary().await;
         assert_eq!(summary.tokens_remaining, 35_000);
+    }
+
+    #[tokio::test]
+    async fn model_override_takes_precedence() {
+        let routing = HashMap::from([("planner".to_string(), "mock/static".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget);
+
+        // Without override: resolves to static routing.
+        let models = router.select("planner").await.unwrap();
+        assert_eq!(models[0], "mock/static");
+
+        // With override: resolves to override.
+        router
+            .set_model_override("planner", "mock/override".into())
+            .await;
+        let models = router.select("planner").await.unwrap();
+        assert_eq!(models[0], "mock/override");
+
+        // After clearing: back to static routing.
+        router.clear_model_override("planner").await;
+        let models = router.select("planner").await.unwrap();
+        assert_eq!(models[0], "mock/static");
+    }
+
+    #[tokio::test]
+    async fn escalate_model_returns_higher_tier() {
+        let models = vec![
+            ModelProfile {
+                model_string: "mock/cheap".into(),
+                input_cost_per_m: 0.1,
+                output_cost_per_m: 0.3,
+                tier: ModelTier::Economy,
+                capabilities: HashSet::from(["tool_use".into(), "code".into()]),
+            },
+            ModelProfile {
+                model_string: "mock/mid".into(),
+                input_cost_per_m: 0.5,
+                output_cost_per_m: 1.0,
+                tier: ModelTier::Standard,
+                capabilities: HashSet::from(["tool_use".into(), "code".into()]),
+            },
+            ModelProfile {
+                model_string: "mock/premium".into(),
+                input_cost_per_m: 3.0,
+                output_cost_per_m: 15.0,
+                tier: ModelTier::Premium,
+                capabilities: HashSet::from(["tool_use".into(), "code".into()]),
+            },
+        ];
+        let roles = HashMap::from([(
+            "planner".into(),
+            RolePreference {
+                min_tier: ModelTier::Standard,
+                required_capabilities: HashSet::new(),
+            },
+        )]);
+        let chooser = ModelChooser::new(models, roles, 0.7);
+        let routing = HashMap::from([("planner".to_string(), "mock/fallback".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget).with_chooser(chooser);
+
+        // Planner currently resolves to cheapest Standard (mock/mid).
+        // Escalation should offer Premium (mock/premium).
+        let escalated = router.escalate_model("planner").await;
+        assert_eq!(escalated.as_deref(), Some("mock/premium"));
+    }
+
+    #[tokio::test]
+    async fn escalate_model_returns_none_without_chooser() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget);
+
+        // No chooser attached → escalation not possible.
+        let escalated = router.escalate_model("planner").await;
+        assert_eq!(escalated, None);
     }
 }

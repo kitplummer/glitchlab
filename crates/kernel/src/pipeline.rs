@@ -169,6 +169,8 @@ pub enum PipelineStatus {
     Retryable,
     /// Work already done — triage detected no implementation needed.
     AlreadyDone,
+    /// LLM returned unparseable output — retryable with model escalation.
+    ParseError,
     /// Architect review rejected the changes.
     ArchitectRejected,
     /// PR was created and merged automatically.
@@ -362,6 +364,15 @@ mod tests {
         assert_eq!(json, "\"pr_merged\"");
         let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, PipelineStatus::PrMerged);
+    }
+
+    #[test]
+    fn pipeline_status_parse_error_serde() {
+        let status = PipelineStatus::ParseError;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"parse_error\"");
+        let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, PipelineStatus::ParseError);
     }
 
     #[test]

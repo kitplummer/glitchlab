@@ -1010,7 +1010,7 @@ impl EngineeringPipeline {
             task_size.max_tool_turns(),
             self.config.limits.max_stuck_turns,
         );
-        let impl_output = match implementer.execute(&ctx.agent_context).await {
+        let mut impl_output = match implementer.execute(&ctx.agent_context).await {
             Ok(o) => o,
             Err(e) => {
                 return self
@@ -1046,13 +1046,85 @@ impl EngineeringPipeline {
                     .await;
             }
 
-            return self
-                .fail(
-                    ctx,
-                    PipelineStatus::ImplementationFailed,
-                    format!("implementer failed: {reason}"),
-                )
-                .await;
+            // Pure parse error (LLM returned garbage) — try model escalation
+            // before giving up. Stuck-loop failures are not retryable.
+            if reason == "parse_error" {
+                if let Some(escalated_model) = self.router.escalate_model("implementer").await {
+                    let original_model = impl_output.metadata.model.clone();
+                    warn!(
+                        task_id,
+                        original_model,
+                        escalated_model,
+                        "parse error — retrying with escalated model"
+                    );
+
+                    // Override the implementer model for the retry.
+                    self.router
+                        .set_model_override("implementer", escalated_model.clone())
+                        .await;
+
+                    // Re-run the implementer with the same context.
+                    let retry_dispatcher = ToolDispatcher::new(
+                        wt_path.clone(),
+                        ToolPolicy::new(
+                            self.config.allowed_tools.clone(),
+                            self.config.blocked_patterns.clone(),
+                        ),
+                        self.config.boundaries.protected_paths.clone(),
+                        Duration::from_secs(120),
+                    );
+                    let retry_implementer = ImplementerAgent::new(
+                        Arc::clone(&self.router),
+                        retry_dispatcher,
+                        task_size.max_tool_turns(),
+                        self.config.limits.max_stuck_turns,
+                    );
+                    let retry_output = retry_implementer.execute(&ctx.agent_context).await;
+
+                    // Clear the override regardless of outcome.
+                    self.router.clear_model_override("implementer").await;
+
+                    match retry_output {
+                        Ok(output) if !output.parse_error => {
+                            info!(task_id, escalated_model, "model escalation retry succeeded");
+                            // Replace the original output and continue the pipeline.
+                            impl_output = output;
+                            ctx.stage_outputs
+                                .insert("implement".into(), impl_output.clone());
+                            // Fall through to test/debug loop below.
+                        }
+                        _ => {
+                            // Escalation retry also failed.
+                            return self
+                                .fail(
+                                    ctx,
+                                    PipelineStatus::ParseError,
+                                    format!(
+                                        "implementer failed: parse_error (escalation to {escalated_model} also failed)"
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
+                } else {
+                    // No escalated model available.
+                    return self
+                        .fail(
+                            ctx,
+                            PipelineStatus::ParseError,
+                            format!("implementer failed: {reason}"),
+                        )
+                        .await;
+                }
+            } else {
+                return self
+                    .fail(
+                        ctx,
+                        PipelineStatus::ImplementationFailed,
+                        format!("implementer failed: {reason}"),
+                    )
+                    .await;
+            }
         }
 
         // --- Stage 7: Test / debug loop ---
@@ -3831,13 +3903,13 @@ mod tests {
             )
             .await;
 
-        assert_eq!(result.status, PipelineStatus::ImplementationFailed);
+        assert_eq!(result.status, PipelineStatus::ParseError);
         assert!(
             result
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("implementer failed")
+                .contains("implementer failed: parse_error")
         );
     }
 
