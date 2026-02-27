@@ -142,7 +142,7 @@ impl Agent for ImplementerAgent {
             max_turns: self.max_tool_turns,
             temperature: 0.2,
             max_tokens: 16384,
-            context_token_budget: 12_000,
+            context_token_budget: 8_000,
             max_stuck_turns: self.max_stuck_turns,
         };
         let outcome = tool_use_loop(&self.router, "implementer", &mut messages, &params).await?;

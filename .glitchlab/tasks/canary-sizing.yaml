@@ -29,7 +29,7 @@ tasks:
   status: failed
   depends_on: []
   decomposition_depth: 0
-  error: 'budget exceeded: token limit exceeded: 77784 / 73448 tokens used'
+  error: 'budget exceeded: token limit exceeded: 80318 / 73590 tokens used'
   outcome_context:
     approach: direct implementation
     obstacle:
@@ -92,7 +92,7 @@ tasks:
   status: failed
   depends_on: []
   decomposition_depth: 1
-  error: 'budget exceeded: token limit exceeded: 67619 / 65000 tokens used'
+  error: 'budget exceeded: token limit exceeded: 75028 / 65000 tokens used'
   outcome_context:
     approach: direct implementation
     obstacle:
@@ -159,7 +159,16 @@ tasks:
   status: failed
   depends_on: []
   decomposition_depth: 1
-  error: 'debugger failed: budget exceeded: token limit exceeded: 83527 / 65000 tokens used'
+  error: 'budget exceeded: token limit exceeded: 73559 / 65000 tokens used'
+  outcome_context:
+    approach: direct implementation
+    obstacle:
+      kind: model_limitation
+      model: unknown
+      error_class: budget_exceeded
+    discoveries: []
+    recommendation: Try a different implementation approach or simpler plan
+    files_explored: []
   remediation_depth: 0
   is_remediation: false
   files_hint:
@@ -209,3 +218,83 @@ tasks:
   is_remediation: false
   files_hint:
   - crates/router/src/router.rs
+- id: circuit-fix-0-e72b8892
+  objective: Investigate and potentially update the models used in the 'canary-size-m-role-preference-derives' task. Check for any known limitations or parsing errors specific to this model's application.
+  priority: 2
+  status: failed
+  depends_on: []
+  decomposition_depth: 0
+  error: 'budget exceeded: token limit exceeded: 99997 / 71213 tokens used'
+  outcome_context:
+    approach: direct implementation
+    obstacle:
+      kind: model_limitation
+      model: unknown
+      error_class: budget_exceeded
+    discoveries: []
+    recommendation: Try a different implementation approach or simpler plan
+    files_explored: []
+  remediation_depth: 1
+  is_remediation: true
+- id: circuit-fix-1-45fcb436
+  objective: Examine the model integration and parsing logic within the 'add-model-profile-display-part1' task. Address any identified parsing errors or model limitations.
+  priority: 2
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 1
+  is_remediation: true
+- id: circuit-fix-2-7c8e183d
+  objective: Review the model's usage and output parsing in the 'add-router-tracing-part1-setup-and-metrics-struct' task. Correct any issues related to model limitations or parsing.
+  priority: 2
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  pr_url: https://github.com/kitplummer/glitchlab/pull/74
+  remediation_depth: 1
+  is_remediation: true
+- id: add-model-profile-display-part1-sub1-define-struct
+  objective: Define a new `ModelProfile` data structure to encapsulate model-specific information (e.g., capabilities, cost, latency). Integrate this into the `Provider` trait or related structs in `crates/router`.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'budget exceeded: token limit exceeded: 65212 / 65000 tokens used'
+  outcome_context:
+    approach: direct implementation
+    obstacle:
+      kind: model_limitation
+      model: unknown
+      error_class: budget_exceeded
+    discoveries: []
+    recommendation: Try a different implementation approach or simpler plan
+    files_explored: []
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/provider.rs
+- id: add-model-profile-display-part1-sub2-implement-retrieval
+  objective: Implement the logic to retrieve and populate the `ModelProfile` for each specific LLM provider (Anthropic, Gemini, OpenAI). This will involve adding methods to the respective provider implementations and potentially to the `Router` to aggregate this information.
+  priority: 50
+  status: pending
+  depends_on:
+  - add-model-profile-display-part1-sub1-define-struct
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/provider/anthropic.rs
+  - crates/router/src/provider/gemini.rs
+  - crates/router/src/provider/openai.rs
+  - crates/router/src/router.rs
+- id: add-model-profile-display-part1-sub3-integrate-diagnostics
+  objective: Modify `crates/router/src/provider_diagnostics.rs` to display the newly retrieved `ModelProfile` information as part of the overall provider diagnostics output.
+  priority: 50
+  status: pending
+  depends_on:
+  - add-model-profile-display-part1-sub2-implement-retrieval
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/provider_diagnostics.rs

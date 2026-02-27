@@ -1084,6 +1084,70 @@ impl Orchestrator {
         }
 
         let router = Arc::new(router);
+
+        // --- Pre-flight triage ---
+        // For top-level, non-remediation tasks: run a quick triage check before
+        // the full pipeline.  If the task is obviously XL, decompose immediately
+        // via the planner without burning workspace-setup / indexer / context-
+        // assembly tokens.
+        if decomposition_depth == 0 {
+            use crate::agents::architect::ArchitectTriageAgent;
+            use crate::agents::planner::PlannerAgent;
+            use glitchlab_kernel::agent::{Agent, AgentContext};
+
+            let preflight_ctx = AgentContext {
+                task_id: task_id.into(),
+                objective: objective.into(),
+                repo_path: params.repo_path.to_string_lossy().into(),
+                working_dir: String::new(),
+                constraints: vec![],
+                acceptance_criteria: vec![],
+                risk_level: "low".into(),
+                file_context: std::collections::HashMap::new(),
+                previous_output: serde_json::Value::Null,
+                extra: std::collections::HashMap::new(),
+            };
+            let triage = ArchitectTriageAgent::new(Arc::clone(&router));
+            if let Ok(triage_output) = triage.execute(&preflight_ctx).await
+                && triage_output.data["task_size"].as_str() == Some("XL")
+            {
+                info!(
+                    task_id,
+                    "pre-flight triage sized XL — forcing decomposition without full pipeline"
+                );
+                // Ask the planner to decompose, providing the triage feedback.
+                let mut plan_ctx = preflight_ctx.clone();
+                plan_ctx.previous_output = serde_json::json!({
+                    "triage_feedback": triage_output.data,
+                    "instruction": "Task is too large (XL). Decompose into S/M/L sub-tasks. \
+                                    Each sub-task must touch at most 2 files.",
+                });
+                let planner = PlannerAgent::new(Arc::clone(&router));
+                if let Ok(plan_output) = planner.execute(&plan_ctx).await
+                    && plan_output
+                        .data
+                        .get("decomposition")
+                        .is_some_and(|d| d.as_array().is_some_and(|a| !a.is_empty()))
+                {
+                    let budget = router.budget_summary().await;
+                    let mut stage_outputs = std::collections::HashMap::new();
+                    stage_outputs.insert("architect_triage".into(), triage_output.clone());
+                    stage_outputs.insert("plan".into(), plan_output);
+                    return Ok(glitchlab_kernel::pipeline::PipelineResult {
+                        status: PipelineStatus::Decomposed,
+                        stage_outputs,
+                        events: vec![],
+                        budget,
+                        pr_url: None,
+                        branch: None,
+                        error: None,
+                        outcome_context: None,
+                    });
+                }
+                // If planner didn't decompose, fall through to full pipeline.
+            }
+        }
+
         let pipeline = EngineeringPipeline::new(
             Arc::clone(&router),
             self.config.clone(),
@@ -3334,6 +3398,78 @@ mod tests {
         let tqm_config = crate::tqm::TQMConfig::default();
         let tasks = Orchestrator::circuit_output_to_tasks(&output, &tqm_config, 1);
         assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn preflight_xl_output_compatible_with_decomposition() {
+        // Verify that the pre-flight triage output format (stage_outputs with
+        // "plan" containing decomposition) is compatible with extract_sub_tasks.
+        use glitchlab_kernel::agent::AgentMetadata;
+
+        // Simulate the stage_outputs produced by the pre-flight XL path:
+        // architect_triage + plan with decomposition.
+        let triage_data = serde_json::json!({
+            "verdict": "needs_refinement",
+            "task_size": "XL",
+            "sizing_rationale": "too many files",
+            "confidence": 0.9,
+            "reasoning": "too large",
+            "evidence": [],
+            "architectural_notes": "",
+            "suggested_changes": ["decompose"]
+        });
+        let plan_data = serde_json::json!({
+            "steps": [],
+            "files_likely_affected": [],
+            "requires_core_change": false,
+            "risk_level": "medium",
+            "risk_notes": "",
+            "test_strategy": [],
+            "estimated_complexity": "large",
+            "dependencies_affected": false,
+            "public_api_changed": false,
+            "decomposition": [
+                {"id": "xl-part1", "objective": "First half", "depends_on": []},
+                {"id": "xl-part2", "objective": "Second half", "depends_on": ["xl-part1"]}
+            ]
+        });
+
+        let meta = AgentMetadata {
+            agent: "test".into(),
+            model: "test".into(),
+            tokens: 100,
+            cost: 0.01,
+            latency_ms: 50,
+        };
+
+        let mut stage_outputs = HashMap::new();
+        stage_outputs.insert(
+            "architect_triage".into(),
+            AgentOutput {
+                data: triage_data,
+                metadata: meta.clone(),
+                parse_error: false,
+            },
+        );
+        stage_outputs.insert(
+            "plan".into(),
+            AgentOutput {
+                data: plan_data,
+                metadata: meta,
+                parse_error: false,
+            },
+        );
+
+        // extract_sub_tasks should find the sub-tasks from the pre-flight output.
+        let sub_tasks = Orchestrator::extract_sub_tasks("xl-task", 0, &stage_outputs).unwrap();
+        assert_eq!(sub_tasks.len(), 2);
+        assert_eq!(sub_tasks[0].id, "xl-part1");
+        assert_eq!(sub_tasks[0].objective, "First half");
+        assert_eq!(sub_tasks[1].id, "xl-part2");
+        assert_eq!(sub_tasks[1].depends_on, vec!["xl-part1"]);
+        // Sub-tasks should be at depth 1.
+        assert_eq!(sub_tasks[0].decomposition_depth, 1);
+        assert_eq!(sub_tasks[1].decomposition_depth, 1);
     }
 
     #[test]

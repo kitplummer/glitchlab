@@ -592,6 +592,9 @@ impl EngineeringPipeline {
         // objective and go straight to implementation. This saves 6-8k
         // tokens per sub-task.
         let is_sub_task = decomposition_depth > 0;
+        // Leaf beads (id contains '.') are already human-decomposed children
+        // of an epic.  Don't allow the planner to re-decompose them.
+        let is_leaf_bead = task_id.contains('.') && decomposition_depth == 0;
         let mut plan_output;
 
         if is_sub_task {
@@ -635,6 +638,13 @@ impl EngineeringPipeline {
             ctx.stage_outputs.insert("plan".into(), plan_output.clone());
         } else {
             ctx.current_stage = Some("plan".into());
+            if is_leaf_bead {
+                ctx.agent_context.constraints.push(
+                    "This task is a leaf work item (already decomposed by the project owner). \
+                     Do NOT decompose further. Plan a single implementation pass."
+                        .into(),
+                );
+            }
             let planner = PlannerAgent::new(Arc::clone(&self.router));
             plan_output = match planner.execute(&ctx.agent_context).await {
                 Ok(o) => o,
@@ -661,7 +671,8 @@ impl EngineeringPipeline {
 
             if (complexity == "trivial"
                 || complexity == "small"
-                || (complexity == "medium" && file_count <= 3))
+                || (complexity == "medium" && file_count <= 3)
+                || is_leaf_bead)
                 && plan_output
                     .data
                     .get("decomposition")
@@ -669,9 +680,7 @@ impl EngineeringPipeline {
             {
                 warn!(
                     task_id,
-                    complexity,
-                    file_count,
-                    "stripping spurious decomposition from {complexity} task ({file_count} files)"
+                    complexity, file_count, is_leaf_bead, "stripping spurious decomposition"
                 );
                 plan_output
                     .data
@@ -6567,6 +6576,114 @@ mod tests {
         assert_eq!(
             oc.recommendation.as_deref(),
             Some("Decompose to exclude protected paths")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Leaf bead decomposition stripping
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_leaf_bead_strips_decomposition() {
+        // A task with a dot-notation ID (leaf bead) should have any planner
+        // decomposition stripped, regardless of complexity.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — large complexity WITH decomposition
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "impl"}], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "requires_core_change": false, "risk_level": "medium", "risk_notes": "", "test_strategy": [], "estimated_complexity": "large", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "p1", "objective": "part 1"}, {"id": "p2", "objective": "part 2"}]}"#,
+            ),
+            // 2. Implementer — tool use (write_file)
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/a.rs", "content": "pub fn a() {}\n"}),
+            }]),
+            // 3. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/a.rs"], "tests_added": [], "commit_message": "feat: impl", "summary": "done"}"#,
+            ),
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 5;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        // Leaf bead ID: "gl-abc.1" contains a dot at depth 0.
+        let result = pipeline
+            .run(
+                "gl-abc.1",
+                "Test tool-use loop with Ollama",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        // Should NOT be decomposed — leaf bead decomposition was stripped.
+        assert_ne!(
+            result.status,
+            PipelineStatus::Decomposed,
+            "leaf bead should not be decomposed, got {:?}",
+            result.status
+        );
+        // Plan should have decomposition removed.
+        let plan = result.stage_outputs.get("plan").unwrap();
+        assert!(
+            plan.data.get("decomposition").is_none(),
+            "decomposition should have been stripped from leaf bead plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_non_leaf_allows_decomposition() {
+        // A task without dot notation (non-leaf) should preserve decomposition.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — large complexity with decomposition
+            final_response(
+                r#"{"steps": [], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "large", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "sub-1", "description": "sub-task 1"}, {"id": "sub-2", "description": "sub-task 2"}]}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        // Non-leaf ID: "gl-abc" has no dot.
+        let result = pipeline
+            .run(
+                "gl-abc",
+                "Build a complex feature",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        // Decomposition should be preserved — large task, not a leaf bead.
+        assert_eq!(
+            result.status,
+            PipelineStatus::Decomposed,
+            "non-leaf large task should keep decomposition, got {:?}",
+            result.status
         );
     }
 }

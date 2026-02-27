@@ -320,7 +320,9 @@ pub(crate) async fn tool_use_loop(
             }
         }
 
-        if turns >= params.max_turns {
+        // Reserve 1 turn for the forced final JSON call so we don't
+        // exhaust the budget before emitting a summary.
+        if turns >= params.max_turns.saturating_sub(1) {
             warn!(
                 role,
                 turns,
@@ -1121,7 +1123,10 @@ mod tests {
         for i in 0..5 {
             std::fs::write(dir.path().join(format!("f{i}.txt")), format!("data-{i}")).unwrap();
         }
-        let mut responses: Vec<RouterResponse> = (0..3)
+        // With saturating_sub(1) the loop fires at turns >= max_turns - 1,
+        // reserving 1 turn for the forced final JSON call.
+        // max_turns=3 → fires at turn 2, so only 2 tool turns run.
+        let mut responses: Vec<RouterResponse> = (0..2)
             .map(|i| {
                 tool_response(vec![tool_call(
                     &format!("call_{i}"),
@@ -1160,8 +1165,8 @@ mod tests {
         // The forced final call should return a text response (no tool calls).
         assert!(resp.tool_calls.is_empty());
         assert!(resp.content.contains("max turns reached"));
-        // 1 original + 3*(assistant+tool_result) + 1 system nudge = 8
-        assert_eq!(messages.len(), 8);
+        // 1 original + 2*(assistant+tool_result) + 1 system nudge = 6
+        assert_eq!(messages.len(), 6);
     }
 
     #[tokio::test]
