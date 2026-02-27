@@ -325,9 +325,27 @@ pub(crate) async fn tool_use_loop(
                 role,
                 turns,
                 max_turns = params.max_turns,
-                "tool-use loop hit max turns, returning last response"
+                "tool-use loop hit max turns, forcing final response"
             );
-            return Ok(ToolLoopOutcome::Completed(response));
+
+            // Force one last call WITHOUT tools so the model emits its JSON summary
+            // instead of returning a tool-call response as the "final" output.
+            messages.push(Message {
+                role: MessageRole::User,
+                content: MessageContent::Text(
+                    "[SYSTEM] You have used all available tool turns. Do NOT call any more tools. \
+                     Emit your final JSON response NOW based on the work completed so far."
+                        .into(),
+                ),
+            });
+
+            prune_messages(messages, params.context_token_budget);
+
+            let final_response = router
+                .complete(role, messages, params.temperature, params.max_tokens, None)
+                .await?;
+
+            return Ok(ToolLoopOutcome::Completed(final_response));
         }
     }
 }
@@ -1103,7 +1121,7 @@ mod tests {
         for i in 0..5 {
             std::fs::write(dir.path().join(format!("f{i}.txt")), format!("data-{i}")).unwrap();
         }
-        let responses: Vec<RouterResponse> = (0..5)
+        let mut responses: Vec<RouterResponse> = (0..3)
             .map(|i| {
                 tool_response(vec![tool_call(
                     &format!("call_{i}"),
@@ -1112,6 +1130,10 @@ mod tests {
                 )])
             })
             .collect();
+        // Add a final text-only response for the forced summary call.
+        responses.push(final_response(
+            r#"{"files_changed": [], "summary": "max turns reached"}"#,
+        ));
         let router = sequential_router_ref(responses);
         let tool_defs = crate::tools::tool_definitions();
         let mut messages = vec![Message {
@@ -1135,10 +1157,11 @@ mod tests {
             panic!("expected Completed, got Stuck");
         };
 
-        // Should have stopped after 3 turns, returning a response with tool_calls.
-        assert!(!resp.tool_calls.is_empty());
-        // 1 original + 3 * (assistant + tool_result) = 7
-        assert_eq!(messages.len(), 7);
+        // The forced final call should return a text response (no tool calls).
+        assert!(resp.tool_calls.is_empty());
+        assert!(resp.content.contains("max turns reached"));
+        // 1 original + 3*(assistant+tool_result) + 1 system nudge = 8
+        assert_eq!(messages.len(), 8);
     }
 
     #[tokio::test]

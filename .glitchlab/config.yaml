@@ -10,7 +10,7 @@ boundaries:
 
 limits:
   max_tool_turns: 12
-  max_tokens_per_task: 60000
+  max_tokens_per_task: 120000
   max_dollars_per_task: 1.00
   max_total_tasks: 200
   max_remediation_depth: 1
