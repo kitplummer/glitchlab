@@ -66,6 +66,24 @@ impl ModelProfile {
     }
 }
 
+impl fmt::Display for ModelProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut capabilities: Vec<_> = self.capabilities.iter().cloned().collect();
+        capabilities.sort();
+        let capabilities_str = capabilities.join(", ");
+
+        write!(
+            f,
+            "{} (tier: {}, input: ${:.3}/M, output: ${:.3}/M, capabilities: [{}])",
+            self.model_string,
+            self.tier,
+            self.input_cost_per_m,
+            self.output_cost_per_m,
+            capabilities_str
+        )
+    }
+}
+
 /// Per-role requirements for model selection.
 #[derive(Debug, Clone)]
 pub struct RolePreference {
@@ -550,5 +568,24 @@ mod tests {
         assert_eq!(ModelTier::Standard.to_string(), "standard");
         assert_eq!(ModelTier::StandardPlus.to_string(), "standard_plus");
         assert_eq!(ModelTier::Premium.to_string(), "premium");
+    }
+
+    #[test]
+    fn model_profile_display() {
+        let profile = ModelProfile {
+            model_string: "gemini/gemini-2.5-flash".into(),
+            input_cost_per_m: 0.15,
+            output_cost_per_m: 0.60,
+            tier: ModelTier::Standard,
+            capabilities: HashSet::from(["tool_use".into(), "code".into()]),
+        };
+
+        let display_str = profile.to_string();
+        assert!(display_str.contains("gemini/gemini-2.5-flash"));
+        assert!(display_str.contains("standard"));
+        assert!(display_str.contains("0.15"));
+        assert!(display_str.contains("0.60"));
+        assert!(display_str.contains("tool_use"));
+        assert!(display_str.contains("code"));
     }
 }
