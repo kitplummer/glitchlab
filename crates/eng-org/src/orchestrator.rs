@@ -68,9 +68,10 @@ impl CumulativeBudget {
     }
 
     /// Create with a ledger file for persistence.
-    /// Loads existing entries to recover cumulative totals.
+    /// Each invocation starts with a fresh budget — the ledger is append-only
+    /// for historical tracking, not for constraining the current run.
     pub fn with_ledger(limit_dollars: f64, ledger_path: &Path) -> Self {
-        let mut budget = Self {
+        Self {
             limit_dollars,
             total_cost: 0.0,
             total_tokens: 0,
@@ -78,29 +79,6 @@ impl CumulativeBudget {
             ledger_path: Some(ledger_path.to_path_buf()),
             repair_cost: 0.0,
             repair_budget_fraction: 0.20,
-        };
-        budget.load_ledger();
-        budget
-    }
-
-    /// Load existing ledger entries to recover cumulative totals.
-    fn load_ledger(&mut self) {
-        let Some(ref path) = self.ledger_path else {
-            return;
-        };
-        let Ok(contents) = std::fs::read_to_string(path) else {
-            return;
-        };
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<BudgetLedgerEntry>(line) {
-                self.total_cost = entry.cumulative_cost;
-                self.total_tokens = entry.cumulative_tokens;
-                self.total_runs += 1;
-            }
         }
     }
 
@@ -1539,14 +1517,19 @@ mod tests {
             assert!((budget.total_cost() - 7.0).abs() < f64::EPSILON);
         }
 
-        // Reload — should recover cumulative totals.
+        // New session starts fresh — ledger is append-only for history,
+        // not for constraining the current run's budget.
         {
             let budget = CumulativeBudget::with_ledger(100.0, &ledger_path);
-            assert!((budget.total_cost() - 7.0).abs() < f64::EPSILON);
-            assert_eq!(budget.total_tokens(), 70000);
-            assert_eq!(budget.total_runs(), 2);
-            assert!((budget.remaining_dollars() - 93.0).abs() < f64::EPSILON);
+            assert!((budget.total_cost() - 0.0).abs() < f64::EPSILON);
+            assert_eq!(budget.total_tokens(), 0);
+            assert_eq!(budget.total_runs(), 0);
+            assert!((budget.remaining_dollars() - 100.0).abs() < f64::EPSILON);
         }
+
+        // Ledger file should still contain the entries from the first session.
+        let contents = std::fs::read_to_string(&ledger_path).unwrap();
+        assert_eq!(contents.lines().count(), 2);
     }
 
     #[test]
@@ -1579,9 +1562,11 @@ mod tests {
         )
         .unwrap();
 
+        // Each session starts fresh — pre-existing ledger entries are
+        // historical records and don't affect the current budget.
         let budget = CumulativeBudget::with_ledger(50.0, &ledger_path);
-        assert!((budget.total_cost() - 1.0).abs() < f64::EPSILON);
-        assert_eq!(budget.total_tokens(), 1000);
+        assert!((budget.total_cost() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(budget.total_tokens(), 0);
     }
 
     #[test]

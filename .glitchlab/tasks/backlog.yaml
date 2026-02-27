@@ -30,10 +30,9 @@ tasks:
     `.to_string()`. The enum starts around line 113. Use `read_file` to read
     lines 110-132.
   priority: 20
-  status: failed
+  status: pending
   depends_on: []
   decomposition_depth: 0
-  error: 'implementer failed: repeated_results'
   remediation_depth: 0
   is_remediation: false
 - id: display-failure-category
@@ -82,10 +81,9 @@ tasks:
     produce the expected string via `.to_string()`. The enum starts around
     line 365. Use `read_file` to read lines 363-371.
   priority: 50
-  status: failed
+  status: pending
   depends_on: []
   decomposition_depth: 0
-  error: 'budget exceeded: token limit exceeded: 150763 / 120000 tokens used'
   remediation_depth: 0
   is_remediation: false
 - id: config-limits-validation
@@ -202,10 +200,9 @@ tasks:
     "standard"`, `Premium.to_string() == "premium"`. The enum and its Display
     impl start around line 20. Use `read_file` to read lines 18-50.
   priority: 160
-  status: failed
+  status: pending
   depends_on: []
   decomposition_depth: 0
-  error: 'budget exceeded: token limit exceeded: 123769 / 120000 tokens used'
   remediation_depth: 0
   is_remediation: false
 - id: config-docs-yaml-comments
@@ -285,10 +282,9 @@ tasks:
     These are async tests — use `#[tokio::test]`. The function starts around
     line 210. Use `read_file` to read lines 208-270.
   priority: 260
-  status: failed
+  status: pending
   depends_on: []
   decomposition_depth: 0
-  error: 'implementer failed: parse_error'
   remediation_depth: 0
   is_remediation: false
 - id: test-cumulative-budget
