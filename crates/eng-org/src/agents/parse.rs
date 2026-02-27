@@ -120,6 +120,7 @@ fn strip_code_fences(s: &str) -> String {
 /// Fix common JSON issues that LLMs produce:
 /// - Trailing commas before `}` or `]`
 /// - Literal newlines inside string values (replace with `\n`)
+/// - Line and block comments (`//...` and `/*...* /`)
 fn sanitize_json(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
@@ -163,6 +164,35 @@ fn sanitize_json(s: &str) -> String {
             result.push(chars[i]);
             i += 1;
             continue;
+        }
+
+        // Outside a string, check for comments.
+        if chars[i] == '/' {
+            // Line comment
+            if i + 1 < chars.len() && chars[i + 1] == '/' {
+                i += 2;
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                // Skip the newline as well, if it exists
+                if i < chars.len() && chars[i] == '\n' {
+                    result.push('\n'); // Keep the newline for line numbers
+                    i += 1;
+                }
+                continue;
+            }
+            // Block comment
+            if i + 1 < chars.len() && chars[i + 1] == '*' {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                // Skip the closing */
+                if i + 1 < chars.len() {
+                    i += 2;
+                }
+                continue;
+            }
         }
 
         // Outside a string: check for trailing comma.
@@ -515,6 +545,63 @@ mod tests {
         let result = sanitize_json(input);
         // Already-escaped \n should be preserved as-is.
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn parse_json_with_line_comments() {
+        let raw = r#"{
+            // The verdict
+            "verdict": "pass", // pass is good
+            "issues": []
+        }"#;
+        let meta = test_meta();
+        let output = parse_json_response(raw, meta, serde_json::json!({}));
+        assert!(!output.parse_error, "failed with raw: {}", raw);
+        assert_eq!(output.data["verdict"], "pass");
+    }
+
+    #[test]
+    fn parse_json_with_block_comments() {
+        let raw = r#"{
+            /* The verdict */
+            "verdict": "pass",
+            "issues": [/* none */]
+        }"#;
+        let meta = test_meta();
+        let output = parse_json_response(raw, meta, serde_json::json!({}));
+        assert!(!output.parse_error, "failed with raw: {}", raw);
+        assert_eq!(output.data["verdict"], "pass");
+        assert!(output.data["issues"].is_array());
+    }
+
+    #[test]
+    fn sanitize_json_removes_line_comments() {
+        let input = r#"{
+            // comment
+            "a": 1, // another
+            "b": 2
+        }"#;
+        let result = sanitize_json(input);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["a"], 1);
+        assert!(parsed.get("comment").is_none());
+    }
+
+    #[test]
+    fn sanitize_json_removes_block_comments() {
+        let input = r#"{"a": 1, /* comment */ "b": 2}"#;
+        let result = sanitize_json(input);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["b"], 2);
+    }
+
+    #[test]
+    fn sanitize_json_preserves_comment_like_strings() {
+        let input = r#"{"url": "http://example.com", "msg": "/* not a comment */"}"#;
+        let result = sanitize_json(input);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["url"], "http://example.com");
+        assert_eq!(parsed["msg"], "/* not a comment */");
     }
 
     fn test_meta() -> AgentMetadata {
