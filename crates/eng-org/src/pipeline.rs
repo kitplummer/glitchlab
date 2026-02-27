@@ -200,7 +200,13 @@ impl ExternalOps for RealExternalOps {
                 .map_err(|e| format!("gh pr create: {e}"))?;
 
             if output.status.success() {
-                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                let pr_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let pr_number = pr_url.split('/').next_back().unwrap_or("unknown");
+                info!(
+                    "pr_created: Successfully created PR {} ({})",
+                    pr_number, pr_url
+                );
+                Ok(pr_url)
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 Err(format!("gh pr create failed: {stderr}"))
