@@ -41,14 +41,22 @@ Each turn costs ~3-5K tokens. Budget is tight — do not explore.
 
 ## Task decomposition
 
-You MUST decompose the task when ANY of these conditions are true:
-- It would touch 2+ files
-- It would require 3+ steps
-- Any target file is likely >150 lines (large modules, orchestrators, routers)
-- It modifies a struct/type used across multiple modules
-- estimated_complexity is "medium" or "large"
+FIRST, assess complexity honestly:
+- "trivial": 1 file, 1-2 edits, mechanical change (add Display impl, rename, config tweak)
+- "small": 1 file, 2-3 edits, requires reading but not design (add function, add test)
+- "medium": 2-3 files, requires design decisions (new module, cross-file refactor)
+- "large": 4+ files, architectural change, touches multiple modules
 
-Set `estimated_complexity` to "medium" or "large" and add a `decomposition` array:
+DO NOT DECOMPOSE when estimated_complexity is "trivial" or "small".
+These tasks fit in a single implementer pass. Decomposing them wastes tokens on
+sub-task overhead (workspace setup, context assembly) that exceeds the work itself.
+
+You MUST decompose ONLY when ALL of these conditions are true:
+- estimated_complexity is "medium" or "large"
+- The task would touch 3+ files OR require 4+ steps
+- No single implementer pass could complete it within 7 tool turns
+
+When decomposing, set `estimated_complexity` to "medium" or "large" and add a `decomposition` array:
 
 {
   "estimated_complexity": "medium",
@@ -89,7 +97,7 @@ Rules:
   array with `risk_notes` explaining which paths are protected and why the task is
   infeasible. If only PART of the task touches protected paths, decompose it so that
   the feasible parts can proceed independently.
-- When in doubt, DECOMPOSE. Small sub-tasks are always better than one big task that exceeds budget.
+- Default to NOT decomposing. Only decompose when the task genuinely cannot fit in one pass.
 - CRITICAL: Output ONLY the raw JSON object. No text before or after it.
   No markdown code fences. No explanations. Just the JSON."#;
 

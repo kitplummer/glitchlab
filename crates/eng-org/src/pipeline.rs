@@ -622,6 +622,27 @@ impl EngineeringPipeline {
             ctx.stage_outputs.insert("plan".into(), plan_output.clone());
 
             // --- Stage 3b: Check for decomposition ---
+            // Guard: strip spurious decomposition from trivial/small tasks.
+            // The planner sometimes decomposes tasks that don't need it.
+            let complexity = plan_output.data["estimated_complexity"]
+                .as_str()
+                .unwrap_or("unknown");
+            if (complexity == "trivial" || complexity == "small")
+                && plan_output
+                    .data
+                    .get("decomposition")
+                    .is_some_and(|d| d.is_array())
+            {
+                warn!(
+                    task_id,
+                    complexity, "stripping spurious decomposition from trivial/small task"
+                );
+                plan_output
+                    .data
+                    .as_object_mut()
+                    .map(|o| o.remove("decomposition"));
+            }
+
             if plan_output
                 .data
                 .get("decomposition")
@@ -3533,7 +3554,7 @@ mod tests {
         let responses = vec![
             // 1. Planner — returns a decomposition array
             final_response(
-                r#"{"steps": [], "files_likely_affected": [], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "sub-1", "description": "sub-task 1"}, {"id": "sub-2", "description": "sub-task 2"}]}"#,
+                r#"{"steps": [], "files_likely_affected": [], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "medium", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "sub-1", "description": "sub-task 1"}, {"id": "sub-2", "description": "sub-task 2"}]}"#,
             ),
         ];
         let router = sequential_router_ref(responses);
