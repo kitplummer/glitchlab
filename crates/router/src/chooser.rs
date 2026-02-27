@@ -212,6 +212,48 @@ impl ModelChooser {
             .next()
     }
 
+    /// Select an ordered list of models for a role, from cheapest to most expensive.
+    ///
+    /// This is used to provide a fallback chain to the caller. The logic is identical
+    /// to `select` but it returns all eligible models instead of just the first.
+    pub fn select_with_fallbacks(
+        &self,
+        role: &str,
+        budget_remaining_dollars: f64,
+        max_budget: f64,
+    ) -> Vec<ModelProfile> {
+        let pref = self.role_preferences.get(role).cloned().unwrap_or_default();
+
+        // Compute budget pressure: 1.0 when fully spent, 0.0 when full budget remains.
+        let budget_pressure = if max_budget > 0.0 {
+            (1.0 - (budget_remaining_dollars / max_budget)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Determine effective minimum tier.
+        let effective_min_tier = if budget_pressure > self.cost_quality_threshold {
+            pref.min_tier.downgrade()
+        } else {
+            pref.min_tier
+        };
+
+        // Models are pre-sorted by cost ascending.
+        self.models
+            .iter()
+            .filter(|m| {
+                // Must meet tier requirement.
+                m.tier >= effective_min_tier
+                    // Must have all required capabilities.
+                    && pref
+                        .required_capabilities
+                        .iter()
+                        .all(|cap| m.capabilities.contains(cap))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Look up the tier for a model string. Returns `None` if unknown.
     pub fn tier_of(&self, model_string: &str) -> Option<ModelTier> {
         self.models
@@ -613,5 +655,22 @@ mod tests {
 
         // Test inequality - different capabilities
         assert_ne!(pref1, pref4);
+    }
+
+    #[test]
+    fn select_with_fallbacks_returns_ordered_list() {
+        let chooser = test_chooser(0.7);
+        // Planner has min_tier=Standard, plenty of budget.
+        // Should return Standard and Premium models, ordered by cost.
+        let fallbacks = chooser.select_with_fallbacks("planner", 10.0, 10.0);
+        let model_names: Vec<String> = fallbacks.iter().map(|m| m.model_string.clone()).collect();
+
+        assert_eq!(
+            model_names,
+            vec![
+                "gemini/gemini-2.5-flash".to_string(),
+                "anthropic/claude-sonnet-4-20250514".to_string()
+            ]
+        );
     }
 }
