@@ -45,11 +45,11 @@ Assign exactly one size:
 
 - **S** (15K tokens, 3 tool turns): 1 file, ≤2 edits, mechanical change
   (doc, comment, rename, config tweak, single-line fix)
-- **M** (35K tokens, 7 tool turns): 1-2 files, ≤4 edits, requires understanding
+- **M** (50K tokens, 9 tool turns): 1-3 files, ≤4 edits, requires understanding
   but not design (bug fix, add function, add test, small refactor)
 - **L** (60K tokens, 12 tool turns): 2-3 files, requires design decisions
   (new module, trait impl, cross-file refactor)
-- **XL** (too large): 4+ files, OR architectural change, OR touches >3 modules
+- **XL** (too large): 5+ files, OR architectural change, OR touches >3 modules
   → MUST return verdict "needs_refinement" with `suggested_changes` requesting
   decomposition into S/M/L sub-tasks
 

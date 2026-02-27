@@ -628,12 +628,20 @@ impl EngineeringPipeline {
             ctx.stage_outputs.insert("plan".into(), plan_output.clone());
 
             // --- Stage 3b: Check for decomposition ---
-            // Guard: strip spurious decomposition from trivial/small tasks.
-            // The planner sometimes decomposes tasks that don't need it.
+            // Guard: strip spurious decomposition from tasks that don't need it.
+            // The planner sometimes decomposes trivial/small tasks, or medium
+            // tasks that touch ≤3 files (within a single implementer pass).
             let complexity = plan_output.data["estimated_complexity"]
                 .as_str()
                 .unwrap_or("unknown");
-            if (complexity == "trivial" || complexity == "small")
+            let file_count = plan_output.data["files_likely_affected"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+
+            if (complexity == "trivial"
+                || complexity == "small"
+                || (complexity == "medium" && file_count <= 3))
                 && plan_output
                     .data
                     .get("decomposition")
@@ -641,12 +649,16 @@ impl EngineeringPipeline {
             {
                 warn!(
                     task_id,
-                    complexity, "stripping spurious decomposition from trivial/small task"
+                    complexity,
+                    file_count,
+                    "stripping spurious decomposition from {complexity} task ({file_count} files)"
                 );
                 plan_output
                     .data
                     .as_object_mut()
                     .map(|o| o.remove("decomposition"));
+                // Update the stored plan output so downstream code sees the stripped version.
+                ctx.stage_outputs.insert("plan".into(), plan_output.clone());
             }
 
             if plan_output
@@ -1024,8 +1036,34 @@ impl EngineeringPipeline {
         let mut impl_output = match implementer.execute(&ctx.agent_context).await {
             Ok(o) => o,
             Err(e) => {
+                let err_str = e.to_string();
+                let obstacle =
+                    if err_str.contains("budget exceeded") || err_str.contains("budget_exceeded") {
+                        glitchlab_kernel::outcome::ObstacleKind::ModelLimitation {
+                            model: "unknown".into(),
+                            error_class: "budget_exceeded".into(),
+                        }
+                    } else {
+                        glitchlab_kernel::outcome::ObstacleKind::ModelLimitation {
+                            model: "unknown".into(),
+                            error_class: err_str.clone(),
+                        }
+                    };
                 return self
-                    .fail(ctx, PipelineStatus::ImplementationFailed, e.to_string())
+                    .fail_with_context(
+                        ctx,
+                        PipelineStatus::ImplementationFailed,
+                        err_str,
+                        Some(OutcomeContext {
+                            approach: "direct implementation".into(),
+                            obstacle,
+                            discoveries: vec![],
+                            recommendation: Some(
+                                "Try a different implementation approach or simpler plan".into(),
+                            ),
+                            files_explored: vec![],
+                        }),
+                    )
                     .await;
             }
         };
@@ -1049,10 +1087,19 @@ impl EngineeringPipeline {
             // TQM can detect them without relying on error-string matching.
             if reason == "boundary_violation" {
                 return self
-                    .fail(
+                    .fail_with_context(
                         ctx,
                         PipelineStatus::BoundaryViolation,
                         format!("implementer hit protected path: {reason}"),
+                        Some(OutcomeContext {
+                            approach: "direct implementation".into(),
+                            obstacle: glitchlab_kernel::outcome::ObstacleKind::ArchitecturalGap {
+                                description: format!("protected path: {reason}"),
+                            },
+                            discoveries: vec![],
+                            recommendation: Some("Decompose to exclude protected paths".into()),
+                            files_explored: vec![],
+                        }),
                     )
                     .await;
             }
@@ -1106,33 +1153,74 @@ impl EngineeringPipeline {
                         }
                         _ => {
                             // Escalation retry also failed.
+                            let raw_snippet: String =
+                                impl_output.data.to_string().chars().take(200).collect();
                             return self
-                                .fail(
+                                .fail_with_context(
                                     ctx,
                                     PipelineStatus::ParseError,
                                     format!(
                                         "implementer failed: parse_error (escalation to {escalated_model} also failed)"
                                     ),
+                                    Some(OutcomeContext {
+                                        approach: "direct implementation".into(),
+                                        obstacle:
+                                            glitchlab_kernel::outcome::ObstacleKind::ParseFailure {
+                                                model: escalated_model.clone(),
+                                                raw_snippet,
+                                            },
+                                        discoveries: vec![],
+                                        recommendation: Some(
+                                            "Use a different model or simplify the task".into(),
+                                        ),
+                                        files_explored: vec![],
+                                    }),
                                 )
                                 .await;
                         }
                     }
                 } else {
                     // No escalated model available.
+                    let raw_snippet: String =
+                        impl_output.data.to_string().chars().take(200).collect();
                     return self
-                        .fail(
+                        .fail_with_context(
                             ctx,
                             PipelineStatus::ParseError,
                             format!("implementer failed: {reason}"),
+                            Some(OutcomeContext {
+                                approach: "direct implementation".into(),
+                                obstacle: glitchlab_kernel::outcome::ObstacleKind::ParseFailure {
+                                    model: impl_output.metadata.model.clone(),
+                                    raw_snippet,
+                                },
+                                discoveries: vec![],
+                                recommendation: Some(
+                                    "Use a different model or simplify the task".into(),
+                                ),
+                                files_explored: vec![],
+                            }),
                         )
                         .await;
                 }
             } else {
                 return self
-                    .fail(
+                    .fail_with_context(
                         ctx,
                         PipelineStatus::ImplementationFailed,
                         format!("implementer failed: {reason}"),
+                        Some(OutcomeContext {
+                            approach: "direct implementation".into(),
+                            obstacle: glitchlab_kernel::outcome::ObstacleKind::ModelLimitation {
+                                model: impl_output.metadata.model.clone(),
+                                error_class: reason.to_string(),
+                            },
+                            discoveries: vec![],
+                            recommendation: Some(
+                                "Try a different implementation approach or simpler plan".into(),
+                            ),
+                            files_explored: vec![],
+                        }),
                     )
                     .await;
             }
@@ -1170,11 +1258,26 @@ impl EngineeringPipeline {
                         );
 
                         if fix_attempts >= max_fixes {
+                            let test_error_snippet = truncate(&test_output, 500);
                             return self
-                                .fail(
+                                .fail_with_context(
                                     ctx,
                                     PipelineStatus::TestsFailed,
                                     format!("tests failing after {max_fixes} fix attempts"),
+                                    Some(OutcomeContext {
+                                        approach: "direct implementation".into(),
+                                        obstacle:
+                                            glitchlab_kernel::outcome::ObstacleKind::TestFailure {
+                                                attempts: fix_attempts,
+                                                last_error: test_error_snippet,
+                                            },
+                                        discoveries: vec![],
+                                        recommendation: Some(
+                                            "Check test expectations or simplify the implementation"
+                                                .into(),
+                                        ),
+                                        files_explored: vec![],
+                                    }),
                                 )
                                 .await;
                         }
@@ -3647,7 +3750,7 @@ mod tests {
         let responses = vec![
             // 1. Planner — returns a decomposition array
             final_response(
-                r#"{"steps": [], "files_likely_affected": [], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "medium", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "sub-1", "description": "sub-task 1"}, {"id": "sub-2", "description": "sub-task 2"}]}"#,
+                r#"{"steps": [], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "large", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "sub-1", "description": "sub-task 1"}, {"id": "sub-2", "description": "sub-task 2"}]}"#,
             ),
         ];
         let router = sequential_router_ref(responses);
@@ -6142,6 +6245,225 @@ mod tests {
             summary.tokens_remaining <= 66_000,
             "short-circuit should use ~M budget (65k + overhead), got remaining: {}",
             summary.tokens_remaining
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_medium_3_files_strips_decomposition() {
+        // Medium complexity with 3 files + decomposition → decomposition stripped,
+        // proceeds to implementation (short-circuit eligible).
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — medium complexity, 3 files, with decomposition
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "edit a"}, {"step_number": 2, "description": "edit b"}], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs"], "requires_core_change": false, "risk_level": "medium", "risk_notes": "", "test_strategy": [], "estimated_complexity": "medium", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "p1", "objective": "part 1"}, {"id": "p2", "objective": "part 2"}]}"#,
+            ),
+            // 2. Implementer — tool use (write_file)
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/a.rs", "content": "pub fn a() {}\n"}),
+            }]),
+            // 3. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/a.rs"], "tests_added": [], "commit_message": "feat: add a", "summary": "done"}"#,
+            ),
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 3;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-med-3files",
+                "Refactor across 3 files",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        // Should NOT be decomposed — decomposition was stripped.
+        assert_ne!(
+            result.status,
+            PipelineStatus::Decomposed,
+            "medium task with ≤3 files should not be decomposed, got {:?}",
+            result.status
+        );
+        // Plan should have decomposition removed.
+        let plan = result.stage_outputs.get("plan").unwrap();
+        assert!(
+            plan.data.get("decomposition").is_none(),
+            "decomposition should have been stripped from medium/3-file plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_medium_4_files_keeps_decomposition() {
+        // Medium complexity with 4 files + decomposition → decomposition preserved.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — medium complexity, 4 files, with decomposition
+            final_response(
+                r#"{"steps": [], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "requires_core_change": false, "risk_level": "medium", "risk_notes": "", "test_strategy": [], "estimated_complexity": "medium", "dependencies_affected": false, "public_api_changed": false, "decomposition": [{"id": "p1", "objective": "part 1"}, {"id": "p2", "objective": "part 2"}]}"#,
+            ),
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-med-4files",
+                "Refactor across 4 files",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::Decomposed,
+            "medium task with 4 files should keep decomposition, got {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_implementation_failure_has_outcome_context() {
+        // When the implementer returns an error, the pipeline should produce
+        // an OutcomeContext with a ModelLimitation obstacle.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — trivial task (short-circuit eligible)
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Implementer — returns stuck/parse_error with no escalation
+            //    (mock router doesn't support escalation by default)
+            final_response(
+                r#"{"stuck": true, "stuck_reason": "stuck_loop", "files_changed": [], "summary": "got stuck"}"#,
+            ),
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 2;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-impl-failure",
+                "Add feature",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::ImplementationFailed);
+        assert!(
+            result.outcome_context.is_some(),
+            "implementation failure should produce OutcomeContext"
+        );
+        let oc = result.outcome_context.unwrap();
+        assert_eq!(oc.approach, "direct implementation");
+        assert!(oc.recommendation.is_some());
+        match &oc.obstacle {
+            glitchlab_kernel::outcome::ObstacleKind::ModelLimitation { .. } => {}
+            other => panic!("expected ModelLimitation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_boundary_violation_has_outcome_context() {
+        // When the implementer hits a boundary violation, the pipeline should
+        // produce an OutcomeContext with an ArchitecturalGap obstacle.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — trivial task (short-circuit eligible)
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "edit protected", "files": ["src/lib.rs"], "action": "modify"}], "files_likely_affected": ["src/lib.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Implementer — boundary violation
+            final_response(
+                r#"{"stuck": true, "stuck_reason": "boundary_violation", "files_changed": [], "summary": "hit protected path"}"#,
+            ),
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 2;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-boundary",
+                "Edit protected file",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::BoundaryViolation);
+        assert!(
+            result.outcome_context.is_some(),
+            "boundary violation should produce OutcomeContext"
+        );
+        let oc = result.outcome_context.unwrap();
+        match &oc.obstacle {
+            glitchlab_kernel::outcome::ObstacleKind::ArchitecturalGap { description } => {
+                assert!(
+                    description.contains("protected path"),
+                    "expected 'protected path' in description, got: {description}"
+                );
+            }
+            other => panic!("expected ArchitecturalGap, got {other:?}"),
+        }
+        assert_eq!(
+            oc.recommendation.as_deref(),
+            Some("Decompose to exclude protected paths")
         );
     }
 }

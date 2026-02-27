@@ -35,7 +35,7 @@ Output schema:
 
 ## Token budget constraint
 
-The implementer has a STRICT budget of ~30K tokens per sub-task (~5-7 tool turns).
+The implementer has a STRICT budget of ~50K tokens per task (~9 tool turns).
 A single file read costs 1-3K tokens. A test + build cycle costs 3-5K tokens.
 Each turn costs ~3-5K tokens. Budget is tight — do not explore.
 
@@ -53,8 +53,8 @@ sub-task overhead (workspace setup, context assembly) that exceeds the work itse
 
 You MUST decompose ONLY when ALL of these conditions are true:
 - estimated_complexity is "medium" or "large"
-- The task would touch 3+ files OR require 4+ steps
-- No single implementer pass could complete it within 7 tool turns
+- The task would touch 4+ files AND require 5+ steps
+- No single implementer pass could complete it within 9 tool turns
 
 When decomposing, set `estimated_complexity` to "medium" or "large" and add a `decomposition` array:
 
@@ -81,7 +81,7 @@ When decomposing, set `estimated_complexity` to "medium" or "large" and add a `d
 Each sub-task MUST:
 - Touch at most 1-2 files
 - Require at most 2-3 edits
-- Be completable within ~7 tool turns
+- Be completable within ~9 tool turns
 - Include specific file paths and line-range hints (e.g. "lines 200-250")
 - Include `files_likely_affected` listing the exact files it will touch
 

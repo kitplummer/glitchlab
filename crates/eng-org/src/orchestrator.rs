@@ -1163,6 +1163,14 @@ impl Orchestrator {
                 save_context: true,
                 track_attempt: false,
             },
+            PipelineStatus::ImplementationFailed
+            | PipelineStatus::TestsFailed
+            | PipelineStatus::BoundaryViolation => OutcomeRouting {
+                task_status: TaskStatus::Failed,
+                counter: OutcomeCounter::Failed,
+                save_context: true,
+                track_attempt: true,
+            },
             _ => OutcomeRouting {
                 task_status: TaskStatus::Failed,
                 counter: OutcomeCounter::Failed,
@@ -2539,8 +2547,8 @@ mod tests {
         let routing = Orchestrator::route_outcome(&pr);
         assert_eq!(routing.task_status, TaskStatus::Failed);
         assert_eq!(routing.counter, OutcomeCounter::Failed);
-        assert!(!routing.save_context);
-        assert!(!routing.track_attempt);
+        assert!(routing.save_context);
+        assert!(routing.track_attempt);
     }
 
     #[test]
@@ -2557,6 +2565,18 @@ mod tests {
         let routing = Orchestrator::route_outcome(&pr);
         assert_eq!(routing.task_status, TaskStatus::Failed);
         assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert!(routing.save_context);
+        assert!(routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_boundary_violation_tracks_context() {
+        let pr = make_pipeline_result(PipelineStatus::BoundaryViolation);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Failed);
+        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert!(routing.save_context);
+        assert!(routing.track_attempt);
     }
 
     #[test]
