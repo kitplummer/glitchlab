@@ -65,6 +65,13 @@ pub enum ObstacleKind {
     /// LLM output couldn't be parsed into the expected schema.
     ParseFailure { model: String, raw_snippet: String },
 
+    /// LLM output is valid JSON but doesn't match the expected schema.
+    SchemaMismatch {
+        model: String,
+        expected_schema: String,
+        validation_error: String,
+    },
+
     /// Catch-all for unclassified obstacles.
     Unknown { detail: String },
 }
@@ -193,6 +200,28 @@ mod tests {
             ObstacleKind::ParseFailure { model, raw_snippet } => {
                 assert_eq!(model, "claude-3");
                 assert_eq!(raw_snippet, "not json {");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn obstacle_schema_mismatch_serde() {
+        let o = ObstacleKind::SchemaMismatch {
+            model: "claude-3".into(),
+            expected_schema: "TaskPlan".into(),
+            validation_error: "missing required field 'steps'".into(),
+        };
+        let parsed = roundtrip(&o);
+        match parsed {
+            ObstacleKind::SchemaMismatch {
+                model,
+                expected_schema,
+                validation_error,
+            } => {
+                assert_eq!(model, "claude-3");
+                assert_eq!(expected_schema, "TaskPlan");
+                assert_eq!(validation_error, "missing required field 'steps'");
             }
             _ => panic!("wrong variant"),
         }
