@@ -6,6 +6,8 @@ pub enum ErrorCategory {
     ProviderInternal,
     /// The error is due to a network issue.
     Network,
+    /// The error is transient and retryable, warranting model cascade fallback.
+    TransientRetryable,
     /// The error is due to an unknown or unhandled issue.
     Unknown,
 }
@@ -21,9 +23,23 @@ pub struct ProviderDiagnostic {
 
 pub fn classify_error(status_code: Option<u16>) -> ErrorCategory {
     match status_code {
+        // Transient retryable errors that warrant model cascade fallback
+        Some(307) => ErrorCategory::TransientRetryable, // Temporary Redirect
+        Some(408) => ErrorCategory::TransientRetryable, // Request Timeout
+        Some(429) => ErrorCategory::TransientRetryable, // Too Many Requests (Rate Limit)
+        Some(503) => ErrorCategory::TransientRetryable, // Service Unavailable
+        Some(504) => ErrorCategory::TransientRetryable, // Gateway Timeout
+
+        // Other 4xx errors are bad requests
         Some(code) if (400..=499).contains(&code) => ErrorCategory::BadRequest,
+
+        // Other 5xx errors are provider internal issues
         Some(code) if (500..=599).contains(&code) => ErrorCategory::ProviderInternal,
+
+        // No status code indicates network issues
         None => ErrorCategory::Network,
+
+        // Everything else is unknown
         _ => ErrorCategory::Unknown,
     }
 }
@@ -57,6 +73,10 @@ mod tests {
             "ProviderInternal"
         );
         assert_eq!(format!("{:?}", ErrorCategory::Network), "Network");
+        assert_eq!(
+            format!("{:?}", ErrorCategory::TransientRetryable),
+            "TransientRetryable"
+        );
         assert_eq!(format!("{:?}", ErrorCategory::Unknown), "Unknown");
     }
 
@@ -85,8 +105,8 @@ mod tests {
         );
         assert_eq!(
             classify_error(Some(503)),
-            ErrorCategory::ProviderInternal,
-            "Status code 503 should be ProviderInternal"
+            ErrorCategory::TransientRetryable,
+            "Status code 503 should be TransientRetryable"
         );
         assert_eq!(
             classify_error(Some(599)),
@@ -114,6 +134,44 @@ mod tests {
             classify_error(Some(101)),
             ErrorCategory::Unknown,
             "Status code 101 should be Unknown"
+        );
+    }
+
+    #[test]
+    fn test_transient_retryable_errors() {
+        // Rate limiting
+        assert_eq!(
+            classify_error(Some(429)),
+            ErrorCategory::TransientRetryable,
+            "Status code 429 (rate limit) should be TransientRetryable"
+        );
+
+        // Service unavailable
+        assert_eq!(
+            classify_error(Some(503)),
+            ErrorCategory::TransientRetryable,
+            "Status code 503 (service unavailable) should be TransientRetryable"
+        );
+
+        // Gateway timeout
+        assert_eq!(
+            classify_error(Some(504)),
+            ErrorCategory::TransientRetryable,
+            "Status code 504 (gateway timeout) should be TransientRetryable"
+        );
+
+        // Temporary redirect
+        assert_eq!(
+            classify_error(Some(307)),
+            ErrorCategory::TransientRetryable,
+            "Status code 307 (temporary redirect) should be TransientRetryable"
+        );
+
+        // Request timeout
+        assert_eq!(
+            classify_error(Some(408)),
+            ErrorCategory::TransientRetryable,
+            "Status code 408 (request timeout) should be TransientRetryable"
         );
     }
 }
