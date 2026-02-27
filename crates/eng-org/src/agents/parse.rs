@@ -517,6 +517,17 @@ mod tests {
         assert_eq!(result, input);
     }
 
+    #[test]
+    fn parse_malformed_json_fails_gracefully() {
+        // This JSON is malformed because the string "world" is not quoted.
+        let raw = r#"{"hello": world}"#;
+        let meta = test_meta();
+        let fallback = serde_json::json!({"fallback": true});
+        let output = parse_json_response(raw, meta, fallback.clone());
+        assert!(output.parse_error);
+        assert_eq!(output.data, fallback);
+    }
+
     fn test_meta() -> AgentMetadata {
         AgentMetadata {
             agent: "test".into(),
