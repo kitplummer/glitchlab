@@ -1,0 +1,240 @@
+tasks:
+- id: canary-size-s-display-model-profile
+  objective: |
+    Add a `Display` trait implementation for the `ModelProfile` struct in
+    `crates/router/src/chooser.rs`. The struct has fields `model: String`,
+    `tier: ModelTier`, and `capabilities: Vec<String>`. Display should output
+    a compact human-readable format: `"{model} ({tier})"`, e.g.
+    `"gemini/gemini-2.5-flash (standard)"`. Add a unit test in the existing
+    `#[cfg(test)]` block that constructs a `ModelProfile` and verifies
+    `.to_string()` output. This is a single-file, ≤2-edit mechanical change.
+    Use `read_file` to read lines 1-60 of `chooser.rs`.
+  priority: 10
+  status: failed
+  depends_on: []
+  decomposition_depth: 0
+  error: 'budget exceeded: token limit exceeded: 17778 / 15000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
+- id: canary-size-m-role-preference-derives
+  objective: |
+    Add `Display`, `PartialEq`, and `Eq` derives/impls for the
+    `RolePreference` struct in `crates/router/src/chooser.rs`. The struct
+    has `min_tier: ModelTier` and `requires: Vec<String>`. Display format:
+    `"min_tier={tier}, requires=[{caps}]"` e.g. `"min_tier=standard,
+    requires=[tool_use, code]"`. Derive `PartialEq` and `Eq`. Add 2-3 unit
+    tests: (1) Display with capabilities, (2) Display with empty requires,
+    (3) PartialEq equality and inequality. This is a 1-file, ~4-edit change.
+    Use `read_file` to read lines 60-120 of `chooser.rs`.
+  priority: 10
+  status: failed
+  depends_on: []
+  decomposition_depth: 0
+  error: 'budget exceeded: token limit exceeded: 21868 / 15000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
+- id: canary-size-l-provider-error-diagnostics
+  objective: |
+    Extract provider error diagnostics into a new module
+    `crates/router/src/provider_diagnostics.rs`. Create a
+    `ProviderDiagnostic` struct with fields: `provider: String`,
+    `error_code: Option<u16>`, `category: ErrorCategory`, `retryable: bool`,
+    `message: String`. Add an `ErrorCategory` enum with variants:
+    `RateLimit`, `AuthFailure`, `ModelNotFound`, `ContentFilter`,
+    `ServerError`, `Unknown`. Add a `classify_error(provider: &str,
+    status: u16, body: &str) -> ProviderDiagnostic` function that maps
+    HTTP status codes to categories (429→RateLimit, 401/403→AuthFailure,
+    404→ModelNotFound, 500-599→ServerError, etc.). Add the module to
+    `crates/router/src/lib.rs`. Add comprehensive unit tests covering all
+    status code mappings and edge cases. This is a 2-file, design-required
+    change (new module + lib.rs registration).
+  priority: 10
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+- id: canary-size-xl-router-instrumentation
+  objective: |
+    Add comprehensive tracing instrumentation to the Router and ModelChooser.
+    Changes span 4+ files:
+    (1) `crates/router/src/router.rs` — add `tracing::info_span!` to
+    `chat()`, `chat_with_tools()`, and `resize_budget()` with fields for
+    model, role, token count, cost, latency_ms.
+    (2) `crates/router/src/chooser.rs` — add `tracing::debug!` to
+    `choose_for_role()` logging candidate models, selected model, and
+    rejection reasons.
+    (3) `crates/router/src/budget.rs` — add `tracing::info!` to `record()`
+    logging cumulative spend vs limit, and `tracing::warn!` when remaining
+    budget drops below 20%.
+    (4) `crates/router/src/lib.rs` — re-export a new `RouterMetrics` struct
+    that aggregates call count, total tokens, total cost, average latency.
+    (5) Add unit tests for `RouterMetrics` in a new test module.
+    This is an XL task (5 files, cross-cutting concern) and SHOULD be
+    decomposed by the triage agent into smaller sub-tasks.
+  priority: 10
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+- id: extract-provider-error-diagnostics-part1
+  objective: Create the new module file `crates/router/src/provider_diagnostics.rs` and define the `ProviderDiagnostic` struct and `ErrorCategory` enum. Register the module in `crates/router/src/lib.rs`.
+  priority: 50
+  status: completed
+  depends_on: []
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/provider_diagnostics.rs
+  - crates/router/src/lib.rs
+- id: extract-provider-error-diagnostics-part2
+  objective: Implement the `classify_error` function in `crates/router/src/provider_diagnostics.rs` to map HTTP status codes to `ErrorCategory` and populate `ProviderDiagnostic`.
+  priority: 50
+  status: failed
+  depends_on:
+  - extract-provider-error-diagnostics-part1
+  decomposition_depth: 1
+  error: 'implementer failed: parse_error'
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/provider_diagnostics.rs
+- id: extract-provider-error-diagnostics-part3
+  objective: Add comprehensive unit tests for the `classify_error` function in `crates/router/src/provider_diagnostics.rs`, covering all specified status code mappings and edge cases.
+  priority: 50
+  status: pending
+  depends_on:
+  - extract-provider-error-diagnostics-part2
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/provider_diagnostics.rs
+- id: add-router-tracing-part1-metrics-struct
+  objective: Define RouterMetrics struct and re-export it.
+  priority: 50
+  status: completed
+  depends_on: []
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+  - crates/router/src/lib.rs
+- id: add-router-tracing-part2-instrument-router
+  objective: Instrument Router::complete with tracing::info_span! and update RouterMetrics.
+  priority: 50
+  status: completed
+  depends_on:
+  - add-router-tracing-part1-metrics-struct
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+- id: add-router-tracing-part3-instrument-chooser
+  objective: Instrument ModelChooser::select with tracing::debug!.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'budget exceeded: token limit exceeded: 16599 / 15000 tokens used'
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: add-router-tracing-part4-instrument-budget
+  objective: Instrument BudgetTracker::record with tracing::info! and tracing::warn!.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'objective references protected path(s): crates/kernel/src/budget.rs'
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/kernel/src/budget.rs
+- id: add-router-tracing-part5-test-metrics
+  objective: Add unit tests for RouterMetrics.
+  priority: 50
+  status: pending
+  depends_on:
+  - add-router-tracing-part1-metrics-struct
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+- id: create-provider-diagnostics-module
+  objective: Create the new module file `crates/router/src/provider_diagnostics.rs` and define the `ProviderDiagnostic` struct and `ErrorCategory` enum within it.
+  priority: 50
+  status: pending
+  depends_on: []
+  decomposition_depth: 2
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/provider_diagnostics.rs
+- id: register-provider-diagnostics-module
+  objective: Register the new `provider_diagnostics` module in `crates/router/src/lib.rs` by adding `pub mod provider_diagnostics;`.
+  priority: 50
+  status: pending
+  depends_on:
+  - create-provider-diagnostics-module
+  decomposition_depth: 2
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/lib.rs
+- id: define-router-metrics-part1
+  objective: Define the RouterMetrics struct in crates/router/src/router.rs with relevant fields and necessary derives.
+  priority: 50
+  status: pending
+  depends_on: []
+  decomposition_depth: 2
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+- id: define-router-metrics-part2
+  objective: Re-export the RouterMetrics struct from crates/router/src/lib.rs to make it publicly accessible.
+  priority: 50
+  status: pending
+  depends_on:
+  - define-router-metrics-part1
+  decomposition_depth: 2
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/lib.rs
+- id: instrument-router-complete-part1
+  objective: Define a `RouterMetrics` struct and integrate it into the `Router` struct. This includes adding fields for total calls, successful calls, failed calls, token usage, cost, and latency. The `Router` struct will hold an `Arc<Mutex<RouterMetrics>>` and initialize it in its constructors.
+  priority: 50
+  status: pending
+  depends_on: []
+  decomposition_depth: 2
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+- id: instrument-router-complete-part2
+  objective: Instrument the `Router::complete` method with `tracing::info_span!` and update the `RouterMetrics` instance. This involves starting a timer, creating a new span, incrementing call counters, and recording token usage, cost, and latency based on the outcome of the LLM call.
+  priority: 50
+  status: pending
+  depends_on:
+  - instrument-router-complete-part1
+  decomposition_depth: 2
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+- id: circuit-fix-0-a2fbe7f5
+  objective: Identify and correct the specific path or resource access within the 'add-router-tracing-part4-instrument-budget' task that triggers the boundary violation.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 1
+  is_remediation: true

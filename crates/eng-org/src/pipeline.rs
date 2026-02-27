@@ -352,7 +352,31 @@ impl EngineeringPipeline {
         base_branch: &str,
         previous_attempts: &[OutcomeContext],
     ) -> PipelineResult {
-        info!(task_id, "pipeline starting");
+        self.run_with_depth(
+            task_id,
+            objective,
+            repo_path,
+            base_branch,
+            previous_attempts,
+            0,
+        )
+        .await
+    }
+
+    /// Run the pipeline with decomposition depth context.
+    ///
+    /// Sub-tasks (depth > 0) skip the planner — they already have a plan
+    /// from the parent task and go straight to triage + implement.
+    pub async fn run_with_depth(
+        &self,
+        task_id: &str,
+        objective: &str,
+        repo_path: &Path,
+        base_branch: &str,
+        previous_attempts: &[OutcomeContext],
+        decomposition_depth: u32,
+    ) -> PipelineResult {
+        info!(task_id, decomposition_depth, "pipeline starting");
 
         let timeout = Duration::from_secs(self.config.limits.max_pipeline_duration_secs);
 
@@ -367,6 +391,7 @@ impl EngineeringPipeline {
                 base_branch,
                 &mut workspace,
                 previous_attempts,
+                decomposition_depth,
             ),
         )
         .await
@@ -409,6 +434,7 @@ impl EngineeringPipeline {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_stages(
         &self,
         task_id: &str,
@@ -417,6 +443,7 @@ impl EngineeringPipeline {
         base_branch: &str,
         workspace: &mut Workspace,
         previous_attempts: &[OutcomeContext],
+        decomposition_depth: u32,
     ) -> PipelineResult {
         let mut ctx = PipelineContext::new(AgentContext {
             task_id: task_id.into(),
@@ -534,54 +561,100 @@ impl EngineeringPipeline {
         }
 
         // --- Stage 3: Plan ---
-        ctx.current_stage = Some("plan".into());
-        let planner = PlannerAgent::new(Arc::clone(&self.router));
-        let mut plan_output = match planner.execute(&ctx.agent_context).await {
-            Ok(o) => o,
-            Err(e) => {
-                return self
-                    .fail(ctx, PipelineStatus::PlanFailed, e.to_string())
-                    .await;
-            }
-        };
-        self.emit(&mut ctx, EventKind::PlanCreated, plan_output.data.clone());
-        ctx.stage_outputs.insert("plan".into(), plan_output.clone());
+        // Sub-tasks (depth > 0) already have a plan from their parent.
+        // Skip the planner entirely — synthesize a minimal plan from the
+        // objective and go straight to implementation. This saves 6-8k
+        // tokens per sub-task.
+        let is_sub_task = decomposition_depth > 0;
+        let mut plan_output;
 
-        // --- Stage 3b: Check for decomposition ---
-        if plan_output
-            .data
-            .get("decomposition")
-            .is_some_and(|d| d.is_array())
-        {
+        if is_sub_task {
             info!(
                 task_id,
-                "planner decomposed task into sub-tasks, returning early"
+                decomposition_depth, "sub-task — skipping planner, using objective as plan"
             );
-            return PipelineResult {
-                status: PipelineStatus::Decomposed,
-                stage_outputs: ctx.stage_outputs,
-                events: ctx.events,
-                budget: self.router.budget_summary().await,
-                pr_url: None,
-                branch: None,
-                error: None,
-                outcome_context: None,
+            // Extract file hints from the objective (appended by orchestrator).
+            let files: Vec<String> = ctx
+                .agent_context
+                .objective
+                .lines()
+                .filter(|l| l.starts_with("Files from parent task:"))
+                .flat_map(|l| {
+                    l.trim_start_matches("Files from parent task:")
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .collect();
+
+            let synthetic_plan = serde_json::json!({
+                "steps": [{"description": objective}],
+                "files_likely_affected": files,
+                "estimated_complexity": "small",
+                "requires_core_change": false,
+            });
+            plan_output = AgentOutput {
+                data: synthetic_plan.clone(),
+                metadata: AgentMetadata {
+                    agent: "planner".into(),
+                    model: "synthetic".into(),
+                    tokens: 0,
+                    cost: 0.0,
+                    latency_ms: 0,
+                },
+                parse_error: false,
             };
+            ctx.current_stage = Some("plan".into());
+            self.emit(&mut ctx, EventKind::PlanCreated, plan_output.data.clone());
+            ctx.stage_outputs.insert("plan".into(), plan_output.clone());
+        } else {
+            ctx.current_stage = Some("plan".into());
+            let planner = PlannerAgent::new(Arc::clone(&self.router));
+            plan_output = match planner.execute(&ctx.agent_context).await {
+                Ok(o) => o,
+                Err(e) => {
+                    return self
+                        .fail(ctx, PipelineStatus::PlanFailed, e.to_string())
+                        .await;
+                }
+            };
+            self.emit(&mut ctx, EventKind::PlanCreated, plan_output.data.clone());
+            ctx.stage_outputs.insert("plan".into(), plan_output.clone());
+
+            // --- Stage 3b: Check for decomposition ---
+            if plan_output
+                .data
+                .get("decomposition")
+                .is_some_and(|d| d.is_array())
+            {
+                info!(
+                    task_id,
+                    "planner decomposed task into sub-tasks, returning early"
+                );
+                return PipelineResult {
+                    status: PipelineStatus::Decomposed,
+                    stage_outputs: ctx.stage_outputs,
+                    events: ctx.events,
+                    budget: self.router.budget_summary().await,
+                    pr_url: None,
+                    branch: None,
+                    error: None,
+                    outcome_context: None,
+                };
+            }
         }
 
         // --- Short-circuit eligibility check ---
-        let use_short_circuit = self.config.pipeline.short_circuit_enabled
-            && is_short_circuit_eligible(
-                &plan_output.data,
-                self.config.pipeline.short_circuit_max_files,
-            );
+        // Sub-tasks are always short-circuit eligible (parent already planned).
+        let use_short_circuit = is_sub_task
+            || (self.config.pipeline.short_circuit_enabled
+                && is_short_circuit_eligible(
+                    &plan_output.data,
+                    self.config.pipeline.short_circuit_max_files,
+                ));
 
-        // Task size — set by triage (or S for short-circuit).
-        let mut task_size = if use_short_circuit {
-            TaskSize::S
-        } else {
-            TaskSize::M // will be overwritten by triage
-        };
+        // Task size — defaults to M, overwritten by triage when it runs.
+        let mut task_size = TaskSize::M;
 
         if use_short_circuit {
             info!(
@@ -678,7 +751,8 @@ impl EngineeringPipeline {
                     "instruction": "Task is too large (XL). Decompose into S/M/L sub-tasks. Each sub-task must touch at most 2 files.",
                 });
 
-                let replan_output = match planner.execute(&ctx.agent_context).await {
+                let xl_planner = PlannerAgent::new(Arc::clone(&self.router));
+                let replan_output = match xl_planner.execute(&ctx.agent_context).await {
                     Ok(o) => o,
                     Err(e) => {
                         return self
@@ -746,7 +820,8 @@ impl EngineeringPipeline {
                 });
 
                 // Re-invoke planner (max 1 replan — no recursion).
-                let replan_output = match planner.execute(&ctx.agent_context).await {
+                let replan_planner = PlannerAgent::new(Arc::clone(&self.router));
+                let replan_output = match replan_planner.execute(&ctx.agent_context).await {
                     Ok(o) => o,
                     Err(e) => {
                         return self
@@ -5747,14 +5822,14 @@ mod tests {
             result.error
         );
 
-        // Budget should have been resized to S (15,000 tokens).
+        // Budget should have been resized to S (20,000 tokens).
         let summary = router.budget_summary().await;
-        // After resize_budget(15_000), the tracker's max_tokens is 15_000.
+        // After resize_budget(20_000), the tracker's max_tokens is 20_000.
         // tokens_remaining = max_tokens - used. Since tokens were used,
-        // the remaining should be ≤ 15_000.
+        // the remaining should be ≤ 20_000.
         assert!(
-            summary.tokens_remaining <= 15_000,
-            "budget should be resized to S (15k), got remaining: {}",
+            summary.tokens_remaining <= 20_000,
+            "budget should be resized to S (20k), got remaining: {}",
             summary.tokens_remaining
         );
     }
@@ -5860,7 +5935,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_short_circuit_uses_task_size_s() {
-        // Short-circuit tasks should use TaskSize::S budget (15k tokens, 3 turns).
+        // Short-circuit tasks should use TaskSize::M budget (35k tokens, 7 turns).
         let dir = tempfile::tempdir().unwrap();
         let base_branch = init_test_repo(dir.path());
 
@@ -5895,11 +5970,11 @@ mod tests {
             result.error
         );
 
-        // Budget should be resized to S (15,000 tokens) for short-circuit.
+        // Budget should be resized to M (35,000 tokens) for short-circuit.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 15_000,
-            "short-circuit should use S budget (15k), got remaining: {}",
+            summary.tokens_remaining <= 35_000,
+            "short-circuit should use M budget (35k), got remaining: {}",
             summary.tokens_remaining
         );
     }

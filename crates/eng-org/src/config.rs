@@ -26,7 +26,7 @@ impl TaskSize {
     /// XL returns 0 — these tasks must be decomposed, never executed.
     pub fn max_tokens(&self) -> u64 {
         match self {
-            Self::S => 15_000,
+            Self::S => 20_000,
             Self::M => 35_000,
             Self::L => 60_000,
             Self::XL => 0,
@@ -37,7 +37,7 @@ impl TaskSize {
     /// XL returns 0 — these tasks must be decomposed, never executed.
     pub fn max_tool_turns(&self) -> u32 {
         match self {
-            Self::S => 3,
+            Self::S => 4,
             Self::M => 7,
             Self::L => 12,
             Self::XL => 0,
@@ -1558,7 +1558,7 @@ base_url: http://localhost:8080
 
     #[test]
     fn task_size_max_tokens() {
-        assert_eq!(TaskSize::S.max_tokens(), 15_000);
+        assert_eq!(TaskSize::S.max_tokens(), 20_000);
         assert_eq!(TaskSize::M.max_tokens(), 35_000);
         assert_eq!(TaskSize::L.max_tokens(), 60_000);
         assert_eq!(TaskSize::XL.max_tokens(), 0);
@@ -1566,7 +1566,7 @@ base_url: http://localhost:8080
 
     #[test]
     fn task_size_max_tool_turns() {
-        assert_eq!(TaskSize::S.max_tool_turns(), 3);
+        assert_eq!(TaskSize::S.max_tool_turns(), 4);
         assert_eq!(TaskSize::M.max_tool_turns(), 7);
         assert_eq!(TaskSize::L.max_tool_turns(), 12);
         assert_eq!(TaskSize::XL.max_tool_turns(), 0);

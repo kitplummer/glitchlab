@@ -716,7 +716,7 @@ impl Orchestrator {
             // --- Create fresh router + pipeline for this task ---
             let attempt_contexts = tracker.contexts(&task_id);
             let pipeline_result = match self
-                .create_and_run_pipeline(&task_id, &objective, params, attempt_contexts)
+                .create_and_run_pipeline(&task_id, &objective, params, attempt_contexts, task_depth)
                 .await
             {
                 Ok(pr) => pr,
@@ -1077,6 +1077,7 @@ impl Orchestrator {
         objective: &str,
         params: &OrchestratorParams,
         previous_attempts: &[OutcomeContext],
+        decomposition_depth: u32,
     ) -> Result<glitchlab_kernel::pipeline::PipelineResult> {
         let budget_tracker = BudgetTracker::new(
             self.config.limits.max_tokens_per_task,
@@ -1111,12 +1112,13 @@ impl Orchestrator {
         );
 
         Ok(pipeline
-            .run(
+            .run_with_depth(
                 task_id,
                 objective,
                 &params.repo_path,
                 &params.base_branch,
                 previous_attempts,
+                decomposition_depth,
             )
             .await)
     }

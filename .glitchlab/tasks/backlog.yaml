@@ -721,3 +721,81 @@ tasks:
   decomposition_depth: 1
   remediation_depth: 0
   is_remediation: false
+# ── Canary: t-shirt sizing validation (one per size) ──
+- id: canary-size-s-display-model-profile
+  objective: |
+    Add a `Display` trait implementation for the `ModelProfile` struct in
+    `crates/router/src/chooser.rs`. The struct has fields `model: String`,
+    `tier: ModelTier`, and `capabilities: Vec<String>`. Display should output
+    a compact human-readable format: `"{model} ({tier})"`, e.g.
+    `"gemini/gemini-2.5-flash (standard)"`. Add a unit test in the existing
+    `#[cfg(test)]` block that constructs a `ModelProfile` and verifies
+    `.to_string()` output. This is a single-file, ≤2-edit mechanical change.
+    Use `read_file` to read lines 1-60 of `chooser.rs`.
+  priority: 10
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+- id: canary-size-m-role-preference-derives
+  objective: |
+    Add `Display`, `PartialEq`, and `Eq` derives/impls for the
+    `RolePreference` struct in `crates/router/src/chooser.rs`. The struct
+    has `min_tier: ModelTier` and `requires: Vec<String>`. Display format:
+    `"min_tier={tier}, requires=[{caps}]"` e.g. `"min_tier=standard,
+    requires=[tool_use, code]"`. Derive `PartialEq` and `Eq`. Add 2-3 unit
+    tests: (1) Display with capabilities, (2) Display with empty requires,
+    (3) PartialEq equality and inequality. This is a 1-file, ~4-edit change.
+    Use `read_file` to read lines 60-120 of `chooser.rs`.
+  priority: 10
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+- id: canary-size-l-provider-error-diagnostics
+  objective: |
+    Extract provider error diagnostics into a new module
+    `crates/router/src/provider_diagnostics.rs`. Create a
+    `ProviderDiagnostic` struct with fields: `provider: String`,
+    `error_code: Option<u16>`, `category: ErrorCategory`, `retryable: bool`,
+    `message: String`. Add an `ErrorCategory` enum with variants:
+    `RateLimit`, `AuthFailure`, `ModelNotFound`, `ContentFilter`,
+    `ServerError`, `Unknown`. Add a `classify_error(provider: &str,
+    status: u16, body: &str) -> ProviderDiagnostic` function that maps
+    HTTP status codes to categories (429→RateLimit, 401/403→AuthFailure,
+    404→ModelNotFound, 500-599→ServerError, etc.). Add the module to
+    `crates/router/src/lib.rs`. Add comprehensive unit tests covering all
+    status code mappings and edge cases. This is a 2-file, design-required
+    change (new module + lib.rs registration).
+  priority: 10
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+- id: canary-size-xl-router-instrumentation
+  objective: |
+    Add comprehensive tracing instrumentation to the Router and ModelChooser.
+    Changes span 4+ files:
+    (1) `crates/router/src/router.rs` — add `tracing::info_span!` to
+    `chat()`, `chat_with_tools()`, and `resize_budget()` with fields for
+    model, role, token count, cost, latency_ms.
+    (2) `crates/router/src/chooser.rs` — add `tracing::debug!` to
+    `choose_for_role()` logging candidate models, selected model, and
+    rejection reasons.
+    (3) `crates/router/src/budget.rs` — add `tracing::info!` to `record()`
+    logging cumulative spend vs limit, and `tracing::warn!` when remaining
+    budget drops below 20%.
+    (4) `crates/router/src/lib.rs` — re-export a new `RouterMetrics` struct
+    that aggregates call count, total tokens, total cost, average latency.
+    (5) Add unit tests for `RouterMetrics` in a new test module.
+    This is an XL task (5 files, cross-cutting concern) and SHOULD be
+    decomposed by the triage agent into smaller sub-tasks.
+  priority: 10
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
