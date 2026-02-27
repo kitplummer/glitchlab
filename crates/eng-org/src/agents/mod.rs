@@ -304,6 +304,21 @@ pub(crate) async fn tool_use_loop(
         }
 
         turns += 1;
+
+        // Soft budget signal: warn the LLM to wrap up when >80% consumed.
+        if let Ok(summary) = router.budget_summary_result().await {
+            let used = summary.total_tokens;
+            let limit = used + summary.tokens_remaining;
+            if limit > 0 && used * 100 / limit > 80 {
+                messages.push(Message {
+                    role: MessageRole::User,
+                    content: MessageContent::Text(
+                        "[SYSTEM] Budget >80% consumed. Finish current edits and return your JSON response now. Do not start new work.".into(),
+                    ),
+                });
+            }
+        }
+
         if turns >= params.max_turns {
             warn!(
                 role,

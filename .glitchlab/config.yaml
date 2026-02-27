@@ -21,7 +21,7 @@ routing:
   # Static fallbacks
   planner: "gemini/gemini-2.5-flash"
   implementer: "gemini/gemini-2.5-pro"
-  debugger: "anthropic/claude-sonnet-4-20250514"
+  debugger: "openai/gpt-4o"
   security: "gemini/gemini-2.5-flash"
   release: "gemini/gemini-2.5-flash"
   archivist: "gemini/gemini-2.5-flash"
@@ -40,6 +40,12 @@ routing:
     - model: "anthropic/claude-sonnet-4-20250514"
       tier: premium
       capabilities: [tool_use, code, long_context, vision]
+    - model: "openai/gpt-4o"
+      tier: premium
+      capabilities: [tool_use, code, long_context, vision]
+    - model: "openai/gpt-4o-mini"
+      tier: standard
+      capabilities: [tool_use, code]
 
   roles:
     planner:
@@ -82,3 +88,5 @@ providers:
     api_key_env: GEMINI_API_KEY
   anthropic:
     api_key_env: ANTHROPIC_API_KEY
+  openai:
+    api_key_env: OPENAI_API_KEY

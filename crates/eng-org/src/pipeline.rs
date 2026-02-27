@@ -885,6 +885,17 @@ impl EngineeringPipeline {
             }
         }
 
+        // XL tasks that weren't decomposed above must not reach the implementer.
+        if task_size == TaskSize::XL {
+            return self
+                .fail(
+                    ctx,
+                    PipelineStatus::PlanFailed,
+                    "XL task could not be decomposed — cannot proceed to implementation".into(),
+                )
+                .await;
+        }
+
         // Resize budget: add overhead already consumed (planner/triage) to the
         // task-size ceiling so only implementer tokens count against the limit.
         let overhead = self.router.budget_summary().await.total_tokens;
@@ -1076,7 +1087,7 @@ impl EngineeringPipeline {
                     let retry_implementer = ImplementerAgent::new(
                         Arc::clone(&self.router),
                         retry_dispatcher,
-                        task_size.max_tool_turns(),
+                        TaskSize::L.max_tool_turns(),
                         self.config.limits.max_stuck_turns,
                     );
                     let retry_output = retry_implementer.execute(&ctx.agent_context).await;
@@ -6036,8 +6047,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipeline_xl_guard_blocks_implementer() {
+        // When an XL task fails to decompose (re-plan doesn't produce a
+        // decomposition array), the pipeline should return PlanFailed
+        // instead of falling through to the implementer.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — multi-file task
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "refactor", "files": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "action": "modify"}], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "requires_core_change": false, "risk_level": "high", "risk_notes": "big change", "test_strategy": [], "estimated_complexity": "large", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — XL (forces decomposition)
+            final_response(
+                r#"{"verdict": "proceed", "task_size": "XL", "sizing_rationale": "4+ files", "confidence": 0.9, "reasoning": "too large", "evidence": [], "architectural_notes": "", "suggested_changes": ["decompose"]}"#,
+            ),
+            // 3. Re-plan (triggered by XL) — but NO decomposition array
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "still too big", "files": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "action": "modify"}], "files_likely_affected": ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"], "requires_core_change": false, "risk_level": "high", "risk_notes": "failed to decompose", "test_strategy": [], "estimated_complexity": "large", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-xl-guard",
+                "Large refactor that cannot be decomposed",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::PlanFailed,
+            "XL task without decomposition should return PlanFailed, got {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+    }
+
+    #[tokio::test]
     async fn pipeline_short_circuit_uses_task_size_s() {
-        // Short-circuit tasks use TaskSize::M budget (50k + overhead tokens, 7 turns).
+        // Short-circuit tasks use TaskSize::M budget (65k + overhead tokens, 9 turns).
         let dir = tempfile::tempdir().unwrap();
         let base_branch = init_test_repo(dir.path());
 
@@ -6072,12 +6135,12 @@ mod tests {
             result.error
         );
 
-        // Budget effective limit = M ceiling (50k) + planner overhead.
+        // Budget effective limit = M ceiling (65k) + planner overhead.
         // Short-circuit skips triage, so overhead is just the planner call.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 51_000,
-            "short-circuit should use ~M budget (50k + overhead), got remaining: {}",
+            summary.tokens_remaining <= 66_000,
+            "short-circuit should use ~M budget (65k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }

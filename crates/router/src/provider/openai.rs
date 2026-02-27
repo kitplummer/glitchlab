@@ -326,6 +326,8 @@ fn estimate_openai_cost(
         (0.15, 0.60)
     } else if model.contains("gpt-4o") {
         (2.50, 10.0)
+    } else if model.contains("o3-mini") {
+        (1.10, 4.40)
     } else if model.contains("o1") || model.contains("o3") {
         (10.0, 40.0)
     } else {
@@ -694,8 +696,17 @@ mod tests {
 
     #[test]
     fn openai_o3_cost() {
-        let cost = estimate_openai_cost("openai", "o3-mini", 1_000_000, 1_000_000);
+        let cost = estimate_openai_cost("openai", "o3", 1_000_000, 1_000_000);
         assert!((cost - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn estimate_cost_o3_mini() {
+        let cost = estimate_openai_cost("openai", "o3-mini", 1_000_000, 1_000_000);
+        assert!(
+            (cost - 5.5).abs() < 0.01,
+            "o3-mini cost should be $5.50, got {cost}"
+        );
     }
 
     #[test]

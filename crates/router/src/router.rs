@@ -424,6 +424,16 @@ impl Router {
         self.budget.lock().await.summary()
     }
 
+    /// Get a snapshot of the current budget state, returning a `Result`.
+    ///
+    /// Same as [`budget_summary`](Self::budget_summary) but wrapped in `Result`
+    /// for use in contexts where fallible access is more ergonomic.
+    pub async fn budget_summary_result(
+        &self,
+    ) -> error::Result<glitchlab_kernel::budget::BudgetSummary> {
+        Ok(self.budget.lock().await.summary())
+    }
+
     /// Check if budget is exceeded.
     pub async fn budget_exceeded(&self) -> bool {
         self.budget.lock().await.exceeded()
@@ -1361,6 +1371,25 @@ mod tests {
         // Escalation should offer Premium (mock/premium).
         let escalated = router.escalate_model("planner").await;
         assert_eq!(escalated.as_deref(), Some("mock/premium"));
+    }
+
+    #[tokio::test]
+    async fn budget_summary_result_returns_ok() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget);
+        router.register_provider("mock".into(), Arc::new(MockProvider::ok()));
+
+        // Call once to record some usage.
+        router
+            .complete("planner", &test_messages(), 0.2, 4096, None)
+            .await
+            .unwrap();
+
+        let result = router.budget_summary_result().await;
+        assert!(result.is_ok());
+        let summary = result.unwrap();
+        assert_eq!(summary.total_tokens, 150);
     }
 
     #[tokio::test]
