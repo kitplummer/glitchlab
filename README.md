@@ -17,7 +17,7 @@ Ten agents, each with a persona and a job:
 | Agent | Persona | Role | Default Model |
 |-------|---------|------|---------------|
 | Planner | Professor Zap | Decompose objectives into execution plans | gemini-2.5-flash |
-| Implementer | Patch | Write code and tests (tool-use loop, 15 turns) | gemini-2.5-pro |
+| Implementer | Patch | Write code and tests (tool-use loop, 9 turns) | gemini-2.5-pro |
 | Debugger | Reroute | Fix failing tests and builds | claude-sonnet-4 |
 | Security | Firewall Frankie | Code-level vulnerability scanning | gemini-2.5-flash |
 | CISO | Sentinel | Strategic risk analysis: blast radius, trust boundaries, compliance | gemini-2.5-flash |
@@ -168,7 +168,7 @@ When patterns are detected, the **Circuit** agent (Ops Diagnosis) generates scop
     ArchitectTriage   Plan → Impl → Debug → Test
                         │
                         ▼
-              Security → Release → Archivist
+              Security → CISO → Release → Archivist
                         │
                         ▼
                    Commit → PR → Merge
@@ -193,7 +193,7 @@ crates/
 │
 ├── memory/       Persistence: JSONL history (fallback), Dolt (SQL), Beads (graph).
 │
-├── eng-org/      Engineering org: 9 agents, workspace (git worktree), repo indexer,
+├── eng-org/      Engineering org: 10 agents, workspace (git worktree), repo indexer,
 │                 config loading, TQM analyzer, orchestrator, pipeline.
 │
 └── cli/          Binary crate. CLI commands via clap.
@@ -253,9 +253,10 @@ GLITCHLAB is autonomous between checkpoints, but you stay in control:
 1. **Plan Review** — Approve before implementation begins
 2. **Core Boundary** — Protected paths block unauthorized changes
 3. **Fix Loop** — Halts after N failed attempts
-4. **Architect Review** — Diff review before merge
-5. **Budget Cap** — Halts if dollar limit exceeded
-6. **TQM Escalation** — Circuit escalates when confidence is low
+4. **CISO Escalation** — Sentinel flags high-risk changes for human security review
+5. **Architect Review** — Diff review before merge
+6. **Budget Cap** — Halts if dollar limit exceeded
+7. **TQM Escalation** — Circuit escalates when confidence is low
 
 ## Development
 
