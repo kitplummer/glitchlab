@@ -181,6 +181,14 @@ pub enum PipelineStatus {
     Error,
 }
 
+impl std::fmt::Display for PipelineStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = serde_json::to_string(self).map_err(|_| std::fmt::Error)?;
+        // serde_json adds quotes, remove them
+        f.write_str(&s.replace('"', ""))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PipelineEvent — structured event log
 // ---------------------------------------------------------------------------
@@ -411,6 +419,45 @@ mod tests {
         let kind = EventKind::PrMerged;
         let json = serde_json::to_string(&kind).unwrap();
         assert_eq!(json, "\"pr_merged\"");
+    }
+
+    #[test]
+    fn pipeline_status_display() {
+        assert_eq!(PipelineStatus::PrCreated.to_string(), "pr_created");
+        assert_eq!(PipelineStatus::Committed.to_string(), "committed");
+        assert_eq!(PipelineStatus::PlanFailed.to_string(), "plan_failed");
+        assert_eq!(
+            PipelineStatus::ImplementationFailed.to_string(),
+            "implementation_failed"
+        );
+        assert_eq!(PipelineStatus::TestsFailed.to_string(), "tests_failed");
+        assert_eq!(
+            PipelineStatus::SecurityBlocked.to_string(),
+            "security_blocked"
+        );
+        assert_eq!(
+            PipelineStatus::BoundaryViolation.to_string(),
+            "boundary_violation"
+        );
+        assert_eq!(
+            PipelineStatus::BudgetExceeded.to_string(),
+            "budget_exceeded"
+        );
+        assert_eq!(PipelineStatus::Interrupted.to_string(), "interrupted");
+        assert_eq!(PipelineStatus::TimedOut.to_string(), "timed_out");
+        assert_eq!(PipelineStatus::Decomposed.to_string(), "decomposed");
+        assert_eq!(PipelineStatus::Deferred.to_string(), "deferred");
+        assert_eq!(PipelineStatus::Blocked.to_string(), "blocked");
+        assert_eq!(PipelineStatus::Retryable.to_string(), "retryable");
+        assert_eq!(PipelineStatus::AlreadyDone.to_string(), "already_done");
+        assert_eq!(PipelineStatus::ParseError.to_string(), "parse_error");
+        assert_eq!(
+            PipelineStatus::ArchitectRejected.to_string(),
+            "architect_rejected"
+        );
+        assert_eq!(PipelineStatus::PrMerged.to_string(), "pr_merged");
+        assert_eq!(PipelineStatus::Escalated.to_string(), "escalated");
+        assert_eq!(PipelineStatus::Error.to_string(), "error");
     }
 
     #[test]
