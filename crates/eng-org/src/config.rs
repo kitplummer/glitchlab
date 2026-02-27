@@ -27,7 +27,7 @@ impl TaskSize {
     pub fn max_tokens(&self) -> u64 {
         match self {
             Self::S => 20_000,
-            Self::M => 35_000,
+            Self::M => 50_000,
             Self::L => 60_000,
             Self::XL => 0,
         }
@@ -1559,7 +1559,7 @@ base_url: http://localhost:8080
     #[test]
     fn task_size_max_tokens() {
         assert_eq!(TaskSize::S.max_tokens(), 20_000);
-        assert_eq!(TaskSize::M.max_tokens(), 35_000);
+        assert_eq!(TaskSize::M.max_tokens(), 50_000);
         assert_eq!(TaskSize::L.max_tokens(), 60_000);
         assert_eq!(TaskSize::XL.max_tokens(), 0);
     }

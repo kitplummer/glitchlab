@@ -5959,7 +5959,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_short_circuit_uses_task_size_s() {
-        // Short-circuit tasks use TaskSize::M budget (35k + overhead tokens, 7 turns).
+        // Short-circuit tasks use TaskSize::M budget (50k + overhead tokens, 7 turns).
         let dir = tempfile::tempdir().unwrap();
         let base_branch = init_test_repo(dir.path());
 
@@ -5994,12 +5994,12 @@ mod tests {
             result.error
         );
 
-        // Budget effective limit = M ceiling (35k) + planner overhead.
+        // Budget effective limit = M ceiling (50k) + planner overhead.
         // Short-circuit skips triage, so overhead is just the planner call.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 36_000,
-            "short-circuit should use ~M budget (35k + overhead), got remaining: {}",
+            summary.tokens_remaining <= 51_000,
+            "short-circuit should use ~M budget (50k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }
