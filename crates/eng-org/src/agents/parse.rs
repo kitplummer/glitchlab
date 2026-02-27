@@ -15,7 +15,16 @@ pub fn parse_json_response(
     metadata: AgentMetadata,
     fallback: serde_json::Value,
 ) -> AgentOutput {
-    // Attempt 1: direct parse.
+    // Attempt 1: direct parse as AgentOutput. This is unconventional, as metadata
+    // is normally supplied by the caller, but might be useful for some agents
+    // or for chained calls. We'll use our own metadata for security/consistency.
+    if let Ok(mut output) = serde_json::from_str::<AgentOutput>(raw) {
+        output.metadata = metadata;
+        output.parse_error = false; // Parsed correctly.
+        return output;
+    }
+
+    // Attempt 2: direct parse as json Value.
     if let Ok(data) = serde_json::from_str::<serde_json::Value>(raw) {
         return AgentOutput {
             data,
@@ -24,7 +33,7 @@ pub fn parse_json_response(
         };
     }
 
-    // Attempt 2: strip markdown fences.
+    // Attempt 3: strip markdown fences.
     let stripped = strip_code_fences(raw);
     if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stripped) {
         return AgentOutput {
@@ -34,7 +43,7 @@ pub fn parse_json_response(
         };
     }
 
-    // Attempt 3: extract first JSON object.
+    // Attempt 4: extract first JSON object.
     if let Some(extracted) = extract_json_object(&stripped) {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&extracted) {
             return AgentOutput {
@@ -44,7 +53,7 @@ pub fn parse_json_response(
             };
         }
 
-        // Attempt 4: sanitize common JSON issues (trailing commas, newlines).
+        // Attempt 5: sanitize common JSON issues (trailing commas, newlines).
         let sanitized = sanitize_json(&extracted);
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&sanitized) {
             return AgentOutput {
@@ -55,7 +64,7 @@ pub fn parse_json_response(
         }
     }
 
-    // Attempt 5: close truncated JSON (unbalanced braces from max_tokens cutoff).
+    // Attempt 6: close truncated JSON (unbalanced braces from max_tokens cutoff).
     if let Some(closed) = close_truncated_json(&stripped)
         && let Ok(data) = serde_json::from_str::<serde_json::Value>(&closed)
     {
@@ -76,8 +85,21 @@ pub fn parse_json_response(
         raw_preview = &raw[..raw.len().min(500)],
         "failed to parse agent JSON response, using fallback"
     );
+
+    let mut data = fallback;
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "raw_message".to_string(),
+            serde_json::Value::String(raw.to_string()),
+        );
+        obj.insert(
+            "error_message".to_string(),
+            serde_json::Value::String("Failed to parse LLM response as JSON.".to_string()),
+        );
+    }
+
     AgentOutput {
-        data: fallback,
+        data,
         metadata,
         parse_error: true,
     }
@@ -370,7 +392,9 @@ mod tests {
         let fallback = serde_json::json!({"error": true});
         let output = parse_json_response(raw, meta, fallback.clone());
         assert!(output.parse_error);
-        assert_eq!(output.data, fallback);
+        assert_eq!(output.data["error"], true);
+        assert_eq!(output.data["raw_message"], raw);
+        assert!(output.data["error_message"].is_string());
     }
 
     #[test]
