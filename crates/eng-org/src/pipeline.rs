@@ -879,13 +879,17 @@ impl EngineeringPipeline {
             }
         }
 
-        // Resize budget to triage-assigned size.
-        self.router.resize_budget(task_size.max_tokens()).await;
+        // Resize budget: add overhead already consumed (planner/triage) to the
+        // task-size ceiling so only implementer tokens count against the limit.
+        let overhead = self.router.budget_summary().await.total_tokens;
+        let effective_limit = task_size.max_tokens() + overhead;
+        self.router.resize_budget(effective_limit).await;
         info!(
             task_id,
             ?task_size,
-            max_tokens = task_size.max_tokens(),
-            "budget sized by triage"
+            overhead,
+            effective_limit,
+            "budget sized by triage (overhead excluded)"
         );
 
         // Strip repo context from objective — the planner already consumed it;
@@ -5843,14 +5847,13 @@ mod tests {
             result.error
         );
 
-        // Budget should have been resized to S (20,000 tokens).
+        // Budget effective limit = S ceiling (20k) + planner/triage overhead.
+        // tokens_remaining = effective_limit - total_used. Since overhead is
+        // added to the ceiling, implementer gets the full S budget.
         let summary = router.budget_summary().await;
-        // After resize_budget(20_000), the tracker's max_tokens is 20_000.
-        // tokens_remaining = max_tokens - used. Since tokens were used,
-        // the remaining should be ≤ 20_000.
         assert!(
-            summary.tokens_remaining <= 20_000,
-            "budget should be resized to S (20k), got remaining: {}",
+            summary.tokens_remaining <= 21_000,
+            "budget should be ~S (20k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }
@@ -5889,11 +5892,11 @@ mod tests {
             result.error
         );
 
-        // Budget should have been resized to L (60,000 tokens).
+        // Budget effective limit = L ceiling (60k) + planner/triage overhead.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 60_000,
-            "budget should be resized to L (60k), got remaining: {}",
+            summary.tokens_remaining <= 61_000,
+            "budget should be ~L (60k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }
@@ -5956,7 +5959,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_short_circuit_uses_task_size_s() {
-        // Short-circuit tasks should use TaskSize::M budget (35k tokens, 7 turns).
+        // Short-circuit tasks use TaskSize::M budget (35k + overhead tokens, 7 turns).
         let dir = tempfile::tempdir().unwrap();
         let base_branch = init_test_repo(dir.path());
 
@@ -5991,11 +5994,12 @@ mod tests {
             result.error
         );
 
-        // Budget should be resized to M (35,000 tokens) for short-circuit.
+        // Budget effective limit = M ceiling (35k) + planner overhead.
+        // Short-circuit skips triage, so overhead is just the planner call.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 35_000,
-            "short-circuit should use M budget (35k), got remaining: {}",
+            summary.tokens_remaining <= 36_000,
+            "short-circuit should use ~M budget (35k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }
