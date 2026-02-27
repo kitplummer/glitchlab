@@ -40,3 +40,42 @@ def test_chunk_steps_large(planner_agent):
     assert result[0]["description"] == "Decomposed step 1"
     assert result[1]["description"] == "Decomposed step 2"
     assert result[2]["description"] == "Decomposed step 3"
+
+def test_parse_response_with_markdown_fences(planner_agent):
+    from glitchlab.router import RouterResponse
+    from glitchlab.agents import AgentContext
+
+    mock_json_output = """
+```json
+{
+  "steps": [
+    {
+      "step_number": 1,
+      "description": "Test step",
+      "files": ["test.py"],
+      "action": "modify"
+    }
+  ],
+  "estimated_complexity": "small"
+}
+```
+"""
+    mock_response = RouterResponse(
+        content=mock_json_output,
+        model="mock_model",
+        tokens_used=100,
+        cost=0.01
+    )
+    mock_context = AgentContext(
+        objective="test objective",
+        repo_path="/tmp",
+        task_id="test-123"
+    )
+
+    parsed_plan = planner_agent.parse_response(mock_response, mock_context)
+
+    assert "parse_error" not in parsed_plan
+    assert parsed_plan["estimated_complexity"] == "small"
+    assert len(parsed_plan["steps"]) == 1
+    assert parsed_plan["steps"][0]["description"] == "Test step"
+    assert parsed_plan["_model"] == "mock_model"
