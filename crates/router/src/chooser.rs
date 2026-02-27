@@ -67,7 +67,7 @@ impl ModelProfile {
 }
 
 /// Per-role requirements for model selection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolePreference {
     pub min_tier: ModelTier,
     pub required_capabilities: HashSet<String>,
@@ -79,6 +79,18 @@ impl Default for RolePreference {
             min_tier: ModelTier::Economy,
             required_capabilities: HashSet::new(),
         }
+    }
+}
+
+impl fmt::Display for RolePreference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let caps: Vec<&str> = self
+            .required_capabilities
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let caps_str = caps.join(", ");
+        write!(f, "min_tier={}, requires=[{}]", self.min_tier, caps_str)
     }
 }
 
@@ -550,5 +562,56 @@ mod tests {
         assert_eq!(ModelTier::Standard.to_string(), "standard");
         assert_eq!(ModelTier::StandardPlus.to_string(), "standard_plus");
         assert_eq!(ModelTier::Premium.to_string(), "premium");
+    }
+
+    #[test]
+    fn role_preference_display_with_capabilities() {
+        let pref = RolePreference {
+            min_tier: ModelTier::Standard,
+            required_capabilities: HashSet::from(["tool_use".into(), "code".into()]),
+        };
+        let display = pref.to_string();
+        assert!(display.starts_with("min_tier=standard, requires=["));
+        assert!(display.contains("tool_use"));
+        assert!(display.contains("code"));
+        assert!(display.ends_with("]"));
+    }
+
+    #[test]
+    fn role_preference_display_empty_requires() {
+        let pref = RolePreference {
+            min_tier: ModelTier::Premium,
+            required_capabilities: HashSet::new(),
+        };
+        assert_eq!(pref.to_string(), "min_tier=premium, requires=[]");
+    }
+
+    #[test]
+    fn role_preference_partial_eq() {
+        let pref1 = RolePreference {
+            min_tier: ModelTier::Standard,
+            required_capabilities: HashSet::from(["tool_use".into()]),
+        };
+        let pref2 = RolePreference {
+            min_tier: ModelTier::Standard,
+            required_capabilities: HashSet::from(["tool_use".into()]),
+        };
+        let pref3 = RolePreference {
+            min_tier: ModelTier::Economy,
+            required_capabilities: HashSet::from(["tool_use".into()]),
+        };
+        let pref4 = RolePreference {
+            min_tier: ModelTier::Standard,
+            required_capabilities: HashSet::from(["code".into()]),
+        };
+
+        // Test equality
+        assert_eq!(pref1, pref2);
+
+        // Test inequality - different tier
+        assert_ne!(pref1, pref3);
+
+        // Test inequality - different capabilities
+        assert_ne!(pref1, pref4);
     }
 }
