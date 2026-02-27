@@ -623,6 +623,33 @@ impl EngineeringPipeline {
                 })
                 .collect();
 
+            // --- Sub-task budget pre-flight ---
+            // Sub-tasks skip the planner, so they bypass the budget estimation
+            // gate. Check here: if the files are too large for the budget, fail
+            // fast instead of wasting 120K tokens on a doomed implementation.
+            let estimated = estimate_plan_tokens(repo_path, &files, 1).await;
+            let budget_limit = TaskSize::M.max_tokens() as usize;
+            if estimated > (budget_limit * 70 / 100) {
+                warn!(
+                    task_id,
+                    estimated,
+                    budget_limit,
+                    "sub-task files exceed budget pre-flight — failing fast"
+                );
+                return self
+                    .fail(
+                        ctx,
+                        PipelineStatus::PlanFailed,
+                        format!(
+                            "sub-task estimated at ~{estimated} tokens (budget: {budget_limit}). \
+                             Parent decomposition produced a sub-task too large to implement. \
+                             Files: {}",
+                            files.join(", ")
+                        ),
+                    )
+                    .await;
+            }
+
             let synthetic_plan = serde_json::json!({
                 "steps": [{"description": objective}],
                 "files_likely_affected": files,
@@ -4297,6 +4324,135 @@ mod tests {
         assert_eq!(
             plan_created_count, 1,
             "expected 1 PlanCreated event (no budget replan), got {plan_created_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_subtask_preflight_rejects_oversized() {
+        // Sub-tasks (decomposition_depth > 0) skip the planner. The pre-flight
+        // check should fail fast if the files are too large for the budget.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        // Create a large file that exceeds the budget pre-flight.
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let big_content: String = (0..1_400).map(|i| format!("// line {i}\n")).collect();
+        std::fs::write(dir.path().join("src/big.rs"), &big_content).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add big file"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // No LLM responses needed — should fail before any LLM call.
+        let responses = vec![];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        // Run as sub-task (depth=1) with file hints in the objective.
+        let result = pipeline
+            .run_with_depth(
+                "test-subtask-preflight",
+                "Add metrics struct\n\nFiles from parent task: src/big.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+                1,
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::PlanFailed,
+            "oversized sub-task should fail at pre-flight, got {:?}, error: {:?}",
+            result.status,
+            result.error,
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("sub-task estimated at"),
+            "error should mention sub-task budget: {:?}",
+            result.error,
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_subtask_preflight_passes_small() {
+        // A sub-task with small files should pass the pre-flight check.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/small.rs"), "pub fn x() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add small file"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let responses = vec![
+            // 1. Implementer — write_file
+            tool_response(vec![ToolCall {
+                id: "t1".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/small.rs", "content": "pub fn x() {}\npub fn y() {}\n"}),
+            }]),
+            // 2. Implementer — final
+            final_response(
+                r#"{"files_changed": ["src/small.rs"], "tests_added": [], "commit_message": "feat: y", "summary": "done", "tests_passing": true}"#,
+            ),
+            // 3. Architect review — approve
+            final_response(
+                r#"{"verdict": "approve", "confidence": 0.9, "reasoning": "ok", "quality_score": 8, "issues": [], "architectural_fitness": "good", "merge_strategy": "squash"}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run_with_depth(
+                "test-subtask-small",
+                "Add y function\n\nFiles from parent task: src/small.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+                1,
+            )
+            .await;
+
+        assert_ne!(
+            result.status,
+            PipelineStatus::PlanFailed,
+            "small sub-task should pass pre-flight, got {:?}, error: {:?}",
+            result.status,
+            result.error,
         );
     }
 
