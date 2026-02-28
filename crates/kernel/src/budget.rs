@@ -86,6 +86,24 @@ impl BudgetTracker {
         Ok(())
     }
 
+    /// Human-readable summary of current budget state.
+    ///
+    /// Returns a single-line string with tokens used/remaining,
+    /// dollars used/remaining, and the number of LLM calls made.
+    pub fn display_budget(&self) -> String {
+        let calls = self.usage.call_count;
+        let call_label = if calls == 1 { "call" } else { "calls" };
+        format!(
+            "Tokens: {} used / {} remaining | Cost: ${:.4} used / ${:.2} remaining | {} {}",
+            self.usage.total_tokens,
+            self.tokens_remaining(),
+            self.usage.estimated_cost,
+            self.dollars_remaining(),
+            calls,
+            call_label,
+        )
+    }
+
     /// Summary snapshot for history/reporting.
     pub fn summary(&self) -> BudgetSummary {
         BudgetSummary {
@@ -169,5 +187,38 @@ mod tests {
         assert_eq!(summary.tokens_remaining, 7000);
         assert!((summary.dollars_remaining - 3.75).abs() < f64::EPSILON);
         assert_eq!(summary.call_count, 1);
+    }
+
+    #[test]
+    fn display_budget_fresh() {
+        let budget = BudgetTracker::new(10_000, 5.0);
+        let s = budget.display_budget();
+        assert!(s.contains("0"), "should show 0 tokens used");
+        assert!(s.contains("10000"), "should show max tokens");
+        assert!(s.contains("$0.0000"), "should show zero cost used");
+        assert!(s.contains("$5.00"), "should show max dollars");
+        assert!(s.contains("0 calls"), "should show call count");
+    }
+
+    #[test]
+    fn display_budget_after_usage() {
+        let mut budget = BudgetTracker::new(10_000, 5.0);
+        budget.record(2000, 1000, 1.25);
+        let s = budget.display_budget();
+        assert!(s.contains("3000"), "should show tokens used");
+        assert!(s.contains("7000"), "should show tokens remaining");
+        assert!(s.contains("$1.2500"), "should show cost used");
+        assert!(s.contains("$3.75"), "should show dollars remaining");
+        assert!(s.contains("1 call"), "should show call count");
+    }
+
+    #[test]
+    fn display_budget_multiple_calls() {
+        let mut budget = BudgetTracker::new(10_000, 5.0);
+        budget.record(1000, 500, 0.50);
+        budget.record(500, 250, 0.25);
+        let s = budget.display_budget();
+        assert!(s.contains("2250"), "should show total tokens used");
+        assert!(s.contains("2 calls"), "should show plural call count");
     }
 }
