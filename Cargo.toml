@@ -7,6 +7,7 @@ members = [
     "crates/eng-org",
     "crates/cli",
     "crates/ops-org",
+    "crates/dashboard",
 ]
 
 [workspace.package]
@@ -59,3 +60,4 @@ glitchlab-kernel = { path = "crates/kernel" }
 glitchlab-memory = { path = "crates/memory" }
 glitchlab-router = { path = "crates/router" }
 glitchlab-eng-org = { path = "crates/eng-org" }
+glitchlab-dashboard = { path = "crates/dashboard" }
