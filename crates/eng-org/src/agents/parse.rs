@@ -572,6 +572,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_malformed_json_fails_gracefully() {
+        // This JSON is malformed because the string "world" is not quoted.
+        let raw = r#"{"hello": world}"#;
+        let meta = test_meta();
+        let fallback = serde_json::json!({"fallback": true});
+        let output = parse_json_response(raw, meta, fallback);
+        assert!(output.parse_error);
+        assert_eq!(output.data["fallback"], true);
+    }
+
+    #[test]
     fn parse_json_with_line_comments() {
         let raw = r#"{
             // The verdict
