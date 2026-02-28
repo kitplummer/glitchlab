@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use glitchlab_kernel::tool::{ToolCall, ToolCallResult, ToolDefinition, ToolExecutor, ToolPolicy};
 use serde_json::json;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Maximum number of results returned by `list_files`.
 const LIST_FILES_CAP: usize = 500;
@@ -47,6 +49,17 @@ pub enum ToolExecutionOutcome {
     /// The tool failed with a permanent error that is unlikely to be resolved by a retry.
     /// The contained `ToolCallResult` has `is_error: true`.
     FatalFailure(ToolCallResult),
+}
+
+/// Returns tool definitions without `list_files`.
+///
+/// Used for short-circuit tasks where all relevant files are already in context,
+/// saving 2-4K tokens per unnecessary `list_files` call.
+pub fn tool_definitions_no_list() -> Vec<ToolDefinition> {
+    tool_definitions()
+        .into_iter()
+        .filter(|d| d.name != "list_files")
+        .collect()
 }
 
 /// Returns the 5 tool definitions offered to LLMs.
@@ -156,6 +169,10 @@ pub struct ToolDispatcher {
     working_dir: PathBuf,
     executor: ToolExecutor,
     protected_paths: Vec<String>,
+    /// Per-session cache for `read_file` results, keyed by relative path.
+    read_cache: Mutex<HashMap<String, String>>,
+    /// Number of cache hits (reads avoided).
+    cache_hits: Mutex<u32>,
 }
 
 impl ToolDispatcher {
@@ -175,7 +192,24 @@ impl ToolDispatcher {
             working_dir,
             executor,
             protected_paths,
+            read_cache: Mutex::new(HashMap::new()),
+            cache_hits: Mutex::new(0),
         }
+    }
+
+    /// Pre-seed the read cache with files already in the agent context.
+    /// This prevents the implementer from re-reading files that were
+    /// pre-loaded into its context window.
+    pub fn seed_cache(&self, file_context: &HashMap<String, String>) {
+        let mut cache = self.read_cache.lock().unwrap();
+        for (path, content) in file_context {
+            cache.insert(path.clone(), content.clone());
+        }
+    }
+
+    /// Return the number of cache hits (redundant reads avoided).
+    pub fn cache_hit_count(&self) -> u32 {
+        *self.cache_hits.lock().unwrap()
     }
 
     /// Execute a tool call and return the result. Never panics.
@@ -212,13 +246,31 @@ impl ToolDispatcher {
 
     async fn handle_read_file(&self, input: &serde_json::Value) -> Result<String, String> {
         let path = extract_str(input, "path")?;
+        let start_line = input.get("start_line").and_then(|v| v.as_u64());
+        let end_line = input.get("end_line").and_then(|v| v.as_u64());
+
+        // Check cache for full-file reads (no line range).
+        if start_line.is_none() && end_line.is_none() {
+            let hit = self.read_cache.lock().unwrap().get(path).cloned();
+            if let Some(cached) = hit {
+                debug!(path, "read_file cache hit — returning cached content");
+                *self.cache_hits.lock().unwrap() += 1;
+                return Ok(truncate_tool_output(&cached, READ_FILE_MAX_CHARS));
+            }
+        }
+
         let resolved = self.resolve_path(path)?;
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|e| format!("failed to read {path}: {e}"))?;
 
-        let start_line = input.get("start_line").and_then(|v| v.as_u64());
-        let end_line = input.get("end_line").and_then(|v| v.as_u64());
+        // Cache full-file reads for future dedup.
+        if start_line.is_none() && end_line.is_none() {
+            self.read_cache
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), content.clone());
+        }
 
         let output = match (start_line, end_line) {
             (Some(s), Some(e)) => {
@@ -535,6 +587,18 @@ mod tests {
     }
 
     #[test]
+    fn tool_definitions_no_list_excludes_list_files() {
+        let defs = tool_definitions_no_list();
+        assert_eq!(defs.len(), 4);
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"run_command"));
+        assert!(!names.contains(&"list_files"));
+    }
+
+    #[test]
     fn tool_definitions_schemas_are_valid() {
         for def in tool_definitions() {
             assert_eq!(def.input_schema["type"], "object");
@@ -807,5 +871,75 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("PROTECTED PATH"));
         assert!(result.content.contains("Do NOT retry"));
+    }
+
+    // -- read_file cache --
+
+    #[tokio::test]
+    async fn read_file_cache_returns_cached_on_second_read() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("cached.txt"), "original content").unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        // First read — cache miss, reads from disk.
+        let call = make_call("read_file", json!({"path": "cached.txt"}));
+        let result = dispatcher.dispatch(&call).await;
+        assert!(!result.is_error);
+        assert_eq!(result.content, "original content");
+        assert_eq!(dispatcher.cache_hit_count(), 0);
+
+        // Modify file on disk — cache should still return original.
+        std::fs::write(dir.path().join("cached.txt"), "modified content").unwrap();
+
+        let result2 = dispatcher.dispatch(&call).await;
+        assert!(!result2.is_error);
+        assert_eq!(result2.content, "original content");
+        assert_eq!(dispatcher.cache_hit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_file_cache_bypassed_for_line_ranges() {
+        let dir = TempDir::new().unwrap();
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("ranged.txt"), &content).unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+
+        // Seed cache with the file.
+        let mut ctx = HashMap::new();
+        ctx.insert("ranged.txt".into(), content);
+        dispatcher.seed_cache(&ctx);
+
+        // Line-range read should bypass cache (reads fresh from disk).
+        let call = make_call(
+            "read_file",
+            json!({"path": "ranged.txt", "start_line": 3, "end_line": 5}),
+        );
+        let result = dispatcher.dispatch(&call).await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("line 3"));
+        assert_eq!(
+            dispatcher.cache_hit_count(),
+            0,
+            "line-range should not use cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_cache_prevents_first_read() {
+        let dir = TempDir::new().unwrap();
+        // Don't write the file to disk — seed cache only.
+        let dispatcher = make_dispatcher(dir.path());
+        let mut ctx = HashMap::new();
+        ctx.insert("virtual.txt".into(), "seeded content".into());
+        dispatcher.seed_cache(&ctx);
+
+        let call = make_call("read_file", json!({"path": "virtual.txt"}));
+        let result = dispatcher.dispatch(&call).await;
+        assert!(!result.is_error);
+        assert_eq!(result.content, "seeded content");
+        assert_eq!(dispatcher.cache_hit_count(), 1);
     }
 }

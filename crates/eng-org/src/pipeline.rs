@@ -19,6 +19,8 @@ use glitchlab_memory::history::{EventsSummary, HistoryBackend, HistoryEntry};
 use tokio::process::Command;
 use tracing::{info, warn};
 
+use serde::{Deserialize, Serialize};
+
 use crate::agents::RouterRef;
 use crate::agents::architect::{ArchitectReviewAgent, ArchitectTriageAgent};
 use crate::agents::archivist::ArchivistAgent;
@@ -31,6 +33,21 @@ use crate::config::{EngConfig, TaskSize};
 use crate::indexer;
 use crate::tools::ToolDispatcher;
 use crate::workspace::Workspace;
+
+// ---------------------------------------------------------------------------
+// ImplementerEfficiency — token usage tracking
+// ---------------------------------------------------------------------------
+
+/// Tracks implementer tool usage efficiency for a single pipeline run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImplementerEfficiency {
+    /// Total tool calls made by the implementer.
+    pub total_tool_calls: u32,
+    /// Reads that returned cached content (files already in context).
+    pub redundant_reads: u32,
+    /// Number of `list_files` calls made.
+    pub list_files_calls: u32,
+}
 
 // ---------------------------------------------------------------------------
 // InterventionHandler — human-in-the-loop gate
@@ -774,7 +791,7 @@ impl EngineeringPipeline {
                     task_id,
                     estimated,
                     budget,
-                    "plan estimated to exceed 80% of budget — forcing decomposition"
+                    "plan estimated to exceed 90% of budget — forcing decomposition"
                 );
                 ctx.agent_context.previous_output = serde_json::json!({
                     "original_plan": plan_output.data,
@@ -1163,12 +1180,18 @@ impl EngineeringPipeline {
             self.config.boundaries.protected_paths.clone(),
             Duration::from_secs(120),
         );
-        let implementer = ImplementerAgent::new(
+        // Seed read cache with pre-loaded file contents so the implementer
+        // doesn't waste tool turns re-reading files already in context.
+        impl_dispatcher.seed_cache(&ctx.agent_context.file_context);
+        let mut implementer = ImplementerAgent::new(
             Arc::clone(&self.router),
             impl_dispatcher,
             task_size.max_tool_turns(),
             self.config.limits.max_stuck_turns,
         );
+        if use_short_circuit {
+            implementer = implementer.without_list_files();
+        }
         let mut impl_output = match implementer.execute(&ctx.agent_context).await {
             Ok(o) => o,
             Err(e) => {
@@ -1203,6 +1226,20 @@ impl EngineeringPipeline {
                     .await;
             }
         };
+        // Track implementer efficiency.
+        let efficiency = ImplementerEfficiency {
+            total_tool_calls: impl_output.metadata.tokens.min(u32::MAX as u64) as u32 / 3000, // approximate
+            redundant_reads: implementer.cache_hit_count(),
+            list_files_calls: 0, // TODO: track from dispatcher
+        };
+        if efficiency.redundant_reads > 0 {
+            info!(
+                task_id,
+                redundant_reads = efficiency.redundant_reads,
+                "implementer efficiency: redundant reads avoided by cache"
+            );
+        }
+
         self.emit(
             &mut ctx,
             EventKind::ImplementationComplete,
@@ -1210,6 +1247,24 @@ impl EngineeringPipeline {
         );
         ctx.stage_outputs
             .insert("implement".into(), impl_output.clone());
+
+        // Store efficiency data alongside implementation output.
+        if let Ok(eff_json) = serde_json::to_value(&efficiency) {
+            ctx.stage_outputs.insert(
+                "implementer_efficiency".into(),
+                AgentOutput {
+                    data: eff_json,
+                    metadata: AgentMetadata {
+                        agent: "efficiency_tracker".into(),
+                        model: String::new(),
+                        tokens: 0,
+                        cost: 0.0,
+                        latency_ms: 0,
+                    },
+                    parse_error: false,
+                },
+            );
+        }
 
         // Bail early if the implementer got stuck or produced no useful output.
         if impl_output.parse_error
@@ -2209,21 +2264,31 @@ async fn estimate_plan_tokens(repo_path: &Path, files: &[String], step_count: us
     }
 
     // Base context sent as input on every turn:
-    // - System prompt (~3K: implementer instructions, tools, workflow)
-    // - User message overhead (~5K: objective, constraints, module map, formatting)
+    // - System prompt (~2K: implementer instructions, tools, workflow)
+    // - User message overhead (~3K: objective, constraints, module map)
     // - File content (file_tokens: Relevant File Contents section)
-    let base_context = 8_000 + file_tokens;
+    // With the read cache (gl-eff.3), file_tokens are NOT re-read on
+    // subsequent turns, so we only count them once in base_context.
+    let base_context = 5_000 + file_tokens;
 
     // New content added to conversation history each turn:
     // - Model response (~2K: reasoning, tool calls)
-    // - Tool results (~3K: file reads, build/test output, edit confirmations)
-    let history_growth = 5_000;
+    // - Tool results (~2K: edit confirmations, build output)
+    // Reduced from 5K: the read cache prevents redundant file content
+    // from accumulating in history.
+    let history_growth = 4_000;
 
     // Average completion tokens generated per turn.
     let avg_completion = 2_000;
 
-    // Turns: implementation steps + write-tests + verify + lint.
-    let turns = step_count + 3;
+    // Turns: implementation steps + verify/lint.
+    // Sub-tasks (step_count=1) get +2 (implement + verify).
+    // Root tasks get +3 (test + implement + verify/lint).
+    let turns = if step_count <= 1 {
+        step_count + 2
+    } else {
+        step_count + 3
+    };
 
     // Quadratic total: each turn pays base + accumulated history + completion.
     turns * (base_context + avg_completion) + history_growth * turns * (turns - 1) / 2
@@ -3732,14 +3797,14 @@ mod tests {
         let files = vec!["src/lib.rs".to_string()];
         let estimated = estimate_plan_tokens(dir.path(), &files, 3).await;
 
-        // Quadratic model: turns = step_count + 3 = 6
-        // base_context = 8K + 800 = 8,800
-        // total = 6 * (8800 + 2000) + 5000 * 6 * 5 / 2
-        //       = 64,800 + 75,000 = 139,800
+        // Quadratic model: turns = step_count + 3 = 6 (root task, step_count=3)
+        // base_context = 5K + 800 = 5,800
+        // total = 6 * (5800 + 2000) + 4000 * 6 * 5 / 2
+        //       = 46,800 + 60,000 = 106,800
         let file_tokens = 100 * TOKENS_PER_LINE;
-        let base_context = 8_000 + file_tokens;
+        let base_context = 5_000 + file_tokens;
         let turns = 6;
-        let expected = turns * (base_context + 2_000) + 5_000 * turns * (turns - 1) / 2;
+        let expected = turns * (base_context + 2_000) + 4_000 * turns * (turns - 1) / 2;
         assert_eq!(
             estimated, expected,
             "should calculate correct token estimate"
@@ -3754,14 +3819,35 @@ mod tests {
         let estimated = estimate_plan_tokens(dir.path(), &files, 2).await;
 
         // Missing files contribute 0 file tokens.
-        // turns = 2 + 3 = 5, base_context = 8K
-        // total = 5 * (8K + 2K) + 5K * 5 * 4 / 2 = 50K + 50K = 100K
+        // turns = 2 + 3 = 5 (root task, step_count=2), base_context = 5K
+        // total = 5 * (5K + 2K) + 4K * 5 * 4 / 2 = 35K + 40K = 75K
         let turns = 5;
-        let expected = turns * (8_000 + 2_000) + 5_000 * turns * (turns - 1) / 2;
+        let expected = turns * (5_000 + 2_000) + 4_000 * turns * (turns - 1) / 2;
         assert_eq!(
             estimated, expected,
             "missing files should contribute 0 tokens"
         );
+    }
+
+    #[test]
+    fn implementer_efficiency_default() {
+        let eff = ImplementerEfficiency::default();
+        assert_eq!(eff.total_tool_calls, 0);
+        assert_eq!(eff.redundant_reads, 0);
+        assert_eq!(eff.list_files_calls, 0);
+    }
+
+    #[test]
+    fn implementer_efficiency_serializable() {
+        let eff = ImplementerEfficiency {
+            total_tool_calls: 10,
+            redundant_reads: 3,
+            list_files_calls: 1,
+        };
+        let json = serde_json::to_value(&eff).unwrap();
+        assert_eq!(json["redundant_reads"], 3);
+        let deser: ImplementerEfficiency = serde_json::from_value(json).unwrap();
+        assert_eq!(deser.total_tool_calls, 10);
     }
 
     #[tokio::test]
@@ -3785,16 +3871,16 @@ mod tests {
         let threshold = budget * 90 / 100;
         assert!(
             estimated > threshold,
-            "1405-line file must exceed 70% budget gate: estimated={estimated}, threshold={threshold}"
+            "1405-line file must exceed 90% budget gate: estimated={estimated}, threshold={threshold}"
         );
     }
 
     #[tokio::test]
-    async fn estimate_plan_tokens_subtask_catches_medium_file() {
-        // Sub-tasks use step_count=1. A 500-line file (4K file tokens) should
-        // be caught by the pre-flight check at 90% of 80K budget = 72K.
+    async fn estimate_plan_tokens_subtask_catches_large_file() {
+        // Sub-tasks use step_count=1, turns=3. A 1700-line file (13.6K tokens)
+        // should be caught by the pre-flight check at 90% of 80K budget = 72K.
         let dir = tempfile::tempdir().unwrap();
-        let content: String = (0..500).map(|i| format!("// line {i}\n")).collect();
+        let content: String = (0..1700).map(|i| format!("// line {i}\n")).collect();
         tokio::fs::create_dir_all(dir.path().join("src"))
             .await
             .unwrap();
@@ -3810,16 +3896,16 @@ mod tests {
         let threshold = budget * 90 / 100;
         assert!(
             estimated > threshold,
-            "500-line sub-task must exceed pre-flight: estimated={estimated}, threshold={threshold}"
+            "1700-line sub-task must exceed pre-flight: estimated={estimated}, threshold={threshold}"
         );
     }
 
     #[tokio::test]
-    async fn estimate_plan_tokens_subtask_passes_small_file() {
-        // Sub-tasks with small files (<100 lines) should pass pre-flight.
-        // Pre-flight uses 90% of config budget (80K) = 72K threshold.
+    async fn estimate_plan_tokens_subtask_passes_medium_file() {
+        // Sub-tasks with medium files (~500 lines) should pass pre-flight
+        // now that the estimator accounts for read cache and fewer turns.
         let dir = tempfile::tempdir().unwrap();
-        let content: String = (0..60).map(|i| format!("// line {i}\n")).collect();
+        let content: String = (0..500).map(|i| format!("// line {i}\n")).collect();
         tokio::fs::create_dir_all(dir.path().join("src"))
             .await
             .unwrap();
@@ -3835,7 +3921,7 @@ mod tests {
         let threshold = budget * 90 / 100;
         assert!(
             estimated < threshold,
-            "60-line sub-task should pass pre-flight: estimated={estimated}, threshold={threshold}"
+            "500-line sub-task should pass pre-flight: estimated={estimated}, threshold={threshold}"
         );
     }
 
@@ -4241,7 +4327,7 @@ mod tests {
 
         // Mirrors the actual canary failure: a 1400-line file that blew budget.
         // Quadratic model (step_count=3, turns=6, file_tokens=11200):
-        //   6 * (8K+11200+2K) + 5K*15 = 127,200 + 75,000 = 202,200 > 72K (90% of 80K)
+        //   6 * (5K+11200+2K) + 4K*15 = 109,200 + 60,000 = 169,200 > 72K (90% of 80K)
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let big_content: String = (0..1_400).map(|i| format!("// line {i}\n")).collect();
         std::fs::write(dir.path().join("src/big.rs"), &big_content).unwrap();
@@ -4409,8 +4495,10 @@ mod tests {
         let base_branch = init_test_repo(dir.path());
 
         // Create a large file that exceeds the budget pre-flight.
+        // With the efficiency-adjusted estimator (turns=3, base=5K, growth=4K),
+        // a file needs ~1700+ lines to exceed 90% of 80K = 72K.
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        let big_content: String = (0..1_400).map(|i| format!("// line {i}\n")).collect();
+        let big_content: String = (0..2_000).map(|i| format!("// line {i}\n")).collect();
         std::fs::write(dir.path().join("src/big.rs"), &big_content).unwrap();
         std::process::Command::new("git")
             .args(["add", "-A"])

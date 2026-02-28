@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use glitchlab_kernel::agent::{
     Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageContent, MessageRole,
 };
@@ -8,9 +10,19 @@ use super::build_user_message;
 use super::parse::parse_json_response;
 use super::{StuckReason, ToolLoopOutcome, ToolLoopParams, tool_use_loop};
 use crate::agents::RouterRef;
-use crate::tools::{ToolDispatcher, tool_definitions};
+use crate::tools::{ToolDispatcher, tool_definitions, tool_definitions_no_list};
 
-fn system_prompt(max_turns: u32) -> String {
+fn system_prompt(max_turns: u32, has_file_context: bool) -> String {
+    let file_context_rule = if has_file_context {
+        "\n\nCRITICAL — The user message contains a \"Relevant File Contents\" section with \
+         pre-loaded file contents. These files are ALREADY in your context. \
+         Do NOT call `read_file` on any file listed there — it wastes a tool turn \
+         and duplicates tokens you already have. Only use `read_file` for files NOT \
+         in that section."
+    } else {
+        ""
+    };
+
     format!(
         r#"You are Patch, the implementation engine inside GLITCHLAB.
 
@@ -23,23 +35,31 @@ Each turn costs ~3-5K tokens. Budget is tight — do not explore.
 Each turn may include MULTIPLE tool calls — batch aggressively to stay within budget.
 Reserve 2 turns for final verification. You WILL be terminated if you exceed budget.
 
+## Context hierarchy (IMPORTANT — read this before making ANY tool call)
+
+Your context is assembled in priority order. Use the HIGHEST priority source available:
+
+1. **Relevant File Contents** (in user message) — HIGHEST PRIORITY. These files are
+   pre-loaded. NEVER call `read_file` on them. Use `edit_file` directly — copy the
+   exact string to replace from the content already shown.
+2. **Rust Module Map** (in user message) — Shows the project structure: crates, modules,
+   public items. Use this to locate code instead of calling `list_files`.
+3. **Codebase Overview** (in user message) — Architecture context.
+4. **Tools** (below) — LOWEST PRIORITY. Only call tools for information NOT already
+   provided above.{file_context_rule}
+
 ## Available tools
 
-- `read_file` — Read a file's contents. Supports optional `start_line` and `end_line`
-  parameters to read a specific range (1-based, inclusive). For large files (>200 lines),
-  you MUST use line ranges from the plan's read hints. Never read an entire large file
-  when the plan specifies which section you need. Only use if the file is NOT already
-  in the Relevant File Contents section below.
-- `list_files` — List files matching a glob pattern (e.g. "crates/**/*.rs", "src/*.ts").
-  Only use if the "Codebase Overview" and "Rust Module Map" sections below don't already
-  answer your question. These sections tell you where files are — do NOT re-discover
-  with `list_files` what is already provided.
+- `read_file` — Read a file NOT already in Relevant File Contents. Supports optional
+  `start_line` and `end_line` for ranges (1-based, inclusive). For large files (>200
+  lines), you MUST use line ranges from the plan's read hints.
+- `list_files` — List files matching a glob. Only use if the Module Map doesn't already
+  answer your question.
 - `write_file` — Create or overwrite a file.
 - `edit_file` — Replace an exact string in a file. The `old_string` must be a UNIQUE,
-  EXACT match of existing content (copy it from `read_file` output). Include enough
-  surrounding context lines to ensure uniqueness.
+  EXACT match (copy it from pre-loaded content or `read_file` output).
 - `run_command` — Run a shell command. Allowed: build, test, lint, git, and read-only
-  commands (find, ls, grep, head, tail, cat). NOT allowed: curl, wget, sudo, rm -rf.
+  commands. NOT allowed: curl, wget, sudo, rm -rf.
 
 ## IMPORTANT: Parallel tool calls
 
@@ -94,9 +114,11 @@ Rules:
 
 pub struct ImplementerAgent {
     router: RouterRef,
-    dispatcher: ToolDispatcher,
+    dispatcher: Arc<ToolDispatcher>,
     max_tool_turns: u32,
     max_stuck_turns: u32,
+    /// When true, `list_files` is excluded from the tool set (short-circuit tasks).
+    exclude_list_files: bool,
 }
 
 impl ImplementerAgent {
@@ -108,10 +130,23 @@ impl ImplementerAgent {
     ) -> Self {
         Self {
             router,
-            dispatcher,
+            dispatcher: Arc::new(dispatcher),
             max_tool_turns,
             max_stuck_turns,
+            exclude_list_files: false,
         }
+    }
+
+    /// Exclude `list_files` from the tool set. Used for short-circuit tasks
+    /// where all relevant files are already in context.
+    pub fn without_list_files(mut self) -> Self {
+        self.exclude_list_files = true;
+        self
+    }
+
+    /// Return the number of redundant reads avoided by the cache.
+    pub fn cache_hit_count(&self) -> u32 {
+        self.dispatcher.cache_hit_count()
     }
 }
 
@@ -125,10 +160,11 @@ impl Agent for ImplementerAgent {
     }
 
     async fn execute(&self, ctx: &AgentContext) -> error::Result<AgentOutput> {
+        let has_file_context = !ctx.file_context.is_empty();
         let mut messages = vec![
             Message {
                 role: MessageRole::System,
-                content: MessageContent::Text(system_prompt(self.max_tool_turns)),
+                content: MessageContent::Text(system_prompt(self.max_tool_turns, has_file_context)),
             },
             Message {
                 role: MessageRole::User,
@@ -136,7 +172,11 @@ impl Agent for ImplementerAgent {
             },
         ];
 
-        let tool_defs = tool_definitions();
+        let tool_defs = if self.exclude_list_files {
+            tool_definitions_no_list()
+        } else {
+            tool_definitions()
+        };
         let params = ToolLoopParams {
             tool_defs: &tool_defs,
             dispatcher: &self.dispatcher,
@@ -243,7 +283,7 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_turn_count() {
-        let prompt = system_prompt(15);
+        let prompt = system_prompt(15, false);
         assert!(
             prompt.contains("15 tool-call turns"),
             "prompt should embed the turn count"
@@ -267,8 +307,38 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_contains_context_hierarchy() {
+        let prompt = system_prompt(10, true);
+        assert!(
+            prompt.contains("Context hierarchy"),
+            "prompt should have context hierarchy section"
+        );
+        assert!(
+            prompt.contains("HIGHEST PRIORITY"),
+            "prompt should mark pre-loaded files as highest priority"
+        );
+        assert!(
+            prompt.contains("NEVER call `read_file` on them"),
+            "prompt should forbid re-reading pre-loaded files"
+        );
+        assert!(
+            prompt.contains("CRITICAL"),
+            "prompt should have critical warning when file context is present"
+        );
+    }
+
+    #[test]
+    fn system_prompt_without_file_context_omits_critical_warning() {
+        let prompt = system_prompt(10, false);
+        assert!(
+            !prompt.contains("Do NOT call `read_file` on any file listed there"),
+            "no-context prompt should not have the critical file context warning"
+        );
+    }
+
+    #[test]
     fn system_prompt_contains_module_map_hint() {
-        let prompt = system_prompt(10);
+        let prompt = system_prompt(10, false);
         assert!(
             prompt.contains("Rust Module Map"),
             "prompt should reference Rust Module Map"
@@ -281,7 +351,7 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_tdd_workflow() {
-        let prompt = system_prompt(10);
+        let prompt = system_prompt(10, false);
         assert!(
             prompt.contains("Write tests first"),
             "prompt should enforce test-first ordering"
@@ -298,20 +368,16 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_read_hints() {
-        let prompt = system_prompt(10);
+        let prompt = system_prompt(10, false);
         assert!(
             prompt.contains("MUST use line ranges from the plan's read hints"),
             "prompt should enforce read hints for large files"
-        );
-        assert!(
-            prompt.contains("Never read an entire large file"),
-            "prompt should forbid reading entire large files when hints exist"
         );
     }
 
     #[test]
     fn system_prompt_contains_red_green() {
-        let prompt = system_prompt(10);
+        let prompt = system_prompt(10, false);
         assert!(
             prompt.contains("MUST fail"),
             "prompt should require red phase"
