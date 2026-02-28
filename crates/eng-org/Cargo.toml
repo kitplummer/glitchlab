@@ -20,6 +20,8 @@ chrono.workspace = true
 uuid.workspace = true
 glob.workspace = true
 schemars = { workspace = true, features = ["derive"] }
+opentelemetry.workspace = true
+once_cell.workspace = true
 
 [features]
 live = []
