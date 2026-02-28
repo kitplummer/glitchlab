@@ -115,7 +115,8 @@ Rules:
   the feasible parts can proceed independently.
 - Default to NOT decomposing. Only decompose when the task genuinely cannot fit in one pass.
 - CRITICAL: Output ONLY the raw JSON object. No text before or after it.
-  No markdown code fences. No explanations. Just the JSON."#;
+  No markdown code fences. No explanations. Just the JSON.
+  Ensure all strings are correctly escaped for JSON."#;
 
 pub struct PlannerAgent {
     router: RouterRef,
@@ -238,6 +239,18 @@ mod tests {
         assert!(
             SYSTEM_PROMPT.contains("~120K tokens"),
             "prompt should reference 120K budget"
+        );
+    }
+
+    #[test]
+    fn system_prompt_has_strict_json_rules() {
+        assert!(
+            SYSTEM_PROMPT.contains("CRITICAL: Output ONLY the raw JSON object."),
+            "prompt should have the original critical instruction"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("Ensure all strings are correctly escaped for JSON."),
+            "prompt should contain string escaping instructions"
         );
     }
 }
