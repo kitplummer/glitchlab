@@ -1,6 +1,39 @@
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// Outcome — final result of a pipeline run
+// ---------------------------------------------------------------------------
+
+/// The final result of a pipeline run, capturing either success or failure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Outcome {
+    /// The pipeline completed its objective successfully.
+    Completed(CompletionContext),
+    /// The pipeline failed to complete its objective.
+    Failed(OutcomeContext),
+}
+
+// ---------------------------------------------------------------------------
+// CompletionContext — structured context from a successful pipeline run
+// ---------------------------------------------------------------------------
+
+/// Structured context captured when a pipeline run succeeds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionContext {
+    /// A concise, one-sentence summary of what was accomplished.
+    pub summary: String,
+
+    /// Files that were created or modified during the pipeline run.
+    #[serde(default)]
+    pub files_changed: Vec<String>,
+
+    /// New tests that were added.
+    #[serde(default)]
+    pub tests_added: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // OutcomeContext — structured context from a pipeline failure
 // ---------------------------------------------------------------------------
 
@@ -87,6 +120,65 @@ mod tests {
     fn roundtrip<T: Serialize + for<'de> Deserialize<'de>>(val: &T) -> T {
         let json = serde_json::to_string(val).unwrap();
         serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn outcome_completed_serde() {
+        let outcome = Outcome::Completed(CompletionContext {
+            summary: "Implemented the feature".into(),
+            files_changed: vec!["src/main.rs".into()],
+            tests_added: vec!["tests/test_main.rs".into()],
+        });
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"status\":\"completed\""));
+        assert!(json.contains("\"summary\":\"Implemented the feature\""));
+        let parsed: Outcome = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Outcome::Completed(ctx) => {
+                assert_eq!(ctx.summary, "Implemented the feature");
+                assert_eq!(ctx.files_changed, vec!["src/main.rs"]);
+                assert_eq!(ctx.tests_added, vec!["tests/test_main.rs"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn outcome_failed_serde() {
+        let outcome = Outcome::Failed(OutcomeContext {
+            approach: "Tried to implement".into(),
+            obstacle: ObstacleKind::TestFailure {
+                attempts: 3,
+                last_error: "assertion failed".into(),
+            },
+            discoveries: vec![],
+            recommendation: None,
+            files_explored: vec!["src/main.rs".into()],
+        });
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(json.contains("\"status\":\"failed\""));
+        assert!(json.contains("\"approach\":\"Tried to implement\""));
+        let parsed: Outcome = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Outcome::Failed(ctx) => {
+                assert_eq!(ctx.approach, "Tried to implement");
+                assert_eq!(ctx.files_explored, vec!["src/main.rs"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn completion_context_serde() {
+        let ctx = CompletionContext {
+            summary: "Fixed a bug".into(),
+            files_changed: vec!["a.txt".into()],
+            tests_added: vec![],
+        };
+        let parsed = roundtrip(&ctx);
+        assert_eq!(parsed.summary, "Fixed a bug");
+        assert_eq!(parsed.files_changed, vec!["a.txt"]);
+        assert!(parsed.tests_added.is_empty());
     }
 
     #[test]
