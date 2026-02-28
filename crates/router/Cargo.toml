@@ -16,6 +16,8 @@ reqwest.workspace = true
 backon.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
