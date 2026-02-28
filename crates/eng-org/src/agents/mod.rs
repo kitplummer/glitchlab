@@ -1,6 +1,7 @@
 pub mod architect;
 pub mod archivist;
 pub mod ciso;
+pub mod claude_code;
 pub mod debugger;
 pub mod implementer;
 pub mod ops;

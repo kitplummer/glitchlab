@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::agents::RouterRef;
 use crate::agents::architect::{ArchitectReviewAgent, ArchitectTriageAgent};
 use crate::agents::archivist::ArchivistAgent;
+use crate::agents::claude_code::{ClaudeCodeConfig, ClaudeCodeImplementer};
 use crate::agents::debugger::DebuggerAgent;
 use crate::agents::implementer::ImplementerAgent;
 use crate::agents::planner::PlannerAgent;
@@ -1170,34 +1171,77 @@ impl EngineeringPipeline {
         ctx.current_stage = Some("implement".into());
         ctx.agent_context.previous_output = plan_output.data.clone();
 
-        let impl_tool_policy = ToolPolicy::new(
-            self.config.allowed_tools.clone(),
-            self.config.blocked_patterns.clone(),
-        );
-        let impl_dispatcher = ToolDispatcher::new(
-            wt_path.clone(),
-            impl_tool_policy,
-            self.config.boundaries.protected_paths.clone(),
-            Duration::from_secs(120),
-        );
-        // Seed read cache with pre-loaded file contents so the implementer
-        // doesn't waste tool turns re-reading files already in context.
-        impl_dispatcher.seed_cache(&ctx.agent_context.file_context);
-        let mut implementer = ImplementerAgent::new(
-            Arc::clone(&self.router),
-            impl_dispatcher,
-            task_size.max_tool_turns(),
-            self.config.limits.max_stuck_turns,
-        );
-        if use_short_circuit {
-            implementer = implementer.without_list_files();
-        }
-        let mut impl_output = match implementer.execute(&ctx.agent_context).await {
-            Ok(o) => o,
-            Err(e) => {
-                let err_str = e.to_string();
-                let obstacle =
-                    if err_str.contains("budget exceeded") || err_str.contains("budget_exceeded") {
+        // Select implementer backend: Claude Code CLI or native tool-use loop.
+        let use_claude_code = self.config.pipeline.use_claude_code_implementer;
+        let (mut impl_output, cache_hits) = if use_claude_code {
+            info!(task_id, "using Claude Code implementer backend");
+            let cc_config = ClaudeCodeConfig {
+                model: self.config.pipeline.claude_code_model.clone(),
+                max_budget_usd: self.config.pipeline.claude_code_budget_usd,
+                max_turns: (task_size.max_tool_turns() * 3).max(20), // Claude Code turns are cheaper
+                claude_bin: "claude".into(),
+            };
+            let cc_agent = ClaudeCodeImplementer::new(cc_config);
+            match cc_agent.execute(&ctx.agent_context).await {
+                Ok(o) => (o, 0u32),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let obstacle = glitchlab_kernel::outcome::ObstacleKind::ModelLimitation {
+                        model: format!("claude-code/{}", self.config.pipeline.claude_code_model),
+                        error_class: err_str.clone(),
+                    };
+                    return self
+                        .fail_with_context(
+                            ctx,
+                            PipelineStatus::ImplementationFailed,
+                            err_str,
+                            Some(OutcomeContext {
+                                approach: "claude-code implementation".into(),
+                                obstacle,
+                                discoveries: vec![],
+                                recommendation: Some(
+                                    "Check claude CLI availability and API key".into(),
+                                ),
+                                files_explored: vec![],
+                            }),
+                        )
+                        .await;
+                }
+            }
+        } else {
+            let impl_tool_policy = ToolPolicy::new(
+                self.config.allowed_tools.clone(),
+                self.config.blocked_patterns.clone(),
+            );
+            let impl_dispatcher = ToolDispatcher::new(
+                wt_path.clone(),
+                impl_tool_policy,
+                self.config.boundaries.protected_paths.clone(),
+                Duration::from_secs(120),
+            );
+            // Seed read cache with pre-loaded file contents so the implementer
+            // doesn't waste tool turns re-reading files already in context.
+            impl_dispatcher.seed_cache(&ctx.agent_context.file_context);
+            let mut implementer = ImplementerAgent::new(
+                Arc::clone(&self.router),
+                impl_dispatcher,
+                task_size.max_tool_turns(),
+                self.config.limits.max_stuck_turns,
+            );
+            if use_short_circuit {
+                implementer = implementer.without_list_files();
+            }
+            let hits = implementer.cache_hit_count();
+            match implementer.execute(&ctx.agent_context).await {
+                Ok(o) => {
+                    let cache_hits = implementer.cache_hit_count() - hits;
+                    (o, cache_hits)
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let obstacle = if err_str.contains("budget exceeded")
+                        || err_str.contains("budget_exceeded")
+                    {
                         glitchlab_kernel::outcome::ObstacleKind::ModelLimitation {
                             model: "unknown".into(),
                             error_class: "budget_exceeded".into(),
@@ -1208,28 +1252,30 @@ impl EngineeringPipeline {
                             error_class: err_str.clone(),
                         }
                     };
-                return self
-                    .fail_with_context(
-                        ctx,
-                        PipelineStatus::ImplementationFailed,
-                        err_str,
-                        Some(OutcomeContext {
-                            approach: "direct implementation".into(),
-                            obstacle,
-                            discoveries: vec![],
-                            recommendation: Some(
-                                "Try a different implementation approach or simpler plan".into(),
-                            ),
-                            files_explored: vec![],
-                        }),
-                    )
-                    .await;
+                    return self
+                        .fail_with_context(
+                            ctx,
+                            PipelineStatus::ImplementationFailed,
+                            err_str,
+                            Some(OutcomeContext {
+                                approach: "direct implementation".into(),
+                                obstacle,
+                                discoveries: vec![],
+                                recommendation: Some(
+                                    "Try a different implementation approach or simpler plan"
+                                        .into(),
+                                ),
+                                files_explored: vec![],
+                            }),
+                        )
+                        .await;
+                }
             }
         };
         // Track implementer efficiency.
         let efficiency = ImplementerEfficiency {
             total_tool_calls: impl_output.metadata.tokens.min(u32::MAX as u64) as u32 / 3000, // approximate
-            redundant_reads: implementer.cache_hit_count(),
+            redundant_reads: cache_hits,
             list_files_calls: 0, // TODO: track from dispatcher
         };
         if efficiency.redundant_reads > 0 {

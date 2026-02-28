@@ -78,10 +78,28 @@ pub struct PipelineConfig {
     /// eligibility. Tasks affecting more files use the full pipeline.
     #[serde(default = "default_short_circuit_max_files")]
     pub short_circuit_max_files: usize,
+    /// When true, use the Claude Code CLI as the implementer backend instead
+    /// of the native tool-use loop. Requires `claude` on PATH.
+    #[serde(default)]
+    pub use_claude_code_implementer: bool,
+    /// Model to use with the Claude Code implementer (e.g. "sonnet", "opus").
+    #[serde(default = "default_claude_code_model")]
+    pub claude_code_model: String,
+    /// Maximum dollar budget per Claude Code invocation.
+    #[serde(default = "default_claude_code_budget")]
+    pub claude_code_budget_usd: f64,
 }
 
 fn default_short_circuit_max_files() -> usize {
     2
+}
+
+fn default_claude_code_model() -> String {
+    "sonnet".into()
+}
+
+fn default_claude_code_budget() -> f64 {
+    0.50
 }
 
 impl Default for PipelineConfig {
@@ -89,6 +107,9 @@ impl Default for PipelineConfig {
         Self {
             short_circuit_enabled: false,
             short_circuit_max_files: default_short_circuit_max_files(),
+            use_claude_code_implementer: false,
+            claude_code_model: default_claude_code_model(),
+            claude_code_budget_usd: default_claude_code_budget(),
         }
     }
 }
