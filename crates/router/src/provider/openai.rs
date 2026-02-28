@@ -31,7 +31,9 @@ impl OpenAiProvider {
     pub fn openai_from_env() -> Result<Self, ProviderError> {
         let key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| ProviderError::MissingApiKey("OPENAI_API_KEY".into()))?;
-        Ok(Self::new(key, OPENAI_API_URL.into(), "openai".into()))
+        let base_url =
+            std::env::var("OPENAI_API_BASE").unwrap_or_else(|_| OPENAI_API_URL.to_string());
+        Ok(Self::new(key, base_url, "openai".into()))
     }
 
     pub fn custom(api_key: String, base_url: String, name: String) -> Self {
