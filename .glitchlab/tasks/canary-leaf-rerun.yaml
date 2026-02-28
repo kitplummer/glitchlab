@@ -1,0 +1,59 @@
+tasks:
+- id: canary-size-m-role-preference-derives
+  objective: |
+    Add `Display`, `PartialEq`, and `Eq` derives/impls for the
+    `RolePreference` struct in `crates/router/src/chooser.rs`. The struct
+    has `min_tier: ModelTier` and `requires: Vec<String>`. Display format:
+    `"min_tier={tier}, requires=[{caps}]"` e.g. `"min_tier=standard,
+    requires=[tool_use, code]"`. Derive `PartialEq` and `Eq`. Add 2-3 unit
+    tests: (1) Display with capabilities, (2) Display with empty requires,
+    (3) PartialEq equality and inequality. This is a 1-file, ~4-edit change.
+    Use `read_file` to read lines 60-120 of `chooser.rs`.
+  priority: 10
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  pr_url: https://github.com/kitplummer/glitchlab/pull/78
+  remediation_depth: 0
+  is_remediation: false
+- id: add-model-profile-display-part1
+  objective: Implement the `Display` trait for the `ModelProfile` struct.
+  priority: 50
+  status: completed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'architect requested changes: []'
+  pr_url: https://github.com/kitplummer/glitchlab/pull/79
+  outcome_context:
+    approach: implementation completed but architect requested changes
+    obstacle:
+      kind: architectural_gap
+      description: '[]'
+    discoveries: []
+    recommendation: review agent failed
+    files_explored: []
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: add-router-tracing-part1-setup-and-metrics-struct
+  objective: Add `tracing` dependency to `glitchlab-router`'s `Cargo.toml` and define the `RouterMetrics` struct in `router.rs` to aggregate call count, total tokens, total cost, and average latency.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: 'budget exceeded: token limit exceeded: 124072 / 120000 tokens used'
+  outcome_context:
+    approach: direct implementation
+    obstacle:
+      kind: model_limitation
+      model: unknown
+      error_class: budget_exceeded
+    discoveries: []
+    recommendation: Try a different implementation approach or simpler plan
+    files_explored: []
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/Cargo.toml
+  - crates/router/src/router.rs
