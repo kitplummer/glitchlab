@@ -626,10 +626,13 @@ impl EngineeringPipeline {
             // --- Sub-task budget pre-flight ---
             // Sub-tasks skip the planner, so they bypass the budget estimation
             // gate. Check here: if the files are too large for the budget, fail
-            // fast instead of wasting 120K tokens on a doomed implementation.
+            // fast instead of wasting tokens on a doomed implementation.
             let estimated = estimate_plan_tokens(repo_path, &files, 1).await;
-            let budget_limit = TaskSize::M.max_tokens() as usize;
-            if estimated > (budget_limit * 70 / 100) {
+            let budget_limit = self.config.limits.max_tokens_per_task as usize;
+            // Sub-tasks use a higher threshold (90%) than root tasks (70%)
+            // because the estimator is deliberately pessimistic and sub-tasks
+            // are already narrowly scoped by decomposition.
+            if estimated > (budget_limit * 90 / 100) {
                 warn!(
                     task_id,
                     estimated,
@@ -761,12 +764,12 @@ impl EngineeringPipeline {
                 .map(|a| a.len())
                 .unwrap_or(1);
             let estimated = estimate_plan_tokens(repo_path, &plan_files, step_count).await;
-            let budget = TaskSize::M.max_tokens() as usize; // default pre-triage size
+            let budget = self.config.limits.max_tokens_per_task as usize;
 
-            // 70% threshold — conservative. An unnecessary decomposition costs ~21K
-            // overhead. A budget failure wastes the full 120K. Err on the side of
-            // decomposing.
-            if estimated > (budget * 70 / 100) {
+            // 90% threshold — the estimator is deliberately pessimistic, so the
+            // gate catches plans that would clearly blow budget while allowing
+            // borderline cases to attempt execution.
+            if estimated > (budget * 90 / 100) {
                 warn!(
                     task_id,
                     estimated,
@@ -3777,8 +3780,9 @@ mod tests {
         let files = vec!["crates/router/src/router.rs".to_string()];
         let estimated = estimate_plan_tokens(dir.path(), &files, 3).await;
 
-        let budget = TaskSize::M.max_tokens() as usize; // 120K
-        let threshold = budget * 70 / 100; // 84K — matches the conservative gate
+        // Budget gate uses config (default 80K) at 90% threshold = 72K.
+        let budget = 80_000usize; // matches default config max_tokens_per_task
+        let threshold = budget * 90 / 100;
         assert!(
             estimated > threshold,
             "1405-line file must exceed 70% budget gate: estimated={estimated}, threshold={threshold}"
@@ -3788,7 +3792,7 @@ mod tests {
     #[tokio::test]
     async fn estimate_plan_tokens_subtask_catches_medium_file() {
         // Sub-tasks use step_count=1. A 500-line file (4K file tokens) should
-        // be caught by the pre-flight check at 70% of 120K budget.
+        // be caught by the pre-flight check at 90% of 80K budget = 72K.
         let dir = tempfile::tempdir().unwrap();
         let content: String = (0..500).map(|i| format!("// line {i}\n")).collect();
         tokio::fs::create_dir_all(dir.path().join("src"))
@@ -3801,8 +3805,9 @@ mod tests {
         let files = vec!["src/mod.rs".to_string()];
         let estimated = estimate_plan_tokens(dir.path(), &files, 1).await;
 
-        let budget = TaskSize::M.max_tokens() as usize;
-        let threshold = budget * 70 / 100; // 84K
+        // Pre-flight uses 90% threshold for sub-tasks.
+        let budget = 80_000usize;
+        let threshold = budget * 90 / 100;
         assert!(
             estimated > threshold,
             "500-line sub-task must exceed pre-flight: estimated={estimated}, threshold={threshold}"
@@ -3811,9 +3816,10 @@ mod tests {
 
     #[tokio::test]
     async fn estimate_plan_tokens_subtask_passes_small_file() {
-        // Sub-tasks with small files (<300 lines) should pass pre-flight.
+        // Sub-tasks with small files (<100 lines) should pass pre-flight.
+        // Pre-flight uses 90% of config budget (80K) = 72K threshold.
         let dir = tempfile::tempdir().unwrap();
-        let content: String = (0..200).map(|i| format!("// line {i}\n")).collect();
+        let content: String = (0..60).map(|i| format!("// line {i}\n")).collect();
         tokio::fs::create_dir_all(dir.path().join("src"))
             .await
             .unwrap();
@@ -3824,11 +3830,12 @@ mod tests {
         let files = vec!["src/small.rs".to_string()];
         let estimated = estimate_plan_tokens(dir.path(), &files, 1).await;
 
-        let budget = TaskSize::M.max_tokens() as usize;
-        let threshold = budget * 70 / 100; // 84K
+        // Pre-flight uses 90% threshold for sub-tasks.
+        let budget = 80_000usize;
+        let threshold = budget * 90 / 100;
         assert!(
             estimated < threshold,
-            "200-line sub-task should pass pre-flight: estimated={estimated}, threshold={threshold}"
+            "60-line sub-task should pass pre-flight: estimated={estimated}, threshold={threshold}"
         );
     }
 
@@ -4232,9 +4239,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base_branch = init_test_repo(dir.path());
 
-        // Mirrors the actual canary failure: a 1400-line file that blew 124K/120K.
+        // Mirrors the actual canary failure: a 1400-line file that blew budget.
         // Quadratic model (step_count=3, turns=6, file_tokens=11200):
-        //   6 * (8K+11200+2K) + 5K*15 = 127,200 + 75,000 = 202,200 > 84K
+        //   6 * (8K+11200+2K) + 5K*15 = 127,200 + 75,000 = 202,200 > 72K (90% of 80K)
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let big_content: String = (0..1_400).map(|i| format!("// line {i}\n")).collect();
         std::fs::write(dir.path().join("src/big.rs"), &big_content).unwrap();
@@ -6993,12 +7000,12 @@ mod tests {
             result.error
         );
 
-        // Budget effective limit = M ceiling (120k) + planner overhead.
+        // Budget effective limit = config max_tokens_per_task (80k) + planner overhead.
         // Short-circuit skips triage, so overhead is just the planner call.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 121_000,
-            "short-circuit should use ~M budget (120k + overhead), got remaining: {}",
+            summary.tokens_remaining <= 81_000,
+            "short-circuit should use ~M budget (80k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }

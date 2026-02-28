@@ -27,8 +27,8 @@ impl TaskSize {
     pub fn max_tokens(&self) -> u64 {
         match self {
             Self::S => 20_000,
-            Self::M => 120_000,
-            Self::L => 120_000,
+            Self::M => 80_000,
+            Self::L => 100_000,
             Self::XL => 0,
         }
     }
@@ -337,7 +337,7 @@ impl Default for EngConfig {
                 // Maximum number of times to attempt to fix a failed task. (Range: 1-5)
                 max_fix_attempts: 2,
                 // Maximum number of tokens allowed for a single task (L ceiling — triage sizes down).
-                max_tokens_per_task: 60_000,
+                max_tokens_per_task: 80_000,
                 // Maximum dollar cost allowed for a single task. (Range: 0.10-10.00)
                 max_dollars_per_task: 0.50,
                 // When true, the orchestrator will pause and wait for human approval after generating a plan.
@@ -717,7 +717,7 @@ mod tests {
     fn default_config_has_sane_values() {
         let config = EngConfig::default();
         assert_eq!(config.limits.max_fix_attempts, 2);
-        assert_eq!(config.limits.max_tokens_per_task, 60_000);
+        assert_eq!(config.limits.max_tokens_per_task, 80_000);
         assert!((config.limits.max_dollars_per_task - 0.50).abs() < f64::EPSILON);
         assert!(config.intervention.pause_after_plan);
         assert!(config.intervention.pause_before_pr);
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(config.limits.max_fix_attempts, 5);
         assert!((config.limits.max_dollars_per_task - 5.0).abs() < f64::EPSILON);
         // Non-overridden values should keep defaults.
-        assert_eq!(config.limits.max_tokens_per_task, 60_000);
+        assert_eq!(config.limits.max_tokens_per_task, 80_000);
     }
 
     #[test]
@@ -1571,8 +1571,8 @@ base_url: http://localhost:8080
     #[test]
     fn task_size_max_tokens() {
         assert_eq!(TaskSize::S.max_tokens(), 20_000);
-        assert_eq!(TaskSize::M.max_tokens(), 120_000);
-        assert_eq!(TaskSize::L.max_tokens(), 120_000);
+        assert_eq!(TaskSize::M.max_tokens(), 80_000);
+        assert_eq!(TaskSize::L.max_tokens(), 100_000);
         assert_eq!(TaskSize::XL.max_tokens(), 0);
     }
 
