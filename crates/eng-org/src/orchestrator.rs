@@ -1229,7 +1229,8 @@ impl Orchestrator {
             },
             PipelineStatus::ImplementationFailed
             | PipelineStatus::TestsFailed
-            | PipelineStatus::BoundaryViolation => OutcomeRouting {
+            | PipelineStatus::BoundaryViolation
+            | PipelineStatus::PlanFailed => OutcomeRouting {
                 task_status: TaskStatus::Failed,
                 counter: OutcomeCounter::Failed,
                 save_context: true,
@@ -2641,6 +2642,19 @@ mod tests {
         assert_eq!(routing.counter, OutcomeCounter::Failed);
         assert!(routing.save_context);
         assert!(routing.track_attempt);
+    }
+
+    #[test]
+    fn route_outcome_plan_failed_tracks_attempt() {
+        let pr = make_pipeline_result(PipelineStatus::PlanFailed);
+        let routing = Orchestrator::route_outcome(&pr);
+        assert_eq!(routing.task_status, TaskStatus::Failed);
+        assert_eq!(routing.counter, OutcomeCounter::Failed);
+        assert!(routing.save_context);
+        assert!(
+            routing.track_attempt,
+            "PlanFailed must track attempts to prevent infinite retry loops"
+        );
     }
 
     #[test]
