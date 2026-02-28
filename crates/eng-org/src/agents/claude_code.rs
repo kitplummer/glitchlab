@@ -28,8 +28,9 @@ struct ClaudeCodeResult {
     result_type: String,
     #[serde(default)]
     subtype: String,
-    #[serde(default)]
-    cost_usd: f64,
+    /// Total cost in USD (field name is `total_cost_usd` in Claude CLI output).
+    #[serde(default, alias = "cost_usd")]
+    total_cost_usd: f64,
     #[serde(default)]
     duration_ms: u64,
     #[serde(default)]
@@ -141,18 +142,9 @@ impl ClaudeCodeImplementer {
         working_dir: &Path,
         prompt: &str,
     ) -> error::Result<(ClaudeCodeResult, String)> {
+        use tokio::io::AsyncWriteExt;
+
         let start = Instant::now();
-
-        // Write prompt to a temp file to avoid shell escaping issues.
-        let prompt_file = working_dir.join(".glitchlab-prompt.tmp");
-        tokio::fs::write(&prompt_file, prompt)
-            .await
-            .map_err(|e| error::Error::Pipeline {
-                stage: "claude_code".into(),
-                reason: format!("failed to write prompt file: {e}"),
-            })?;
-
-        let prompt_arg = format!("@{}", prompt_file.display());
 
         let mut cmd = tokio::process::Command::new(&self.config.claude_bin);
         cmd.current_dir(working_dir)
@@ -173,9 +165,12 @@ impl ClaudeCodeImplementer {
             .arg("Read Edit Write Bash(cargo:*) Bash(git diff:*) Bash(git status:*) Glob Grep")
             .arg("--no-session-persistence")
             .arg("-p")
-            .arg(&prompt_arg)
+            .arg("-") // Read prompt from stdin
             // Unset CLAUDECODE to allow nested invocation.
-            .env_remove("CLAUDECODE");
+            .env_remove("CLAUDECODE")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
         info!(
             model = %self.config.model,
@@ -184,13 +179,30 @@ impl ClaudeCodeImplementer {
             "invoking claude code implementer"
         );
 
-        let output = cmd.output().await.map_err(|e| error::Error::Pipeline {
+        let mut child = cmd.spawn().map_err(|e| error::Error::Pipeline {
             stage: "claude_code".into(),
             reason: format!("failed to spawn claude CLI: {e}"),
         })?;
 
-        // Clean up prompt file (best-effort).
-        let _ = tokio::fs::remove_file(&prompt_file).await;
+        // Write prompt to stdin.
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .map_err(|e| error::Error::Pipeline {
+                    stage: "claude_code".into(),
+                    reason: format!("failed to write prompt to stdin: {e}"),
+                })?;
+            // Drop stdin to signal EOF.
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| error::Error::Pipeline {
+                stage: "claude_code".into(),
+                reason: format!("failed to wait for claude CLI: {e}"),
+            })?;
 
         let elapsed = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -248,7 +260,7 @@ impl Agent for ClaudeCodeImplementer {
             agent: "implementer".into(),
             model: format!("claude-code/{}", self.config.model),
             tokens: 0, // Claude Code doesn't expose token counts in JSON output
-            cost: result.cost_usd,
+            cost: result.total_cost_usd,
             latency_ms: result.duration_ms,
         };
 
@@ -292,7 +304,7 @@ impl Agent for ClaudeCodeImplementer {
         let parse_error = data == fallback;
 
         info!(
-            cost = result.cost_usd,
+            cost = result.total_cost_usd,
             turns = result.num_turns,
             duration_ms = result.duration_ms,
             tests_passing = %data.get("tests_passing").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -469,7 +481,7 @@ All tests pass."#;
         let json = r#"{
             "type": "result",
             "subtype": "success",
-            "cost_usd": 0.05,
+            "total_cost_usd": 0.05,
             "duration_ms": 12345,
             "is_error": false,
             "num_turns": 5,
@@ -481,7 +493,7 @@ All tests pass."#;
         assert_eq!(result.subtype, "success");
         assert!(!result.is_error);
         assert_eq!(result.num_turns, 5);
-        assert_eq!(result.cost_usd, 0.05);
+        assert_eq!(result.total_cost_usd, 0.05);
     }
 
     fn test_context() -> AgentContext {
