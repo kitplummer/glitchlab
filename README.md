@@ -95,7 +95,7 @@ Every task passes through these phases:
 | **Review** | Security scan, CISO risk analysis, architect diff review, release assessment, documentation | ~10% |
 | **Deliver** | Commit, open PR, auto-merge (configurable) | ~2% |
 
-For a **Medium** task (the most common size), this budget is approximately **65K tokens across 9 tool turns** for the implementer, plus overhead for the surrounding agents. A typical M task consumes **$0.10–$0.30** end to end.
+For a **Medium** task (the most common size), this budget is approximately **60K tokens across 9 tool turns** for the implementer, plus overhead for the surrounding agents. A typical M task consumes **$0.10–$0.30** end to end.
 
 When a task is **decomposed**, the parent task ends at the Decompose phase and spawns child tasks. Each child is a full task with its own Plan→Deliver lifecycle. Decomposition adds overhead (workspace setup, context assembly, planner calls per sub-task), so it is only triggered when:
 - Complexity is medium or large
@@ -107,8 +107,8 @@ When a task is **decomposed**, the parent task ends at the Decompose phase and s
 | Size | Token Budget | Tool Turns | Typical Scope |
 |------|-------------|------------|---------------|
 | **S** | 20K | 4 | 1 file, ≤2 edits, mechanical change |
-| **M** | 65K | 9 | 1–3 files, requires understanding |
-| **L** | 60K | 12 | 2–3 files, requires design decisions |
+| **M** | 60K | 9 | 1–3 files, requires understanding |
+| **L** | 90K | 12 | 2–3 files, requires design decisions |
 | **XL** | — | — | Must decompose into S/M/L sub-tasks |
 
 ## Pipeline Stages
