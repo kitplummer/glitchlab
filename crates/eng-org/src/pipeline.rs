@@ -2187,10 +2187,15 @@ fn format_file_size_hint(sizes: &[(String, usize)]) -> String {
 
 /// Estimate the token cost of executing a plan.
 ///
-/// Models how multi-turn LLM conversations actually work: file content read in
-/// turn 1 stays in the conversation history and is re-sent as input on every
-/// subsequent turn. A 1400-line file isn't 11K tokens — it's 11K tokens × 9
-/// turns = ~100K tokens. This is why "small" file-count tasks blow budget.
+/// Uses a quadratic model: each turn's input grows as conversation history
+/// accumulates. Turn i sends `base_context + i * history_growth` input tokens
+/// plus generates `avg_completion` output tokens. The total across N turns is:
+///
+///   N × (base_context + avg_completion) + history_growth × N × (N-1) / 2
+///
+/// This properly models the quadratic cost growth that causes budget blowouts.
+/// A 1400-line file isn't 11K tokens — it's 11K tokens re-sent every turn
+/// PLUS growing conversation history from model responses and tool results.
 async fn estimate_plan_tokens(repo_path: &Path, files: &[String], step_count: usize) -> usize {
     let mut file_tokens = 0usize;
     for file in files {
@@ -2199,13 +2204,26 @@ async fn estimate_plan_tokens(repo_path: &Path, files: &[String], step_count: us
             file_tokens += content.lines().count() * TOKENS_PER_LINE;
         }
     }
-    let system_prompt = 4_000; // system prompt, re-sent every turn
-    let per_turn_overhead = 3_000; // tool call framing, response overhead
-    let turns = step_count.max(4) + 2; // steps + test + verify turns
 
-    // Each turn pays: system prompt + all file context + turn overhead.
-    // This models the conversation history growth that causes budget blowouts.
-    turns * (system_prompt + file_tokens + per_turn_overhead)
+    // Base context sent as input on every turn:
+    // - System prompt (~3K: implementer instructions, tools, workflow)
+    // - User message overhead (~5K: objective, constraints, module map, formatting)
+    // - File content (file_tokens: Relevant File Contents section)
+    let base_context = 8_000 + file_tokens;
+
+    // New content added to conversation history each turn:
+    // - Model response (~2K: reasoning, tool calls)
+    // - Tool results (~3K: file reads, build/test output, edit confirmations)
+    let history_growth = 5_000;
+
+    // Average completion tokens generated per turn.
+    let avg_completion = 2_000;
+
+    // Turns: implementation steps + write-tests + verify + lint.
+    let turns = step_count + 3;
+
+    // Quadratic total: each turn pays base + accumulated history + completion.
+    turns * (base_context + avg_completion) + history_growth * turns * (turns - 1) / 2
 }
 
 fn build_pr_body(plan: &AgentOutput, security: &AgentOutput) -> String {
@@ -3699,7 +3717,7 @@ mod tests {
     #[tokio::test]
     async fn estimate_plan_tokens_basic() {
         let dir = tempfile::tempdir().unwrap();
-        // 100-line file → 800 file tokens per turn (8 tokens/line)
+        // 100-line file → 800 file tokens (8 tokens/line)
         let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
         tokio::fs::create_dir_all(dir.path().join("src"))
             .await
@@ -3711,12 +3729,14 @@ mod tests {
         let files = vec!["src/lib.rs".to_string()];
         let estimated = estimate_plan_tokens(dir.path(), &files, 3).await;
 
-        // turns = max(3,4)+2 = 6
-        // per_turn = system(4K) + file_tokens(800) + overhead(3K) = 7,800
-        // total = 6 * 7,800 = 46,800
+        // Quadratic model: turns = step_count + 3 = 6
+        // base_context = 8K + 800 = 8,800
+        // total = 6 * (8800 + 2000) + 5000 * 6 * 5 / 2
+        //       = 64,800 + 75,000 = 139,800
         let file_tokens = 100 * TOKENS_PER_LINE;
+        let base_context = 8_000 + file_tokens;
         let turns = 6;
-        let expected = turns * (4_000 + file_tokens + 3_000);
+        let expected = turns * (base_context + 2_000) + 5_000 * turns * (turns - 1) / 2;
         assert_eq!(
             estimated, expected,
             "should calculate correct token estimate"
@@ -3731,10 +3751,10 @@ mod tests {
         let estimated = estimate_plan_tokens(dir.path(), &files, 2).await;
 
         // Missing files contribute 0 file tokens.
-        // turns = max(2,4)+2 = 6, per_turn = 4K + 0 + 3K = 7K
-        // total = 6 * 7K = 42K
-        let turns = 6;
-        let expected = turns * (4_000 + 3_000);
+        // turns = 2 + 3 = 5, base_context = 8K
+        // total = 5 * (8K + 2K) + 5K * 5 * 4 / 2 = 50K + 50K = 100K
+        let turns = 5;
+        let expected = turns * (8_000 + 2_000) + 5_000 * turns * (turns - 1) / 2;
         assert_eq!(
             estimated, expected,
             "missing files should contribute 0 tokens"
@@ -3762,6 +3782,53 @@ mod tests {
         assert!(
             estimated > threshold,
             "1405-line file must exceed 70% budget gate: estimated={estimated}, threshold={threshold}"
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_plan_tokens_subtask_catches_medium_file() {
+        // Sub-tasks use step_count=1. A 500-line file (4K file tokens) should
+        // be caught by the pre-flight check at 70% of 120K budget.
+        let dir = tempfile::tempdir().unwrap();
+        let content: String = (0..500).map(|i| format!("// line {i}\n")).collect();
+        tokio::fs::create_dir_all(dir.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("src/mod.rs"), &content)
+            .await
+            .unwrap();
+
+        let files = vec!["src/mod.rs".to_string()];
+        let estimated = estimate_plan_tokens(dir.path(), &files, 1).await;
+
+        let budget = TaskSize::M.max_tokens() as usize;
+        let threshold = budget * 70 / 100; // 84K
+        assert!(
+            estimated > threshold,
+            "500-line sub-task must exceed pre-flight: estimated={estimated}, threshold={threshold}"
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_plan_tokens_subtask_passes_small_file() {
+        // Sub-tasks with small files (<300 lines) should pass pre-flight.
+        let dir = tempfile::tempdir().unwrap();
+        let content: String = (0..200).map(|i| format!("// line {i}\n")).collect();
+        tokio::fs::create_dir_all(dir.path().join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("src/small.rs"), &content)
+            .await
+            .unwrap();
+
+        let files = vec!["src/small.rs".to_string()];
+        let estimated = estimate_plan_tokens(dir.path(), &files, 1).await;
+
+        let budget = TaskSize::M.max_tokens() as usize;
+        let threshold = budget * 70 / 100; // 84K
+        assert!(
+            estimated < threshold,
+            "200-line sub-task should pass pre-flight: estimated={estimated}, threshold={threshold}"
         );
     }
 
@@ -4166,8 +4233,8 @@ mod tests {
         let base_branch = init_test_repo(dir.path());
 
         // Mirrors the actual canary failure: a 1400-line file that blew 124K/120K.
-        // With the amplification-aware estimator (8 tok/line × 6 turns):
-        //   6 * (4K + 11200 + 3K) = 6 * 18200 = 109,200 > 84K (70% of 120K)
+        // Quadratic model (step_count=3, turns=6, file_tokens=11200):
+        //   6 * (8K+11200+2K) + 5K*15 = 127,200 + 75,000 = 202,200 > 84K
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let big_content: String = (0..1_400).map(|i| format!("// line {i}\n")).collect();
         std::fs::write(dir.path().join("src/big.rs"), &big_content).unwrap();
