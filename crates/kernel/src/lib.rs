@@ -2,6 +2,7 @@ pub mod agent;
 pub mod budget;
 pub mod context;
 pub mod error;
+pub mod eval;
 pub mod governance;
 pub mod org;
 pub mod outcome;
