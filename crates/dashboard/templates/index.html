@@ -1,0 +1,10 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<h1>GLITCHLAB Live Run</h1>
+<div hx-ext="sse" sse-connect="/sse">
+    <div id="events" hx-swap="beforeend" sse-swap="message">
+        <div class="event">Connecting to event stream...</div>
+    </div>
+</div>
+{% endblock %}

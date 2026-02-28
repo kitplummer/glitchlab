@@ -10,6 +10,7 @@ name = "glitchlab"
 path = "src/main.rs"
 
 [dependencies]
+glitchlab-dashboard = { workspace = true }
 glitchlab-kernel.workspace = true
 glitchlab-eng-org.workspace = true
 glitchlab-memory = { workspace = true, features = ["dolt"] }

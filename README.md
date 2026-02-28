@@ -29,6 +29,19 @@ Ten agents, each with a persona and a job:
 
 Model assignments are configurable per-repo. The `ModelChooser` selects models based on tier, capabilities, and cost.
 
+## Tool-Calling Models
+
+The `Implementer` agent relies on tool-calling (function-calling) capabilities from the underlying model. Not all models support this feature, and performance varies. Here is a list of known-compatible models:
+
+| Provider  | Model Families Supporting Tool Use | Notes |
+|-----------|------------------------------------|-------|
+| Google    | Gemini 1.5 Pro, 1.5 Flash, 1.0 Pro | Gemini 1.5 Pro is recommended for complex tasks. |
+| Anthropic | Claude 3 family (Opus, Sonnet, Haiku) | All Claude 3 models have strong tool-use capabilities. |
+| OpenAI    | GPT-4, GPT-4o, GPT-3.5 Turbo | Newer models generally have better JSON formatting for tool arguments. |
+| Ollama    | Llama 3, other fine-tunes | Requires a model fine-tuned for function calling. `llama3` (8b and 70b) has shown good results. |
+
+When configuring the `Implementer` agent, ensure you select a model from this list for reliable performance.
+
 ## Quick Start
 
 ### 1. Build
@@ -44,7 +57,25 @@ cargo build --release
 ```bash
 export GEMINI_API_KEY="..."
 export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENAI_API_KEY="..." # Can be a placeholder for Ollama/other compatible endpoints
 ```
+
+#### Using Ollama with a Local Model
+
+To use a local model via Ollama, ensure Ollama is running and you have pulled a model that supports OpenAI-compatible function calling (e.g., Llama 3).
+
+1.  **Pull a model:**
+    ```bash
+    ollama pull llama3
+    ```
+
+2.  **Set the API base and a dummy API key:**
+    GLITCHLAB uses the `OPENAI_API_BASE` environment variable to connect to OpenAI-compatible endpoints.
+    ```bash
+    export OPENAI_API_BASE="http://localhost:11434/v1/chat/completions"
+    export OPENAI_API_KEY="ollama" # The key can be any non-empty string
+    ```
+    > **Note:** You must provide the full chat completions endpoint URL to `OPENAI_API_BASE`.
 
 ### 3. Initialize a Repository
 
