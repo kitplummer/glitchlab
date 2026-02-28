@@ -161,6 +161,17 @@ enum Commands {
 
     /// Print version information
     Version,
+
+    /// View live dashboard
+    Dashboard {
+        /// Path to the repository
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+
+        /// Port to run the dashboard on
+        #[arg(long, default_value = "3000")]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -232,5 +243,9 @@ async fn main() -> Result<()> {
             commands::history::execute(&repo, count, stats).await
         }
         Commands::Version => commands::version::execute().await,
+        Commands::Dashboard { repo, port } => {
+            commands::setup_logging(false);
+            commands::dashboard::execute(commands::dashboard::DashboardArgs { repo, port }).await
+        }
     }
 }

@@ -1,0 +1,24 @@
+[package]
+name = "glitchlab-dashboard"
+description = "Web dashboard for GLITCHLAB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glitchlab-kernel.workspace = true
+glitchlab-memory.workspace = true
+glitchlab-eng-org.workspace = true
+
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+axum = "0.7.5"
+tower-http = { version = "0.5.2", features = ["fs", "trace"] }
+askama = { version = "0.12.1", features = ["with-axum"] }
+askama_axum = "0.4.0"
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio-stream = "0.1.15"
+futures-util = "0.3.30"

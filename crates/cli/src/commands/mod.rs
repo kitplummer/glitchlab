@@ -1,5 +1,6 @@
 pub mod batch;
 pub mod common;
+pub mod dashboard;
 pub mod history;
 pub mod init;
 pub mod interactive;
