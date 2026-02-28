@@ -62,6 +62,13 @@ impl Workspace {
 
     /// Create the isolated worktree and branch.
     pub async fn create(&mut self, base_branch: &str) -> Result<&Path> {
+        // Clean up stale worktree from a previous crashed run — must happen
+        // before `branch -D` because git refuses to delete a branch that is
+        // checked out in an existing worktree.
+        let wt = self.worktree_path.to_string_lossy().to_string();
+        let _ = self.git_repo(&["worktree", "remove", &wt, "--force"]).await;
+        let _ = self.git_repo(&["worktree", "prune"]).await;
+
         // Remove any stale branch from a previous run with the same task_id.
         let _ = self.git_repo(&["branch", "-D", &self.branch_name]).await;
 

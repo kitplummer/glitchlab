@@ -1,0 +1,34 @@
+tasks:
+- id: add-router-tracing-part1-setup-and-metrics-struct
+  objective: Add `tracing` dependency to `glitchlab-router`'s `Cargo.toml` and define the `RouterMetrics` struct in `router.rs` to aggregate call count, total tokens, total cost, and average latency.
+  priority: 50
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/Cargo.toml
+  - crates/router/src/router.rs
+- id: add-router-metrics-part1-add-tracing-dep
+  objective: Add `tracing` dependency to `glitchlab-router`'s `Cargo.toml`.
+  priority: 50
+  status: failed
+  depends_on: []
+  decomposition_depth: 1
+  error: no changes produced — implementer output resulted in an empty commit
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/Cargo.toml
+- id: add-router-metrics-part2-define-metrics-struct
+  objective: Define the `RouterMetrics` struct in `crates/router/src/router.rs` to aggregate call count, total tokens, total cost, and average latency.
+  priority: 50
+  status: pending
+  depends_on:
+  - add-router-metrics-part1-add-tracing-dep
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs

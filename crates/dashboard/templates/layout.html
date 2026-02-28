@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>GLITCHLAB Dashboard</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://unpkg.com/htmx-ext-sse@2.0.0"></script>
+    <style>
+        body { font-family: sans-serif; background-color: #1a1a1a; color: #f0f0f0; }
+        .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+        h1 { color: #00ff99; }
+        #events { border: 1px solid #333; padding: 10px; margin-top: 20px; height: 400px; overflow-y: scroll; }
+        .event { border-bottom: 1px solid #333; padding: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+    {% block content %}{% endblock %}
+    </div>
+</body>
+</html>

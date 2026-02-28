@@ -15,7 +15,16 @@ pub fn parse_json_response(
     metadata: AgentMetadata,
     fallback: serde_json::Value,
 ) -> AgentOutput {
-    // Attempt 1: direct parse.
+    // Attempt 1: direct parse as AgentOutput. This is unconventional, as metadata
+    // is normally supplied by the caller, but might be useful for some agents
+    // or for chained calls. We'll use our own metadata for security/consistency.
+    if let Ok(mut output) = serde_json::from_str::<AgentOutput>(raw) {
+        output.metadata = metadata;
+        output.parse_error = false; // Parsed correctly.
+        return output;
+    }
+
+    // Attempt 2: direct parse as json Value.
     if let Ok(data) = serde_json::from_str::<serde_json::Value>(raw) {
         return AgentOutput {
             data,
@@ -24,7 +33,7 @@ pub fn parse_json_response(
         };
     }
 
-    // Attempt 2: strip markdown fences.
+    // Attempt 3: strip markdown fences.
     let stripped = strip_code_fences(raw);
     if let Ok(data) = serde_json::from_str::<serde_json::Value>(&stripped) {
         return AgentOutput {
@@ -34,7 +43,7 @@ pub fn parse_json_response(
         };
     }
 
-    // Attempt 3: extract first JSON object.
+    // Attempt 4: extract first JSON object.
     if let Some(extracted) = extract_json_object(&stripped) {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&extracted) {
             return AgentOutput {
@@ -44,7 +53,7 @@ pub fn parse_json_response(
             };
         }
 
-        // Attempt 4: sanitize common JSON issues (trailing commas, newlines).
+        // Attempt 5: sanitize common JSON issues (trailing commas, newlines).
         let sanitized = sanitize_json(&extracted);
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&sanitized) {
             return AgentOutput {
@@ -55,7 +64,7 @@ pub fn parse_json_response(
         }
     }
 
-    // Attempt 5: close truncated JSON (unbalanced braces from max_tokens cutoff).
+    // Attempt 6: close truncated JSON (unbalanced braces from max_tokens cutoff).
     if let Some(closed) = close_truncated_json(&stripped)
         && let Ok(data) = serde_json::from_str::<serde_json::Value>(&closed)
     {
@@ -76,8 +85,21 @@ pub fn parse_json_response(
         raw_preview = &raw[..raw.len().min(500)],
         "failed to parse agent JSON response, using fallback"
     );
+
+    let mut data = fallback;
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "raw_message".to_string(),
+            serde_json::Value::String(raw.to_string()),
+        );
+        obj.insert(
+            "error_message".to_string(),
+            serde_json::Value::String("Failed to parse LLM response as JSON.".to_string()),
+        );
+    }
+
     AgentOutput {
-        data: fallback,
+        data,
         metadata,
         parse_error: true,
     }
@@ -120,6 +142,7 @@ fn strip_code_fences(s: &str) -> String {
 /// Fix common JSON issues that LLMs produce:
 /// - Trailing commas before `}` or `]`
 /// - Literal newlines inside string values (replace with `\n`)
+/// - Line and block comments (`//...` and `/*...* /`)
 fn sanitize_json(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
@@ -163,6 +186,35 @@ fn sanitize_json(s: &str) -> String {
             result.push(chars[i]);
             i += 1;
             continue;
+        }
+
+        // Outside a string, check for comments.
+        if chars[i] == '/' {
+            // Line comment
+            if i + 1 < chars.len() && chars[i + 1] == '/' {
+                i += 2;
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                // Skip the newline as well, if it exists
+                if i < chars.len() && chars[i] == '\n' {
+                    result.push('\n'); // Keep the newline for line numbers
+                    i += 1;
+                }
+                continue;
+            }
+            // Block comment
+            if i + 1 < chars.len() && chars[i + 1] == '*' {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                // Skip the closing */
+                if i + 1 < chars.len() {
+                    i += 2;
+                }
+                continue;
+            }
         }
 
         // Outside a string: check for trailing comma.
@@ -340,7 +392,9 @@ mod tests {
         let fallback = serde_json::json!({"error": true});
         let output = parse_json_response(raw, meta, fallback.clone());
         assert!(output.parse_error);
-        assert_eq!(output.data, fallback);
+        assert_eq!(output.data["error"], true);
+        assert_eq!(output.data["raw_message"], raw);
+        assert!(output.data["error_message"].is_string());
     }
 
     #[test]
@@ -523,9 +577,66 @@ mod tests {
         let raw = r#"{"hello": world}"#;
         let meta = test_meta();
         let fallback = serde_json::json!({"fallback": true});
-        let output = parse_json_response(raw, meta, fallback.clone());
+        let output = parse_json_response(raw, meta, fallback);
         assert!(output.parse_error);
-        assert_eq!(output.data, fallback);
+        assert_eq!(output.data["fallback"], true);
+    }
+
+    #[test]
+    fn parse_json_with_line_comments() {
+        let raw = r#"{
+            // The verdict
+            "verdict": "pass", // pass is good
+            "issues": []
+        }"#;
+        let meta = test_meta();
+        let output = parse_json_response(raw, meta, serde_json::json!({}));
+        assert!(!output.parse_error, "failed with raw: {}", raw);
+        assert_eq!(output.data["verdict"], "pass");
+    }
+
+    #[test]
+    fn parse_json_with_block_comments() {
+        let raw = r#"{
+            /* The verdict */
+            "verdict": "pass",
+            "issues": [/* none */]
+        }"#;
+        let meta = test_meta();
+        let output = parse_json_response(raw, meta, serde_json::json!({}));
+        assert!(!output.parse_error, "failed with raw: {}", raw);
+        assert_eq!(output.data["verdict"], "pass");
+        assert!(output.data["issues"].is_array());
+    }
+
+    #[test]
+    fn sanitize_json_removes_line_comments() {
+        let input = r#"{
+            // comment
+            "a": 1, // another
+            "b": 2
+        }"#;
+        let result = sanitize_json(input);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["a"], 1);
+        assert!(parsed.get("comment").is_none());
+    }
+
+    #[test]
+    fn sanitize_json_removes_block_comments() {
+        let input = r#"{"a": 1, /* comment */ "b": 2}"#;
+        let result = sanitize_json(input);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["b"], 2);
+    }
+
+    #[test]
+    fn sanitize_json_preserves_comment_like_strings() {
+        let input = r#"{"url": "http://example.com", "msg": "/* not a comment */"}"#;
+        let result = sanitize_json(input);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["url"], "http://example.com");
+        assert_eq!(parsed["msg"], "/* not a comment */");
     }
 
     fn test_meta() -> AgentMetadata {

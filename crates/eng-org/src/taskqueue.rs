@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use glitchlab_kernel::error::{Error, Result};
 use glitchlab_kernel::outcome::OutcomeContext;
@@ -213,11 +213,23 @@ impl TaskQueue {
 
     /// Inject new tasks into the queue (e.g. from decomposition).
     /// Tasks are appended and will be picked based on their priority.
+    /// Duplicate IDs are skipped to prevent re-injection from repeated
+    /// decomposition rounds.
     pub fn inject_tasks(&mut self, tasks: Vec<Task>) {
-        let count = tasks.len();
-        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let existing_ids: std::collections::HashSet<&str> =
+            self.tasks.iter().map(|t| t.id.as_str()).collect();
+        let mut injected = Vec::new();
+        for task in tasks {
+            if existing_ids.contains(task.id.as_str()) {
+                warn!(task_id = %task.id, "skipping duplicate sub-task injection");
+            } else {
+                injected.push(task);
+            }
+        }
+        let count = injected.len();
+        let ids: Vec<&str> = injected.iter().map(|t| t.id.as_str()).collect();
         info!(?ids, count, "injecting sub-tasks into queue");
-        self.tasks.extend(tasks);
+        self.tasks.extend(injected);
     }
 
     /// Check whether any pending or in-progress task has an ID starting with the given prefix.
@@ -701,6 +713,31 @@ mod tests {
         // Injected task has priority 0, so it should be picked first.
         let next = queue.pick_next().unwrap();
         assert_eq!(next.id, "injected-1");
+    }
+
+    #[test]
+    fn inject_tasks_skips_duplicates() {
+        let mut queue = TaskQueue::from_tasks(sample_tasks());
+        assert_eq!(queue.tasks().len(), 3);
+
+        // Inject a task with the same ID as an existing task.
+        let dupe = vec![Task {
+            id: "task-1".into(), // already exists in sample_tasks
+            objective: "Duplicate".into(),
+            priority: 0,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: None,
+        }];
+        queue.inject_tasks(dupe);
+        // Should NOT have grown — duplicate was skipped.
+        assert_eq!(queue.tasks().len(), 3);
     }
 
     // -----------------------------------------------------------------------
