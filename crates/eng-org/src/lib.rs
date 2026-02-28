@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod config;
 pub mod dashboard;
+pub mod eval;
 pub mod indexer;
 pub mod orchestrator;
 pub mod pipeline;
