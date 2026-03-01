@@ -643,6 +643,14 @@ All tests pass."#;
             .current_dir(dir.path())
             .output();
         let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(dir.path())
             .output();
@@ -656,6 +664,14 @@ All tests pass."#;
         let dir = tempfile::tempdir().unwrap();
         let _ = std::process::Command::new("git")
             .args(["init"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
             .current_dir(dir.path())
             .output();
         std::fs::write(dir.path().join("hello.rs"), "fn main() {}").unwrap();
@@ -688,6 +704,14 @@ All tests pass."#;
             .current_dir(dir.path())
             .output();
         let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(dir.path())
             .output();
@@ -708,6 +732,14 @@ All tests pass."#;
         let dir = tempfile::tempdir().unwrap();
         let _ = std::process::Command::new("git")
             .args(["init"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
             .current_dir(dir.path())
             .output();
         std::fs::write(dir.path().join("lib.rs"), "pub fn greet() {}").unwrap();
@@ -750,6 +782,14 @@ All tests pass."#;
         let dir = tempfile::tempdir().unwrap();
         let _ = std::process::Command::new("git")
             .args(["init"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
             .current_dir(dir.path())
             .output();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
