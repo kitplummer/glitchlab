@@ -84,6 +84,12 @@ pipeline:
   claude_code_model: sonnet
   claude_code_budget_usd: 0.50
 
+review:
+  enabled: true
+  auto_close: true
+  auto_reprioritize: true
+  confidence_threshold: 0.8
+
 watch:
   enabled: true
   interval_tasks: 3

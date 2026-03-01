@@ -542,7 +542,11 @@ pub fn adr_summaries_to_context(summaries: &[AdrSummary]) -> String {
     }
 
     if ctx.len() > ADR_CONTEXT_MAX_BYTES {
-        ctx.truncate(ADR_CONTEXT_MAX_BYTES - 20);
+        let mut end = ADR_CONTEXT_MAX_BYTES - 20;
+        while !ctx.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        ctx.truncate(end);
         ctx.push_str("\n(truncated)\n");
     }
 
