@@ -108,6 +108,21 @@ pub enum DashboardEvent {
         actions_applied: usize,
         cost: f64,
     },
+    /// ADR watch scan started.
+    AdrWatchStarted,
+    /// ADR watch scan completed.
+    AdrWatchCompleted {
+        adrs_scanned: usize,
+        adrs_new: usize,
+        adrs_changed: usize,
+        beads_created: usize,
+        cost: f64,
+    },
+    /// A single ADR was decomposed into beads.
+    AdrDecomposed {
+        adr_filename: String,
+        beads_created: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +428,40 @@ impl DashboardEmitter {
                     cost,
                 );
             }
+            DashboardEvent::AdrWatchStarted => {
+                info!(
+                    target: "glitchlab::dashboard",
+                    event = "adr_watch_started",
+                );
+            }
+            DashboardEvent::AdrWatchCompleted {
+                adrs_scanned,
+                adrs_new,
+                adrs_changed,
+                beads_created,
+                cost,
+            } => {
+                info!(
+                    target: "glitchlab::dashboard",
+                    event = "adr_watch_completed",
+                    adrs_scanned,
+                    adrs_new,
+                    adrs_changed,
+                    beads_created,
+                    cost,
+                );
+            }
+            DashboardEvent::AdrDecomposed {
+                adr_filename,
+                beads_created,
+            } => {
+                info!(
+                    target: "glitchlab::dashboard",
+                    event = "adr_decomposed",
+                    adr_filename = adr_filename.as_str(),
+                    beads_created,
+                );
+            }
         }
     }
 }
@@ -591,6 +640,18 @@ mod tests {
                 beads_reviewed: 5,
                 actions_applied: 2,
                 cost: 0.01,
+            },
+            DashboardEvent::AdrWatchStarted,
+            DashboardEvent::AdrWatchCompleted {
+                adrs_scanned: 3,
+                adrs_new: 1,
+                adrs_changed: 1,
+                beads_created: 4,
+                cost: 0.02,
+            },
+            DashboardEvent::AdrDecomposed {
+                adr_filename: "adr-001.md".into(),
+                beads_created: 3,
             },
         ];
 

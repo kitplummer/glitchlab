@@ -1,3 +1,4 @@
+pub mod adr_decomposer;
 pub mod architect;
 pub mod archivist;
 pub mod backlog_review;
@@ -670,6 +671,7 @@ pub(crate) mod test_helpers {
             ("ops_diagnosis".to_string(), "mock/test".to_string()),
             ("ciso".to_string(), "mock/test".to_string()),
             ("backlog_review".to_string(), "mock/test".to_string()),
+            ("adr_decomposer".to_string(), "mock/test".to_string()),
         ]);
         let budget = BudgetTracker::new(1_000_000, 100.0);
         let mut router = glitchlab_router::Router::new(routing, budget);

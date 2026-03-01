@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Stdio;
 
@@ -605,6 +606,97 @@ fn extract_adr_decision(content: &str) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ADR Fingerprinting — change detection for watch loop
+// ---------------------------------------------------------------------------
+
+/// Content fingerprint for an ADR file. Used by the orchestrator to detect
+/// new or changed ADRs between scans without re-reading full file contents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdrFingerprint {
+    pub filename: String,
+    pub content_hash: u64,
+}
+
+/// Compute content fingerprints for all `docs/adr-*.md` files in the repo.
+///
+/// Uses `DefaultHasher` (SipHash) for stable, collision-resistant hashing.
+/// Returns an empty vec if the `docs/` directory doesn't exist.
+pub fn compute_adr_fingerprints(repo_path: &Path) -> Result<Vec<AdrFingerprint>> {
+    let docs_dir = repo_path.join("docs");
+    if !docs_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let entries = std::fs::read_dir(&docs_dir)
+        .map_err(|e| Error::Workspace(format!("failed to read docs/: {e}")))?;
+
+    let mut fingerprints = Vec::new();
+
+    let mut filenames: Vec<String> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("adr-") && name.ends_with(".md") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    filenames.sort();
+
+    for filename in filenames {
+        let path = docs_dir.join(&filename);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        content.hash(&mut hasher);
+        let content_hash = hasher.finish();
+
+        fingerprints.push(AdrFingerprint {
+            filename,
+            content_hash,
+        });
+    }
+
+    Ok(fingerprints)
+}
+
+/// Diff two sets of ADR fingerprints, returning `(new_filenames, changed_filenames)`.
+///
+/// - **New:** present in `current` but not in `previous`.
+/// - **Changed:** present in both but with different content hashes.
+/// - Files present in `previous` but missing from `current` are silently ignored
+///   (ADR was deleted — nothing to decompose).
+pub fn diff_adr_fingerprints(
+    previous: &[AdrFingerprint],
+    current: &[AdrFingerprint],
+) -> (Vec<String>, Vec<String>) {
+    let prev_map: HashMap<&str, u64> = previous
+        .iter()
+        .map(|fp| (fp.filename.as_str(), fp.content_hash))
+        .collect();
+
+    let mut new_files = Vec::new();
+    let mut changed_files = Vec::new();
+
+    for fp in current {
+        match prev_map.get(fp.filename.as_str()) {
+            None => new_files.push(fp.filename.clone()),
+            Some(&old_hash) if old_hash != fp.content_hash => {
+                changed_files.push(fp.filename.clone());
+            }
+            Some(_) => {} // unchanged
+        }
+    }
+
+    (new_files, changed_files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,5 +1230,119 @@ mod tests {
         // The function stops adding lines once the limit is reached.
         assert!(excerpt.len() <= ADR_DECISION_EXCERPT_MAX + 50);
         assert!(excerpt.len() < content.len());
+    }
+
+    // --- ADR fingerprinting tests ---
+
+    #[test]
+    fn compute_fingerprints_hashes_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("adr-001.md"), "# ADR: Use Rust\n").unwrap();
+        std::fs::write(docs.join("adr-002.md"), "# ADR: Router\n").unwrap();
+        // Non-ADR file should be ignored.
+        std::fs::write(docs.join("readme.md"), "# Docs\n").unwrap();
+
+        let fps = compute_adr_fingerprints(dir.path()).unwrap();
+        assert_eq!(fps.len(), 2);
+        assert_eq!(fps[0].filename, "adr-001.md");
+        assert_eq!(fps[1].filename, "adr-002.md");
+        assert_ne!(fps[0].content_hash, 0);
+        // Different content should produce different hashes.
+        assert_ne!(fps[0].content_hash, fps[1].content_hash);
+    }
+
+    #[test]
+    fn compute_fingerprints_empty_when_no_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let fps = compute_adr_fingerprints(dir.path()).unwrap();
+        assert!(fps.is_empty());
+    }
+
+    #[test]
+    fn diff_detects_new() {
+        let prev = vec![AdrFingerprint {
+            filename: "adr-001.md".into(),
+            content_hash: 111,
+        }];
+        let curr = vec![
+            AdrFingerprint {
+                filename: "adr-001.md".into(),
+                content_hash: 111,
+            },
+            AdrFingerprint {
+                filename: "adr-002.md".into(),
+                content_hash: 222,
+            },
+        ];
+        let (new, changed) = diff_adr_fingerprints(&prev, &curr);
+        assert_eq!(new, vec!["adr-002.md"]);
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn diff_detects_changed() {
+        let prev = vec![AdrFingerprint {
+            filename: "adr-001.md".into(),
+            content_hash: 111,
+        }];
+        let curr = vec![AdrFingerprint {
+            filename: "adr-001.md".into(),
+            content_hash: 999,
+        }];
+        let (new, changed) = diff_adr_fingerprints(&prev, &curr);
+        assert!(new.is_empty());
+        assert_eq!(changed, vec!["adr-001.md"]);
+    }
+
+    #[test]
+    fn diff_no_changes() {
+        let fps = vec![
+            AdrFingerprint {
+                filename: "adr-001.md".into(),
+                content_hash: 111,
+            },
+            AdrFingerprint {
+                filename: "adr-002.md".into(),
+                content_hash: 222,
+            },
+        ];
+        let (new, changed) = diff_adr_fingerprints(&fps, &fps);
+        assert!(new.is_empty());
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn diff_handles_removed() {
+        let prev = vec![
+            AdrFingerprint {
+                filename: "adr-001.md".into(),
+                content_hash: 111,
+            },
+            AdrFingerprint {
+                filename: "adr-002.md".into(),
+                content_hash: 222,
+            },
+        ];
+        let curr = vec![AdrFingerprint {
+            filename: "adr-001.md".into(),
+            content_hash: 111,
+        }];
+        // Removed files are silently ignored.
+        let (new, changed) = diff_adr_fingerprints(&prev, &curr);
+        assert!(new.is_empty());
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_serde_roundtrip() {
+        let fp = AdrFingerprint {
+            filename: "adr-test.md".into(),
+            content_hash: 12345,
+        };
+        let json = serde_json::to_string(&fp).unwrap();
+        let parsed: AdrFingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, fp);
     }
 }
