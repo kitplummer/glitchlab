@@ -1354,6 +1354,16 @@ impl EngineeringPipeline {
             // Pure parse error (LLM returned garbage) — try model escalation
             // before giving up. Stuck-loop failures are not retryable.
             if reason == "parse_error" {
+                // Use the actual raw output from the CLI (if captured) instead
+                // of the fallback JSON, so Circuit/TQM can diagnose whether
+                // this is an infrastructure issue vs model garbage.
+                let raw_snippet: String = impl_output
+                    .data
+                    .get("_raw_output_preview")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.chars().take(200).collect())
+                    .unwrap_or_else(|| impl_output.data.to_string().chars().take(200).collect());
+
                 if let Some(escalated_model) = self.router.escalate_model("implementer").await {
                     let original_model = impl_output.metadata.model.clone();
                     warn!(
@@ -1400,8 +1410,6 @@ impl EngineeringPipeline {
                         }
                         _ => {
                             // Escalation retry also failed.
-                            let raw_snippet: String =
-                                impl_output.data.to_string().chars().take(200).collect();
                             return self
                                 .fail_with_context(
                                     ctx,
@@ -1414,7 +1422,7 @@ impl EngineeringPipeline {
                                         obstacle:
                                             glitchlab_kernel::outcome::ObstacleKind::ParseFailure {
                                                 model: escalated_model.clone(),
-                                                raw_snippet,
+                                                raw_snippet: raw_snippet.clone(),
                                             },
                                         discoveries: vec![],
                                         recommendation: Some(
@@ -1428,8 +1436,6 @@ impl EngineeringPipeline {
                     }
                 } else {
                     // No escalated model available.
-                    let raw_snippet: String =
-                        impl_output.data.to_string().chars().take(200).collect();
                     return self
                         .fail_with_context(
                             ctx,

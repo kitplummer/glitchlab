@@ -673,4 +673,34 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn select_with_fallbacks_budget_pressure_downgrades() {
+        let chooser = test_chooser(0.7);
+        // Budget pressure > threshold (0.7): should downgrade min_tier.
+        // Planner normally min_tier=Standard; downgraded to Economy.
+        // All models (including Economy) should now be returned.
+        let fallbacks = chooser.select_with_fallbacks("planner", 1.0, 10.0);
+        assert!(fallbacks.len() > 2, "should include Economy models");
+        // First model should be cheapest (Economy tier)
+        assert!(
+            fallbacks[0].tier == ModelTier::Economy,
+            "first model should be Economy"
+        );
+    }
+
+    #[test]
+    fn select_with_fallbacks_zero_max_budget() {
+        let chooser = test_chooser(0.7);
+        // max_budget = 0.0 → budget_pressure = 0.0 → no downgrade.
+        let fallbacks = chooser.select_with_fallbacks("planner", 0.0, 0.0);
+        let model_names: Vec<String> = fallbacks.iter().map(|m| m.model_string.clone()).collect();
+        assert_eq!(
+            model_names,
+            vec![
+                "gemini/gemini-2.5-flash".to_string(),
+                "anthropic/claude-sonnet-4-20250514".to_string()
+            ]
+        );
+    }
 }

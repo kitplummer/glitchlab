@@ -100,6 +100,29 @@ pub enum DashboardEvent {
     QualityGateFailed { details: String },
     /// Systemic failure detected — orchestrator halting.
     SystemicFailure { dominant_category: String },
+    /// Pre-batch backlog review started.
+    BacklogReviewStarted,
+    /// Pre-batch backlog review completed.
+    BacklogReviewCompleted {
+        beads_reviewed: usize,
+        actions_applied: usize,
+        cost: f64,
+    },
+    /// ADR watch scan started.
+    AdrWatchStarted,
+    /// ADR watch scan completed.
+    AdrWatchCompleted {
+        adrs_scanned: usize,
+        adrs_new: usize,
+        adrs_changed: usize,
+        beads_created: usize,
+        cost: f64,
+    },
+    /// A single ADR was decomposed into beads.
+    AdrDecomposed {
+        adr_filename: String,
+        beads_created: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +409,59 @@ impl DashboardEmitter {
                     dominant_category = dominant_category.as_str(),
                 );
             }
+            DashboardEvent::BacklogReviewStarted => {
+                info!(
+                    target: "glitchlab::dashboard",
+                    event = "backlog_review_started",
+                );
+            }
+            DashboardEvent::BacklogReviewCompleted {
+                beads_reviewed,
+                actions_applied,
+                cost,
+            } => {
+                info!(
+                    target: "glitchlab::dashboard",
+                    event = "backlog_review_completed",
+                    beads_reviewed,
+                    actions_applied,
+                    cost,
+                );
+            }
+            DashboardEvent::AdrWatchStarted => {
+                info!(
+                    target: "glitchlab::dashboard",
+                    event = "adr_watch_started",
+                );
+            }
+            DashboardEvent::AdrWatchCompleted {
+                adrs_scanned,
+                adrs_new,
+                adrs_changed,
+                beads_created,
+                cost,
+            } => {
+                info!(
+                    target: "glitchlab::dashboard",
+                    event = "adr_watch_completed",
+                    adrs_scanned,
+                    adrs_new,
+                    adrs_changed,
+                    beads_created,
+                    cost,
+                );
+            }
+            DashboardEvent::AdrDecomposed {
+                adr_filename,
+                beads_created,
+            } => {
+                info!(
+                    target: "glitchlab::dashboard",
+                    event = "adr_decomposed",
+                    adr_filename = adr_filename.as_str(),
+                    beads_created,
+                );
+            }
         }
     }
 }
@@ -414,6 +490,22 @@ impl Write for SharedBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emitter_new_creates_file_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events/dashboard.jsonl");
+        let emitter = DashboardEmitter::new(&path).unwrap();
+        emitter.emit(DashboardEvent::RunStarted {
+            total_tasks: 5,
+            budget_dollars: 10.0,
+        });
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(v["event"], "run_started");
+        assert_eq!(v["total_tasks"], 5);
+    }
 
     #[test]
     fn emit_writes_jsonl() {
@@ -542,6 +634,24 @@ mod tests {
             },
             DashboardEvent::SystemicFailure {
                 dominant_category: "provider_failures".into(),
+            },
+            DashboardEvent::BacklogReviewStarted,
+            DashboardEvent::BacklogReviewCompleted {
+                beads_reviewed: 5,
+                actions_applied: 2,
+                cost: 0.01,
+            },
+            DashboardEvent::AdrWatchStarted,
+            DashboardEvent::AdrWatchCompleted {
+                adrs_scanned: 3,
+                adrs_new: 1,
+                adrs_changed: 1,
+                beads_created: 4,
+                cost: 0.02,
+            },
+            DashboardEvent::AdrDecomposed {
+                adr_filename: "adr-001.md".into(),
+                beads_created: 3,
             },
         ];
 

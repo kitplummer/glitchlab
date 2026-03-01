@@ -323,6 +323,15 @@ mod tests {
     }
 
     #[test]
+    fn chained_commands_or_operator() {
+        let policy = test_policy();
+        // || chains: first segment allowed, second blocked → rejected
+        assert!(policy.check("cargo test || rm -rf /").is_err());
+        // || chains: both segments allowed
+        assert!(policy.check("cargo test || cargo fmt").is_ok());
+    }
+
+    #[test]
     fn tool_result_success_and_failure() {
         let ok = ToolResult {
             command: "echo hi".into(),

@@ -52,6 +52,20 @@ pub struct BeadDependency {
     pub dep_type: String,
 }
 
+/// Request to create a bead with full metadata.
+///
+/// Used by the ADR decomposer to create beads with title, description,
+/// type, priority, and labels in a single `bd create` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadCreateRequest {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub issue_type: String,
+    pub priority: i32,
+    pub labels: Vec<String>,
+}
+
 fn default_bead_status() -> String {
     "open".into()
 }
@@ -138,6 +152,28 @@ impl BeadsClient {
         let json = self.run_bd(&["list", "--json"]).await?;
         serde_json::from_str(&json)
             .map_err(|e| MemoryError::Beads(format!("failed to parse bd list: {e}")))
+    }
+
+    /// Create a bead with full metadata (title, description, type, priority, labels).
+    pub async fn create_bead_detailed(&self, req: &BeadCreateRequest) -> Result<String> {
+        let mut args: Vec<&str> = vec!["create", &req.title, "--id", &req.id];
+        if !req.issue_type.is_empty() {
+            args.push("--type");
+            args.push(&req.issue_type);
+        }
+        if !req.description.is_empty() {
+            args.push("--description");
+            args.push(&req.description);
+        }
+        let priority_str = req.priority.to_string();
+        args.push("--priority");
+        args.push(&priority_str);
+        for label in &req.labels {
+            args.push("--label");
+            args.push(label);
+        }
+        args.push("--silent");
+        self.run_bd(&args).await
     }
 
     /// List ready (unblocked) beads, parsed from JSON.
@@ -732,6 +768,61 @@ mod tests {
             "open"
         );
         assert_eq!(pipeline_status_to_bead_status(""), "open");
+    }
+
+    #[tokio::test]
+    async fn create_bead_detailed_uses_correct_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, args_file) = mock_bd_capture(dir.path(), "adr-test-add-auth");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let req = BeadCreateRequest {
+            id: "adr-test-add-auth".into(),
+            title: "Add authentication".into(),
+            description: "Implement JWT auth".into(),
+            issue_type: "feature".into(),
+            priority: 1,
+            labels: vec!["adr:adr-test.md".into(), "security".into()],
+        };
+        let result = client.create_bead_detailed(&req).await.unwrap();
+        assert_eq!(result, "adr-test-add-auth");
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        // bd create "Add authentication" --id adr-test-add-auth --type feature
+        //   --description "Implement JWT auth" --priority 1
+        //   --label adr:adr-test.md --label security --silent
+        assert_eq!(lines[0], "create");
+        assert_eq!(lines[1], "Add authentication");
+        assert_eq!(lines[2], "--id");
+        assert_eq!(lines[3], "adr-test-add-auth");
+        assert_eq!(lines[4], "--type");
+        assert_eq!(lines[5], "feature");
+        assert_eq!(lines[6], "--description");
+        assert_eq!(lines[7], "Implement JWT auth");
+        assert_eq!(lines[8], "--priority");
+        assert_eq!(lines[9], "1");
+        assert_eq!(lines[10], "--label");
+        assert_eq!(lines[11], "adr:adr-test.md");
+        assert_eq!(lines[12], "--label");
+        assert_eq!(lines[13], "security");
+        assert_eq!(lines[14], "--silent");
+    }
+
+    #[test]
+    fn bead_create_request_serde_roundtrip() {
+        let req = BeadCreateRequest {
+            id: "test-1".into(),
+            title: "Test".into(),
+            description: "A test bead".into(),
+            issue_type: "task".into(),
+            priority: 2,
+            labels: vec!["adr:test.md".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: BeadCreateRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "test-1");
+        assert_eq!(parsed.labels, vec!["adr:test.md"]);
     }
 
     #[tokio::test]

@@ -786,6 +786,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_with_stderr() {
+        let dir = TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(dir.path());
+        // echo to both stdout and stderr
+        let call = make_call(
+            "run_command",
+            json!({"command": "echo out && echo err >&2"}),
+        );
+        let result = dispatcher.dispatch(&call).await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("out"));
+        assert!(result.content.contains("stderr:"));
+        assert!(result.content.contains("err"));
+    }
+
+    #[tokio::test]
     async fn run_command_blocked_by_policy() {
         let dir = TempDir::new().unwrap();
         let dispatcher = make_dispatcher(dir.path());

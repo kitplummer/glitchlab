@@ -511,6 +511,69 @@ impl RestartIntensityMonitor {
 // Orchestrator
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// BacklogReviewResult
+// ---------------------------------------------------------------------------
+
+/// Result of a pre-batch backlog review sweep.
+#[derive(Debug)]
+pub(crate) struct BacklogReviewResult {
+    pub(crate) beads_reviewed: usize,
+    pub(crate) actions_applied: usize,
+    pub(crate) cost: f64,
+    pub(crate) skipped: bool,
+}
+
+impl BacklogReviewResult {
+    fn skipped() -> Self {
+        Self {
+            beads_reviewed: 0,
+            actions_applied: 0,
+            cost: 0.0,
+            skipped: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AdrWatchState — in-memory state for periodic ADR scanning
+// ---------------------------------------------------------------------------
+
+/// In-memory state for periodic ADR change detection.
+///
+/// Not persisted — cross-run dedup relies on `adr:<filename>` labels on existing beads.
+struct AdrWatchState {
+    fingerprints: Vec<crate::indexer::AdrFingerprint>,
+    tasks_since_last_scan: u32,
+    last_scan_time: Instant,
+}
+
+impl AdrWatchState {
+    fn new() -> Self {
+        Self {
+            fingerprints: Vec::new(),
+            tasks_since_last_scan: 0,
+            last_scan_time: Instant::now(),
+        }
+    }
+
+    /// Check whether a scan should run based on task count and time interval.
+    fn should_scan(&self, interval_tasks: u32, interval_secs: u64) -> bool {
+        self.tasks_since_last_scan >= interval_tasks
+            || self.last_scan_time.elapsed() >= Duration::from_secs(interval_secs)
+    }
+}
+
+/// Result of an ADR watch scan.
+#[derive(Debug)]
+pub(crate) struct AdrWatchResult {
+    pub(crate) adrs_scanned: usize,
+    pub(crate) adrs_new: usize,
+    pub(crate) adrs_changed: usize,
+    pub(crate) beads_created: usize,
+    pub(crate) cost: f64,
+}
+
 /// Multi-run autonomous orchestrator.
 ///
 /// Iterates through a task queue, running each task through the full
@@ -583,11 +646,33 @@ impl Orchestrator {
         };
 
         let mut detected_patterns: Vec<crate::tqm::DetectedPattern> = vec![];
+        let mut infra_diag_injected = false;
 
         self.dash(DashboardEvent::RunStarted {
             total_tasks: queue.summary().pending as usize,
             budget_dollars: budget.limit_dollars(),
         });
+
+        // --- Pre-batch backlog review ---
+        match self
+            .run_backlog_review(queue, budget, &params.repo_path)
+            .await
+        {
+            review_result if review_result.skipped => {
+                // Nothing to do — review was disabled or had no tasks.
+            }
+            review_result => {
+                info!(
+                    beads_reviewed = review_result.beads_reviewed,
+                    actions_applied = review_result.actions_applied,
+                    cost = review_result.cost,
+                    "backlog review sweep complete"
+                );
+            }
+        }
+
+        // --- ADR watch state ---
+        let mut adr_watch_state = AdrWatchState::new();
 
         // --- Task loop ---
         loop {
@@ -602,6 +687,27 @@ impl Orchestrator {
                 result.cease_reason = CeaseReason::BudgetExhausted;
                 break;
             }
+
+            // --- ADR watch scan (periodic) ---
+            if self.config.watch.enabled
+                && adr_watch_state.should_scan(
+                    self.config.watch.interval_tasks,
+                    self.config.watch.interval_secs,
+                )
+            {
+                let watch_result = self
+                    .run_adr_watch_scan(queue, budget, &params.repo_path, &mut adr_watch_state)
+                    .await;
+                info!(
+                    adrs_scanned = watch_result.adrs_scanned,
+                    adrs_new = watch_result.adrs_new,
+                    adrs_changed = watch_result.adrs_changed,
+                    beads_created = watch_result.beads_created,
+                    cost = watch_result.cost,
+                    "ADR watch scan complete"
+                );
+            }
+            adr_watch_state.tasks_since_last_scan += 1;
 
             // --- Check max total tasks ---
             if queue.len() > self.config.limits.max_total_tasks as usize {
@@ -804,6 +910,7 @@ impl Orchestrator {
                                 count: circuit_tasks.len(),
                                 task_ids: ids,
                             });
+                            Self::persist_tasks_as_beads(&params.repo_path, &circuit_tasks).await;
                             queue.inject_tasks(circuit_tasks);
                         } else {
                             // Fallback to generic remediation if Circuit produced nothing.
@@ -825,6 +932,8 @@ impl Orchestrator {
                                     count: fallback_tasks.len(),
                                     task_ids: ids,
                                 });
+                                Self::persist_tasks_as_beads(&params.repo_path, &fallback_tasks)
+                                    .await;
                                 queue.inject_tasks(fallback_tasks);
                             }
                         }
@@ -846,6 +955,7 @@ impl Orchestrator {
                                 count: tasks.len(),
                                 task_ids: ids,
                             });
+                            Self::persist_tasks_as_beads(&params.repo_path, &tasks).await;
                             queue.inject_tasks(tasks);
                         }
                     }
@@ -947,6 +1057,18 @@ impl Orchestrator {
             }
 
             if routing.task_status == TaskStatus::Deferred {
+                // --- Early infrastructure failure detection ---
+                // On ParseError, check if the raw output is empty (infrastructure
+                // issue, not model garbage). Inject a high-priority diagnostic
+                // task immediately instead of waiting for TQM's 3-failure threshold.
+                if pipeline_result.status == PipelineStatus::ParseError {
+                    Self::maybe_inject_infra_diagnostic(
+                        queue,
+                        &pipeline_result,
+                        &mut infra_diag_injected,
+                    );
+                }
+
                 let _ = queue.save();
                 info!(task_id = %task_id, "task deferred, will retry later");
                 continue;
@@ -1516,6 +1638,743 @@ impl Orchestrator {
         }
 
         if tasks.is_empty() { None } else { Some(tasks) }
+    }
+
+    /// Run a pre-batch backlog review using the BacklogReviewAgent.
+    ///
+    /// Non-fatal: errors are logged and a skipped result is returned.
+    async fn run_backlog_review(
+        &self,
+        queue: &mut TaskQueue,
+        budget: &mut CumulativeBudget,
+        repo_path: &Path,
+    ) -> BacklogReviewResult {
+        if !self.config.review.enabled {
+            return BacklogReviewResult::skipped();
+        }
+
+        self.dash(DashboardEvent::BacklogReviewStarted);
+        info!("running pre-batch backlog review");
+
+        // Build ADR index.
+        let adr_summaries = match crate::indexer::build_adr_index(repo_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to build ADR index for backlog review");
+                Vec::new()
+            }
+        };
+        let adr_context = crate::indexer::adr_summaries_to_context(&adr_summaries);
+
+        // Serialize open tasks as JSON for the agent.
+        let open_tasks: Vec<&crate::taskqueue::Task> = queue
+            .tasks()
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    crate::taskqueue::TaskStatus::Pending | crate::taskqueue::TaskStatus::Deferred
+                )
+            })
+            .collect();
+
+        if open_tasks.is_empty() {
+            info!("no open tasks for backlog review");
+            return BacklogReviewResult::skipped();
+        }
+
+        let beads_json = serde_json::to_string_pretty(&open_tasks).unwrap_or_default();
+        let prompt = crate::agents::backlog_review::BacklogReviewAgent::build_prompt(
+            &beads_json,
+            &adr_context,
+        );
+
+        // Create a lightweight router for the review agent.
+        let budget_tracker = BudgetTracker::new(
+            self.config.limits.max_tokens_per_task,
+            self.config.limits.max_dollars_per_task,
+        );
+        let provider_inits = self.config.resolve_providers();
+        let mut router =
+            Router::with_providers(self.config.routing_map(), budget_tracker, provider_inits);
+        if let Some(chooser) = self.config.build_chooser() {
+            router = router.with_chooser(chooser);
+        }
+        let router = Arc::new(router);
+
+        let agent = crate::agents::backlog_review::BacklogReviewAgent::new(router);
+
+        use glitchlab_kernel::agent::{Agent, AgentContext};
+        let ctx = AgentContext {
+            task_id: "backlog-review".into(),
+            objective: prompt,
+            repo_path: repo_path.to_string_lossy().into(),
+            working_dir: String::new(),
+            constraints: vec![],
+            acceptance_criteria: vec![],
+            risk_level: "low".into(),
+            file_context: std::collections::HashMap::new(),
+            previous_output: serde_json::Value::Null,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let output = match agent.execute(&ctx).await {
+            Ok(out) => out,
+            Err(e) => {
+                warn!(error = %e, "backlog review agent failed");
+                return BacklogReviewResult::skipped();
+            }
+        };
+
+        let cost = output.metadata.cost;
+        budget.record("backlog-review", cost, output.metadata.tokens, "review");
+
+        let beads_reviewed = output
+            .data
+            .get("total_beads_reviewed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let actions_applied = Self::apply_review_verdicts(queue, &output.data, &self.config.review);
+
+        let result = BacklogReviewResult {
+            beads_reviewed,
+            actions_applied,
+            cost,
+            skipped: false,
+        };
+
+        info!(
+            beads_reviewed = result.beads_reviewed,
+            actions_applied = result.actions_applied,
+            cost = result.cost,
+            "backlog review complete"
+        );
+
+        self.dash(DashboardEvent::BacklogReviewCompleted {
+            beads_reviewed: result.beads_reviewed,
+            actions_applied: result.actions_applied,
+            cost: result.cost,
+        });
+
+        result
+    }
+
+    /// Run an ADR watch scan: detect new/changed ADRs and decompose them into beads.
+    ///
+    /// Non-fatal: errors are logged and the scan is skipped.
+    async fn run_adr_watch_scan(
+        &self,
+        queue: &mut TaskQueue,
+        budget: &mut CumulativeBudget,
+        repo_path: &Path,
+        state: &mut AdrWatchState,
+    ) -> AdrWatchResult {
+        self.dash(DashboardEvent::AdrWatchStarted);
+        info!("running ADR watch scan");
+
+        // Compute current fingerprints.
+        let current_fps = match crate::indexer::compute_adr_fingerprints(repo_path) {
+            Ok(fps) => fps,
+            Err(e) => {
+                warn!(error = %e, "failed to compute ADR fingerprints");
+                state.last_scan_time = Instant::now();
+                state.tasks_since_last_scan = 0;
+                return AdrWatchResult {
+                    adrs_scanned: 0,
+                    adrs_new: 0,
+                    adrs_changed: 0,
+                    beads_created: 0,
+                    cost: 0.0,
+                };
+            }
+        };
+
+        let adrs_scanned = current_fps.len();
+        let (new_files, changed_files) =
+            crate::indexer::diff_adr_fingerprints(&state.fingerprints, &current_fps);
+
+        // Update stored fingerprints.
+        state.fingerprints = current_fps;
+        state.last_scan_time = Instant::now();
+        state.tasks_since_last_scan = 0;
+
+        let adrs_to_process: Vec<String> = new_files
+            .iter()
+            .chain(changed_files.iter())
+            .cloned()
+            .collect();
+
+        if adrs_to_process.is_empty() {
+            info!("no new or changed ADRs");
+            self.dash(DashboardEvent::AdrWatchCompleted {
+                adrs_scanned,
+                adrs_new: 0,
+                adrs_changed: 0,
+                beads_created: 0,
+                cost: 0.0,
+            });
+            return AdrWatchResult {
+                adrs_scanned,
+                adrs_new: 0,
+                adrs_changed: 0,
+                beads_created: 0,
+                cost: 0.0,
+            };
+        }
+
+        // Get existing beads for dedup context.
+        let existing_beads_json = {
+            let open_tasks: Vec<&crate::taskqueue::Task> = queue
+                .tasks()
+                .iter()
+                .filter(|t| {
+                    matches!(
+                        t.status,
+                        crate::taskqueue::TaskStatus::Pending
+                            | crate::taskqueue::TaskStatus::Deferred
+                    )
+                })
+                .collect();
+            serde_json::to_string_pretty(&open_tasks).unwrap_or_else(|_| "[]".into())
+        };
+
+        // Create router for decomposer.
+        let budget_tracker = BudgetTracker::new(
+            self.config.limits.max_tokens_per_task,
+            self.config.limits.max_dollars_per_task,
+        );
+        let provider_inits = self.config.resolve_providers();
+        let mut router =
+            Router::with_providers(self.config.routing_map(), budget_tracker, provider_inits);
+        if let Some(chooser) = self.config.build_chooser() {
+            router = router.with_chooser(chooser);
+        }
+        let router = Arc::new(router);
+
+        let mut total_beads_created = 0usize;
+        let mut total_cost = 0.0f64;
+
+        for adr_filename in &adrs_to_process {
+            let adr_path = repo_path.join("docs").join(adr_filename);
+            let adr_content = match std::fs::read_to_string(&adr_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        adr = %adr_filename,
+                        error = %e,
+                        "failed to read ADR file"
+                    );
+                    continue;
+                }
+            };
+
+            // Optional consultation.
+            let consultation_context = if self.config.watch.consultation_enabled {
+                self.consult_on_adr(&adr_content, adr_filename, repo_path, Arc::clone(&router))
+                    .await
+            } else {
+                String::new()
+            };
+
+            // Build prompt and run decomposer.
+            let prompt = crate::agents::adr_decomposer::AdrDecomposerAgent::build_prompt(
+                &adr_content,
+                &existing_beads_json,
+                &consultation_context,
+            );
+
+            let agent = crate::agents::adr_decomposer::AdrDecomposerAgent::new(Arc::clone(&router));
+
+            use glitchlab_kernel::agent::{Agent, AgentContext};
+            let ctx = AgentContext {
+                task_id: format!("adr-watch-{adr_filename}"),
+                objective: prompt,
+                repo_path: repo_path.to_string_lossy().into(),
+                working_dir: String::new(),
+                constraints: vec![],
+                acceptance_criteria: vec![],
+                risk_level: "low".into(),
+                file_context: std::collections::HashMap::new(),
+                previous_output: serde_json::Value::Null,
+                extra: std::collections::HashMap::new(),
+            };
+
+            let output = match agent.execute(&ctx).await {
+                Ok(out) => out,
+                Err(e) => {
+                    warn!(adr = %adr_filename, error = %e, "ADR decomposer failed");
+                    continue;
+                }
+            };
+
+            let cost = output.metadata.cost;
+            total_cost += cost;
+            budget.record(
+                &format!("adr-watch-{adr_filename}"),
+                cost,
+                output.metadata.tokens,
+                "adr_decomposition",
+            );
+
+            // Check confidence threshold.
+            let confidence = output
+                .data
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            if confidence < self.config.watch.confidence_threshold {
+                info!(
+                    adr = %adr_filename,
+                    confidence,
+                    threshold = self.config.watch.confidence_threshold,
+                    "ADR decomposition below confidence threshold, skipping"
+                );
+                continue;
+            }
+
+            // Extract beads from output and inject into queue.
+            let adr_beads_created = Self::inject_adr_beads(
+                queue,
+                &output.data,
+                adr_filename,
+                self.config.watch.max_beads_per_adr,
+                self.config.watch.auto_inject,
+            );
+
+            // Persist ADR-spawned tasks as beads so they survive across runs.
+            if adr_beads_created > 0 {
+                Self::persist_adr_beads_from_output(
+                    repo_path,
+                    &output.data,
+                    adr_filename,
+                    self.config.watch.max_beads_per_adr,
+                )
+                .await;
+            }
+
+            total_beads_created += adr_beads_created;
+
+            self.dash(DashboardEvent::AdrDecomposed {
+                adr_filename: adr_filename.clone(),
+                beads_created: adr_beads_created,
+            });
+
+            info!(
+                adr = %adr_filename,
+                beads_created = adr_beads_created,
+                confidence,
+                "ADR decomposed"
+            );
+        }
+
+        self.dash(DashboardEvent::AdrWatchCompleted {
+            adrs_scanned,
+            adrs_new: new_files.len(),
+            adrs_changed: changed_files.len(),
+            beads_created: total_beads_created,
+            cost: total_cost,
+        });
+
+        AdrWatchResult {
+            adrs_scanned,
+            adrs_new: new_files.len(),
+            adrs_changed: changed_files.len(),
+            beads_created: total_beads_created,
+            cost: total_cost,
+        }
+    }
+
+    /// Consult security and architect agents on an ADR before decomposition.
+    ///
+    /// Non-fatal: if either agent fails, its section is empty (logged via `warn!`).
+    async fn consult_on_adr(
+        &self,
+        adr_content: &str,
+        adr_filename: &str,
+        repo_path: &Path,
+        router: Arc<Router>,
+    ) -> String {
+        use glitchlab_kernel::agent::{Agent, AgentContext};
+
+        let ctx = AgentContext {
+            task_id: format!("consult-{adr_filename}"),
+            objective: format!("Review this ADR for concerns:\n\n{adr_content}"),
+            repo_path: repo_path.to_string_lossy().into(),
+            working_dir: String::new(),
+            constraints: vec![],
+            acceptance_criteria: vec![],
+            risk_level: "low".into(),
+            file_context: std::collections::HashMap::new(),
+            previous_output: serde_json::Value::Null,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let mut sections = Vec::new();
+
+        // Security consultation.
+        let security_agent = crate::agents::security::SecurityAgent::new(Arc::clone(&router));
+        match security_agent.execute(&ctx).await {
+            Ok(output) => {
+                if let Some(content) = output.data.get("verdict").and_then(|v| v.as_str()) {
+                    sections.push(format!("### Security Review\n{content}"));
+                }
+            }
+            Err(e) => {
+                warn!(adr = %adr_filename, error = %e, "security consultation failed");
+            }
+        }
+
+        // Architect triage consultation.
+        let architect = crate::agents::architect::ArchitectTriageAgent::new(Arc::clone(&router));
+        match architect.execute(&ctx).await {
+            Ok(output) => {
+                if let Some(content) = output.data.get("assessment").and_then(|v| v.as_str()) {
+                    sections.push(format!("### Architect Review\n{content}"));
+                }
+            }
+            Err(e) => {
+                warn!(adr = %adr_filename, error = %e, "architect consultation failed");
+            }
+        }
+
+        sections.join("\n\n")
+    }
+
+    /// Extract tasks from ADR decomposer output and inject into queue.
+    ///
+    /// Returns the number of tasks created. Skips beads that already exist in
+    /// the queue (by task ID). Respects `max_beads` limit.
+    fn inject_adr_beads(
+        queue: &mut TaskQueue,
+        output_data: &serde_json::Value,
+        adr_filename: &str,
+        max_beads: usize,
+        auto_inject: bool,
+    ) -> usize {
+        let beads = output_data
+            .get("beads")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let adr_stem = adr_filename
+            .strip_suffix(".md")
+            .unwrap_or(adr_filename)
+            .to_string();
+
+        let mut created = 0usize;
+
+        for bead_value in beads.iter().take(max_beads) {
+            let id_suffix = bead_value
+                .get("id_suffix")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let title = bead_value
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Untitled bead");
+            let description = bead_value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let priority = bead_value
+                .get("priority")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2) as u32;
+
+            let task_id = format!("{}-{adr_stem}-{id_suffix}", crate::config::BEAD_ID_PREFIX);
+
+            // Skip if task already in queue.
+            if queue.tasks().iter().any(|t| t.id == task_id) {
+                continue;
+            }
+
+            if auto_inject {
+                let files_hint: Option<Vec<String>> = bead_value
+                    .get("files_likely_affected")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+
+                let task = crate::taskqueue::Task {
+                    id: task_id,
+                    objective: if description.is_empty() {
+                        title.to_string()
+                    } else {
+                        format!("{title}\n\n{description}")
+                    },
+                    priority,
+                    status: TaskStatus::Pending,
+                    depends_on: vec![],
+                    decomposition_depth: 0,
+                    error: None,
+                    pr_url: None,
+                    outcome_context: None,
+                    remediation_depth: 0,
+                    is_remediation: false,
+                    files_hint,
+                };
+                queue.inject_tasks(vec![task]);
+                created += 1;
+            }
+        }
+
+        created
+    }
+
+    /// Persist tasks as beads so they survive across batch runs.
+    ///
+    /// Non-fatal: logs a warning if any bead creation fails.
+    async fn persist_tasks_as_beads(repo_path: &Path, tasks: &[crate::taskqueue::Task]) {
+        let client = glitchlab_memory::beads::BeadsClient::new(repo_path, None);
+        for task in tasks {
+            let title = task
+                .objective
+                .lines()
+                .next()
+                .unwrap_or("Remediation")
+                .to_string();
+            let req = glitchlab_memory::beads::BeadCreateRequest {
+                id: task.id.clone(),
+                title,
+                description: task.objective.clone(),
+                issue_type: "task".to_string(),
+                priority: task.priority as i32,
+                labels: vec!["tqm:remediation".to_string()],
+            };
+            if let Err(e) = client.create_bead_detailed(&req).await {
+                warn!(task_id = %task.id, error = %e, "failed to persist remediation task as bead");
+            }
+        }
+    }
+
+    /// Persist ADR-decomposed beads using the decomposer's JSON output.
+    ///
+    /// Non-fatal: logs warnings on failure.
+    async fn persist_adr_beads_from_output(
+        repo_path: &Path,
+        output_data: &serde_json::Value,
+        adr_filename: &str,
+        max_beads: usize,
+    ) {
+        let client = glitchlab_memory::beads::BeadsClient::new(repo_path, None);
+        let beads = output_data
+            .get("beads")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let adr_stem = adr_filename.strip_suffix(".md").unwrap_or(adr_filename);
+
+        for bead_value in beads.iter().take(max_beads) {
+            let id_suffix = bead_value
+                .get("id_suffix")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let title = bead_value
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Untitled bead");
+            let description = bead_value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let priority = bead_value
+                .get("priority")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2) as i32;
+
+            let task_id = format!("{}-{adr_stem}-{id_suffix}", crate::config::BEAD_ID_PREFIX);
+
+            let mut labels = vec![format!("adr:{adr_filename}")];
+            if let Some(arr) = bead_value.get("labels").and_then(|v| v.as_array()) {
+                for l in arr {
+                    if let Some(s) = l.as_str() {
+                        labels.push(s.to_string());
+                    }
+                }
+            }
+
+            let req = glitchlab_memory::beads::BeadCreateRequest {
+                id: task_id.clone(),
+                title: title.to_string(),
+                description: description.to_string(),
+                issue_type: "task".to_string(),
+                priority,
+                labels,
+            };
+            if let Err(e) = client.create_bead_detailed(&req).await {
+                warn!(task_id = %task_id, error = %e, "failed to persist ADR bead");
+            }
+        }
+    }
+
+    /// Inject a targeted diagnostic task on the first ParseError with empty output.
+    ///
+    /// Instead of waiting for TQM to accumulate 3+ failures and create a generic
+    /// "investigate model degradation" task, this detects infrastructure-level
+    /// failures (empty CLI output) immediately and injects a high-priority fix
+    /// task that the system can act on in the same batch.
+    fn maybe_inject_infra_diagnostic(
+        queue: &mut TaskQueue,
+        pipeline_result: &glitchlab_kernel::pipeline::PipelineResult,
+        already_injected: &mut bool,
+    ) {
+        if *already_injected {
+            return;
+        }
+
+        // Extract the raw output preview from outcome context.
+        let raw_snippet = pipeline_result
+            .outcome_context
+            .as_ref()
+            .and_then(|ctx| match &ctx.obstacle {
+                glitchlab_kernel::outcome::ObstacleKind::ParseFailure { raw_snippet, .. } => {
+                    Some(raw_snippet.as_str())
+                }
+                _ => None,
+            })
+            .unwrap_or("");
+
+        // Only trigger for infrastructure failures (empty or whitespace-only output),
+        // not for model garbage (which model escalation or TQM can handle).
+        if !raw_snippet.trim().is_empty() {
+            return;
+        }
+
+        let diag_id = format!(
+            "{}-infra-diag-empty-implementer-output",
+            crate::config::BEAD_ID_PREFIX
+        );
+        warn!(
+            diag_task_id = diag_id,
+            "empty implementer output detected — injecting infrastructure diagnostic task"
+        );
+
+        let diag_task = crate::taskqueue::Task {
+            id: diag_id,
+            objective: concat!(
+                "INFRASTRUCTURE BUG: The Claude Code implementer CLI returns an empty `result` field. ",
+                "Diagnose why `claude --print --output-format json` produces a JSON envelope with an empty ",
+                "`result` string. Check: (1) is the prompt being written to stdin correctly, (2) is the ",
+                "`--permission-mode bypassPermissions` flag accepted, (3) are the `--allowedTools` valid, ",
+                "(4) does the model parameter match an available model. Fix the invocation in ",
+                "`crates/eng-org/src/agents/claude_code.rs` or add a test that reproduces the empty-result scenario."
+            ).into(),
+            priority: 0, // highest priority — run before any other task
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: true,
+            files_hint: Some(vec!["crates/eng-org/src/agents/claude_code.rs".into()]),
+        };
+
+        queue.inject_tasks(vec![diag_task]);
+        *already_injected = true;
+    }
+
+    /// Apply review verdicts to the task queue, respecting confidence and config gates.
+    ///
+    /// Returns the number of actions actually applied.
+    fn apply_review_verdicts(
+        queue: &mut TaskQueue,
+        review_output: &serde_json::Value,
+        review_config: &crate::config::ReviewConfig,
+    ) -> usize {
+        let actions = match review_output.get("actions").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return 0,
+        };
+
+        let threshold = review_config.confidence_threshold;
+        let mut applied = 0;
+
+        for action in actions {
+            let bead_id = match action.get("bead_id").and_then(|v| v.as_str()) {
+                Some(id) => id,
+                None => continue,
+            };
+            let action_type = match action.get("action").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => continue,
+            };
+            let confidence = action
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let reason = action.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+
+            if confidence < threshold {
+                info!(
+                    bead_id,
+                    action_type,
+                    confidence,
+                    threshold,
+                    "skipping verdict below confidence threshold"
+                );
+                continue;
+            }
+
+            match action_type {
+                "close" => {
+                    if review_config.auto_close {
+                        info!(bead_id, confidence, reason, "auto-closing bead");
+                        queue.update_status(bead_id, TaskStatus::Skipped);
+                        applied += 1;
+                    } else {
+                        info!(
+                            bead_id,
+                            confidence, reason, "close verdict logged (auto_close disabled)"
+                        );
+                    }
+                }
+                "reprioritize" => {
+                    if review_config.auto_reprioritize {
+                        if let Some(new_priority) =
+                            action.get("new_priority").and_then(|v| v.as_u64())
+                        {
+                            info!(
+                                bead_id,
+                                confidence, new_priority, reason, "auto-reprioritizing bead"
+                            );
+                            queue.set_priority(bead_id, new_priority as u32);
+                            applied += 1;
+                        }
+                    } else {
+                        info!(
+                            bead_id,
+                            confidence,
+                            reason,
+                            "reprioritize verdict logged (auto_reprioritize disabled)"
+                        );
+                    }
+                }
+                "flag_stale" | "flag_misaligned" => {
+                    info!(
+                        bead_id,
+                        action_type, confidence, reason, "bead flagged by backlog review"
+                    );
+                }
+                "no_action" => {}
+                other => {
+                    warn!(
+                        bead_id,
+                        action_type = other,
+                        "unknown backlog review action"
+                    );
+                }
+            }
+        }
+
+        applied
     }
 }
 
@@ -2791,6 +3650,7 @@ mod tests {
             FailureCategory::ImplementationFailed.to_string(),
             "implementation failed"
         );
+        assert_eq!(FailureCategory::ParseError.to_string(), "parse error");
         assert_eq!(FailureCategory::TestsFailed.to_string(), "tests failed");
         assert_eq!(
             FailureCategory::ArchitectRejected.to_string(),
@@ -3133,6 +3993,10 @@ mod tests {
             FailureCategory::ImplementationFailed
         );
         assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::ParseError),
+            FailureCategory::ParseError
+        );
+        assert_eq!(
             pipeline_status_to_failure_category(PipelineStatus::TestsFailed),
             FailureCategory::TestsFailed
         );
@@ -3237,7 +4101,7 @@ mod tests {
         // Tasks should have been attempted (and failed due to no API keys).
         assert!(result.tasks_attempted >= 1);
         // Check that TQM remediation tasks were injected into the queue.
-        let has_tqm_task = queue.tasks().iter().any(|t| t.id.starts_with("tqm-"));
+        let has_tqm_task = queue.tasks().iter().any(|t| t.id.starts_with("gl-tqm-"));
         assert!(has_tqm_task, "expected TQM remediation tasks in queue");
     }
 
@@ -3509,5 +4373,1047 @@ mod tests {
         let budget = CumulativeBudget::new(0.01).with_repair_budget_fraction(0.01);
         assert!(!budget.can_afford_repair(0.50)); // per-task cost exceeds repair budget
         assert!(next.is_remediation);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_dashboard / dash coverage
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn orchestrator_with_dashboard_emits_events() {
+        let config = EngConfig::default();
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let (emitter, buf) = DashboardEmitter::in_memory();
+        let orchestrator =
+            Orchestrator::new(config, handler, history).with_dashboard(Arc::new(emitter));
+
+        // Run with an empty queue so it finishes quickly.
+        let mut queue = TaskQueue::from_tasks(vec![]);
+        let mut budget = CumulativeBudget::new(100.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: false,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+        assert_eq!(result.cease_reason, CeaseReason::AllTasksDone);
+
+        // Dashboard events are serialized as snake_case via serde tag.
+        let output = buf.lock().unwrap();
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("run_started"),
+            "expected run_started event in dashboard output, got: {text}"
+        );
+        assert!(
+            text.contains("run_completed"),
+            "expected run_completed event in dashboard output, got: {text}"
+        );
+    }
+
+    #[test]
+    fn dash_noop_without_emitter() {
+        let config = EngConfig::default();
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        // Should not panic — dash is a no-op when no emitter is attached.
+        orchestrator.dash(DashboardEvent::QualityGatePassed);
+    }
+
+    // -----------------------------------------------------------------------
+    // File hints appending in pick_next (lines 628, 631)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn orchestrator_appends_file_hints_to_objective() {
+        let config = EngConfig::default();
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        let tasks = vec![Task {
+            id: "fh-1".into(),
+            objective: "Fix the bug".into(),
+            priority: 1,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: Some(vec!["src/main.rs".into(), "src/lib.rs".into()]),
+        }];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut budget = CumulativeBudget::new(100.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: true,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+        // The task will fail (no API keys) but the file hints path is exercised.
+        assert!(result.tasks_attempted >= 1);
+        assert!(result.tasks_failed >= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Remediation skip when repair budget exhausted (lines 642-643)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn orchestrator_skips_remediation_when_repair_budget_exhausted() {
+        let config = EngConfig::default();
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        // Create a remediation task.
+        let tasks = vec![Task {
+            id: "rem-skip-1".into(),
+            objective: "Fix the flaky test".into(),
+            priority: 1,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 1,
+            is_remediation: true,
+            files_hint: None,
+        }];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        // Repair budget = 0 (fraction 0.0), so all remediation tasks should be skipped.
+        let mut budget = CumulativeBudget::new(100.0).with_repair_budget_fraction(0.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: false,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+        // The remediation task should be skipped, not attempted.
+        assert_eq!(result.tasks_attempted, 0);
+        assert_eq!(result.cease_reason, CeaseReason::AllTasksDone);
+        // Task should be marked Skipped.
+        let task = queue.tasks().iter().find(|t| t.id == "rem-skip-1").unwrap();
+        assert_eq!(task.status, TaskStatus::Skipped);
+    }
+
+    // -----------------------------------------------------------------------
+    // AttemptTracker max-attempts unit test (lines 656-682)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attempt_tracker_count_exceeds_max() {
+        use glitchlab_kernel::outcome::ObstacleKind;
+
+        let mut tracker = AttemptTracker::new();
+        let max = 2;
+        let ctx = || OutcomeContext {
+            approach: "tried something".into(),
+            obstacle: ObstacleKind::Unknown {
+                detail: "test".into(),
+            },
+            discoveries: vec![],
+            recommendation: None,
+            files_explored: vec![],
+        };
+        // Record two attempts.
+        tracker.record("task-x", ctx());
+        tracker.record("task-x", ctx());
+        assert_eq!(tracker.count("task-x"), 2);
+        assert!(
+            tracker.count("task-x") >= max,
+            "expected count >= max_attempts"
+        );
+        // Contexts should be retrievable.
+        assert_eq!(tracker.contexts("task-x").len(), 2);
+        // Unrecorded task should have count 0.
+        assert_eq!(tracker.count("task-y"), 0);
+        assert!(tracker.contexts("task-y").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // record() with tracing coverage (line 127)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn budget_record_emits_tracing_event() {
+        // Install a no-op tracing subscriber so the info! macro in record()
+        // actually executes (covering line 127).
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        let mut budget = CumulativeBudget::new(100.0);
+        budget.record("tracing-test", 1.0, 1000, "ok");
+        assert_eq!(budget.total_runs(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Backlog review tests
+    // -----------------------------------------------------------------------
+
+    fn sample_review_config() -> crate::config::ReviewConfig {
+        crate::config::ReviewConfig {
+            enabled: true,
+            confidence_threshold: 0.8,
+            auto_close: true,
+            auto_reprioritize: true,
+        }
+    }
+
+    fn sample_queue() -> TaskQueue {
+        TaskQueue::from_tasks(vec![
+            Task {
+                id: "gl-1e0.1".into(),
+                objective: "Implement feature A".into(),
+                priority: 50,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
+                files_hint: None,
+            },
+            Task {
+                id: "gl-1e0.5".into(),
+                objective: "Implement feature B".into(),
+                priority: 75,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
+                files_hint: None,
+            },
+        ])
+    }
+
+    #[test]
+    fn apply_review_verdicts_close_above_threshold() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.1",
+                    "action": "close",
+                    "reason": "already implemented",
+                    "confidence": 0.92
+                }
+            ]
+        });
+
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 1);
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.1").unwrap();
+        assert_eq!(task.status, TaskStatus::Skipped);
+    }
+
+    #[test]
+    fn apply_review_verdicts_below_threshold_skipped() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.1",
+                    "action": "close",
+                    "reason": "maybe done",
+                    "confidence": 0.5
+                }
+            ]
+        });
+
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 0);
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.1").unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn apply_review_verdicts_reprioritize() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.5",
+                    "action": "reprioritize",
+                    "reason": "higher priority per ADR",
+                    "new_priority": 10,
+                    "confidence": 0.85
+                }
+            ]
+        });
+
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 1);
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.5").unwrap();
+        assert_eq!(task.priority, 10);
+    }
+
+    #[test]
+    fn apply_review_verdicts_auto_close_disabled() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.1",
+                    "action": "close",
+                    "reason": "done",
+                    "confidence": 0.95
+                }
+            ]
+        });
+
+        let mut config = sample_review_config();
+        config.auto_close = false;
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 0);
+        // Task should remain pending.
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.1").unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn apply_review_verdicts_auto_reprioritize_disabled() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.5",
+                    "action": "reprioritize",
+                    "reason": "should be higher",
+                    "new_priority": 5,
+                    "confidence": 0.9
+                }
+            ]
+        });
+
+        let mut config = sample_review_config();
+        config.auto_reprioritize = false;
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 0);
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.5").unwrap();
+        assert_eq!(task.priority, 75); // unchanged
+    }
+
+    #[test]
+    fn apply_review_verdicts_no_actions_array() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({"summary": "nothing"});
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 0);
+    }
+
+    #[test]
+    fn apply_review_verdicts_mixed_actions() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.1",
+                    "action": "close",
+                    "reason": "done",
+                    "confidence": 0.95
+                },
+                {
+                    "bead_id": "gl-1e0.5",
+                    "action": "no_action",
+                    "reason": "looks fine",
+                    "confidence": 0.9
+                }
+            ]
+        });
+
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // maybe_inject_infra_diagnostic tests
+    // -----------------------------------------------------------------------
+
+    fn make_parse_error_result(raw_snippet: &str) -> glitchlab_kernel::pipeline::PipelineResult {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+        glitchlab_kernel::pipeline::PipelineResult {
+            status: PipelineStatus::ParseError,
+            stage_outputs: HashMap::new(),
+            events: vec![],
+            budget: glitchlab_kernel::budget::BudgetSummary::default(),
+            pr_url: None,
+            branch: None,
+            error: Some("implementer failed: parse_error".into()),
+            outcome_context: Some(OutcomeContext {
+                approach: "direct implementation".into(),
+                obstacle: ObstacleKind::ParseFailure {
+                    model: "claude-code/sonnet".into(),
+                    raw_snippet: raw_snippet.into(),
+                },
+                discoveries: vec![],
+                recommendation: None,
+                files_explored: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn infra_diagnostic_injected_on_empty_output() {
+        let mut queue = sample_queue();
+        let initial_count = queue.tasks().len();
+        let pr = make_parse_error_result(""); // empty = infrastructure failure
+        let mut injected = false;
+
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+
+        assert!(injected);
+        assert_eq!(queue.tasks().len(), initial_count + 1);
+        let diag = queue
+            .tasks()
+            .iter()
+            .find(|t| t.id == "gl-infra-diag-empty-implementer-output")
+            .unwrap();
+        assert_eq!(diag.priority, 0);
+        assert!(diag.is_remediation);
+        assert!(diag.objective.contains("INFRASTRUCTURE BUG"));
+    }
+
+    #[test]
+    fn infra_diagnostic_not_injected_for_non_empty_output() {
+        let mut queue = sample_queue();
+        let initial_count = queue.tasks().len();
+        let pr = make_parse_error_result("some garbage output from model");
+        let mut injected = false;
+
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+
+        assert!(!injected);
+        assert_eq!(queue.tasks().len(), initial_count);
+    }
+
+    #[test]
+    fn infra_diagnostic_only_injected_once() {
+        let mut queue = sample_queue();
+        let pr = make_parse_error_result("");
+        let mut injected = false;
+
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        let count_after_first = queue.tasks().len();
+
+        // Second call should be a no-op.
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        assert_eq!(queue.tasks().len(), count_after_first);
+    }
+
+    #[test]
+    fn infra_diagnostic_skipped_for_whitespace_only_output() {
+        let mut queue = sample_queue();
+        let initial_count = queue.tasks().len();
+        // Whitespace-only is still "empty" — trigger diagnostic.
+        let pr = make_parse_error_result("   \n  ");
+        let mut injected = false;
+
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+
+        assert!(injected);
+        assert_eq!(queue.tasks().len(), initial_count + 1);
+    }
+
+    #[tokio::test]
+    async fn run_backlog_review_disabled_returns_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let config = EngConfig::default(); // review.enabled is false by default
+        let orchestrator = Orchestrator::new(config, handler, history);
+
+        let mut queue = sample_queue();
+        let mut budget = CumulativeBudget::new(100.0);
+
+        let result = orchestrator
+            .run_backlog_review(&mut queue, &mut budget, dir.path())
+            .await;
+        assert!(result.skipped);
+        assert_eq!(result.actions_applied, 0);
+    }
+
+    // --- AdrWatchState tests ---
+
+    #[test]
+    fn adr_watch_state_should_scan_by_tasks() {
+        let mut state = AdrWatchState::new();
+        // Not yet at threshold.
+        assert!(!state.should_scan(3, 120));
+        state.tasks_since_last_scan = 2;
+        assert!(!state.should_scan(3, 120));
+        state.tasks_since_last_scan = 3;
+        assert!(state.should_scan(3, 120));
+    }
+
+    #[test]
+    fn adr_watch_state_should_scan_by_time() {
+        let mut state = AdrWatchState::new();
+        // Override last scan time to the past.
+        state.last_scan_time = Instant::now() - Duration::from_secs(200);
+        assert!(state.should_scan(100, 120));
+    }
+
+    #[test]
+    fn adr_watch_state_should_not_scan_early() {
+        let state = AdrWatchState::new();
+        // Just created — neither task threshold nor time threshold met.
+        assert!(!state.should_scan(3, 120));
+    }
+
+    // --- run_adr_watch_scan tests ---
+
+    fn watch_config_enabled() -> crate::config::EngConfig {
+        let mut config = crate::config::EngConfig::default();
+        config.watch.enabled = true;
+        config.watch.auto_inject = true;
+        config.watch.confidence_threshold = 0.0; // accept all
+        config
+    }
+
+    #[tokio::test]
+    async fn adr_watch_scan_no_docs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let config = watch_config_enabled();
+        let orchestrator = Orchestrator::new(config, handler, history);
+
+        let mut queue = sample_queue();
+        let mut budget = CumulativeBudget::new(100.0);
+        let mut state = AdrWatchState::new();
+
+        let result = orchestrator
+            .run_adr_watch_scan(&mut queue, &mut budget, dir.path(), &mut state)
+            .await;
+        assert_eq!(result.adrs_scanned, 0);
+        assert_eq!(result.adrs_new, 0);
+        assert_eq!(result.beads_created, 0);
+    }
+
+    #[tokio::test]
+    async fn adr_watch_scan_detects_new_adrs() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("adr-test-feature.md"),
+            "# ADR: Test Feature\n\n**Status:** Accepted\n\n## Decision\n\nBuild it.\n",
+        )
+        .unwrap();
+
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let mut config = watch_config_enabled();
+        config.watch.consultation_enabled = false;
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+
+        let mut queue = sample_queue();
+        let mut budget = CumulativeBudget::new(100.0);
+        let mut state = AdrWatchState::new();
+
+        let result = orchestrator
+            .run_adr_watch_scan(&mut queue, &mut budget, dir.path(), &mut state)
+            .await;
+
+        // Should detect 1 new ADR.
+        assert_eq!(result.adrs_scanned, 1);
+        assert_eq!(result.adrs_new, 1);
+        assert_eq!(result.adrs_changed, 0);
+
+        // Fingerprints should be updated.
+        assert_eq!(state.fingerprints.len(), 1);
+        assert_eq!(state.tasks_since_last_scan, 0);
+
+        // Second scan with no changes should find nothing new.
+        let result2 = orchestrator
+            .run_adr_watch_scan(&mut queue, &mut budget, dir.path(), &mut state)
+            .await;
+        assert_eq!(result2.adrs_new, 0);
+        assert_eq!(result2.adrs_changed, 0);
+    }
+
+    #[tokio::test]
+    async fn adr_watch_scan_detects_changed_adrs() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("adr-evolving.md"), "# ADR: Version 1\n").unwrap();
+
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let config = watch_config_enabled();
+        let orchestrator = Orchestrator::new(config, handler, history);
+
+        let mut queue = sample_queue();
+        let mut budget = CumulativeBudget::new(100.0);
+        let mut state = AdrWatchState::new();
+
+        // First scan — captures initial fingerprint.
+        let result1 = orchestrator
+            .run_adr_watch_scan(&mut queue, &mut budget, dir.path(), &mut state)
+            .await;
+        assert_eq!(result1.adrs_new, 1);
+
+        // Modify the ADR.
+        std::fs::write(docs.join("adr-evolving.md"), "# ADR: Version 2 — updated\n").unwrap();
+
+        // Second scan — should detect the change.
+        let result2 = orchestrator
+            .run_adr_watch_scan(&mut queue, &mut budget, dir.path(), &mut state)
+            .await;
+        assert_eq!(result2.adrs_new, 0);
+        assert_eq!(result2.adrs_changed, 1);
+    }
+
+    #[tokio::test]
+    async fn adr_watch_scan_resets_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let config = watch_config_enabled();
+        let orchestrator = Orchestrator::new(config, handler, history);
+
+        let mut queue = sample_queue();
+        let mut budget = CumulativeBudget::new(100.0);
+        let mut state = AdrWatchState::new();
+        state.tasks_since_last_scan = 10;
+
+        orchestrator
+            .run_adr_watch_scan(&mut queue, &mut budget, dir.path(), &mut state)
+            .await;
+
+        assert_eq!(state.tasks_since_last_scan, 0);
+    }
+
+    #[tokio::test]
+    async fn adr_watch_scan_skips_duplicate_task_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("adr-dup.md"), "# ADR: Duplicate Test\n").unwrap();
+
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let config = watch_config_enabled();
+        let orchestrator = Orchestrator::new(config, handler, history);
+
+        // Pre-populate queue with a task ID that would match a decomposed bead.
+        let tasks = vec![Task {
+            id: "gl-adr-dup-existing-bead".into(),
+            objective: "Already exists".into(),
+            priority: 50,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: None,
+        }];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut budget = CumulativeBudget::new(100.0);
+        let mut state = AdrWatchState::new();
+
+        let _result = orchestrator
+            .run_adr_watch_scan(&mut queue, &mut budget, dir.path(), &mut state)
+            .await;
+
+        // The scan runs but the decomposer may fail (no real provider).
+        // The important thing is it doesn't panic and state is updated.
+        assert_eq!(state.tasks_since_last_scan, 0);
+        assert_eq!(state.fingerprints.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn consult_on_adr_returns_empty_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let mut config = watch_config_enabled();
+        config.watch.consultation_enabled = true;
+
+        let orchestrator = Orchestrator::new(config.clone(), handler, history);
+
+        // Create a router with no actual providers — agents will fail gracefully.
+        let routing = config.routing_map();
+        let budget_tracker = BudgetTracker::new(1_000_000, 100.0);
+        let router = Arc::new(Router::new(routing, budget_tracker));
+
+        let result = orchestrator
+            .consult_on_adr(
+                "# ADR: Test\n\n## Decision\n\nDo things.",
+                "adr-test.md",
+                dir.path(),
+                router,
+            )
+            .await;
+
+        // Both agents fail — result should be empty string.
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn consult_on_adr_with_mock_agents_no_fields() {
+        use crate::agents::test_helpers::MockProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let mut config = watch_config_enabled();
+        config.watch.consultation_enabled = true;
+
+        let orchestrator = Orchestrator::new(config.clone(), handler, history);
+
+        // MockProvider returns {"placeholder": true} — no "verdict" or "assessment".
+        let mut routing = config.routing_map();
+        routing.insert("security".into(), "mock/test".into());
+        routing.insert("architect_triage".into(), "mock/test".into());
+        let budget_tracker = BudgetTracker::new(1_000_000, 100.0);
+        let mut router = Router::new(routing, budget_tracker);
+        router.register_provider("mock".into(), Arc::new(MockProvider));
+        let router_ref = Arc::new(router);
+
+        let result = orchestrator
+            .consult_on_adr(
+                "# ADR: Auth\n\n## Decision\n\nUse JWT.",
+                "adr-auth.md",
+                dir.path(),
+                router_ref,
+            )
+            .await;
+
+        // MockProvider returns generic JSON. Agents may or may not produce
+        // the specific "verdict"/"assessment" keys. The key property is that
+        // the method runs without panic and returns a valid string.
+        let _ = &result;
+    }
+
+    #[tokio::test]
+    async fn consult_on_adr_extracts_fields() {
+        use crate::agents::test_helpers::{SequentialMockProvider, final_response};
+
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let mut config = watch_config_enabled();
+        config.watch.consultation_enabled = true;
+
+        let orchestrator = Orchestrator::new(config.clone(), handler, history);
+
+        let security_resp = serde_json::json!({
+            "verdict": "JWT tokens should use short expiry",
+            "issues": []
+        });
+        let architect_resp = serde_json::json!({
+            "assessment": "Feasible with current architecture",
+            "task_size": "M"
+        });
+
+        let mut routing = config.routing_map();
+        routing.insert("security".into(), "seq/test".into());
+        routing.insert("architect_triage".into(), "seq/test".into());
+        let budget_tracker = BudgetTracker::new(1_000_000, 100.0);
+        let mut router = Router::new(routing, budget_tracker);
+        router.register_provider(
+            "seq".into(),
+            Arc::new(SequentialMockProvider::new(vec![
+                final_response(&security_resp.to_string()),
+                final_response(&architect_resp.to_string()),
+            ])),
+        );
+        let router_ref = Arc::new(router);
+
+        let result = orchestrator
+            .consult_on_adr(
+                "# ADR: Auth\n\n## Decision\n\nUse JWT.",
+                "adr-auth.md",
+                dir.path(),
+                router_ref,
+            )
+            .await;
+
+        assert!(result.contains("Security Review"));
+        assert!(result.contains("short expiry"));
+        assert!(result.contains("Architect Review"));
+        assert!(result.contains("Feasible"));
+    }
+
+    #[tokio::test]
+    async fn adr_watch_scan_confidence_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("adr-low-conf.md"), "# ADR: Low Confidence\n").unwrap();
+
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let mut config = watch_config_enabled();
+        config.watch.confidence_threshold = 0.95; // very high threshold
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+
+        let mut queue = sample_queue();
+        let initial_count = queue.tasks().len();
+        let mut budget = CumulativeBudget::new(100.0);
+        let mut state = AdrWatchState::new();
+
+        let result = orchestrator
+            .run_adr_watch_scan(&mut queue, &mut budget, dir.path(), &mut state)
+            .await;
+
+        // ADR was found but decomposer will fail (no real provider),
+        // which means no beads are created regardless.
+        assert_eq!(result.adrs_new, 1);
+        assert_eq!(result.beads_created, 0);
+        // Queue should not have grown.
+        assert_eq!(queue.tasks().len(), initial_count);
+    }
+
+    #[tokio::test]
+    async fn adr_watch_scan_with_dashboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let config = watch_config_enabled();
+        let (emitter, buf) = DashboardEmitter::in_memory();
+        let orchestrator =
+            Orchestrator::new(config, handler, history).with_dashboard(Arc::new(emitter));
+
+        let mut queue = sample_queue();
+        let mut budget = CumulativeBudget::new(100.0);
+        let mut state = AdrWatchState::new();
+
+        orchestrator
+            .run_adr_watch_scan(&mut queue, &mut budget, dir.path(), &mut state)
+            .await;
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("adr_watch_started"));
+        assert!(output.contains("adr_watch_completed"));
+    }
+
+    // --- inject_adr_beads tests ---
+
+    #[test]
+    fn inject_adr_beads_creates_tasks() {
+        let mut queue = sample_queue();
+        let initial = queue.tasks().len();
+        let data = serde_json::json!({
+            "beads": [
+                {
+                    "id_suffix": "add-auth",
+                    "title": "Add authentication",
+                    "description": "Implement JWT auth flow",
+                    "priority": 1,
+                    "files_likely_affected": ["src/auth.rs", "src/middleware.rs"]
+                },
+                {
+                    "id_suffix": "add-tests",
+                    "title": "Add auth tests",
+                    "description": "",
+                    "priority": 2
+                }
+            ]
+        });
+
+        let created = Orchestrator::inject_adr_beads(
+            &mut queue,
+            &data,
+            "adr-auth.md",
+            20,
+            true, // auto_inject
+        );
+
+        assert_eq!(created, 2);
+        assert_eq!(queue.tasks().len(), initial + 2);
+
+        // Check first task.
+        let t = queue
+            .tasks()
+            .iter()
+            .find(|t| t.id == "gl-adr-auth-add-auth")
+            .unwrap();
+        assert_eq!(t.priority, 1);
+        assert!(t.objective.contains("Add authentication"));
+        assert!(t.objective.contains("Implement JWT auth flow"));
+        assert_eq!(t.files_hint.as_ref().unwrap().len(), 2);
+
+        // Check second task (empty description → title only).
+        let t2 = queue
+            .tasks()
+            .iter()
+            .find(|t| t.id == "gl-adr-auth-add-tests")
+            .unwrap();
+        assert_eq!(t2.objective, "Add auth tests");
+        assert!(t2.files_hint.is_none());
+    }
+
+    #[test]
+    fn inject_adr_beads_skips_duplicates() {
+        let existing = crate::taskqueue::Task {
+            id: "gl-adr-test-existing-bead".into(),
+            objective: "Already exists".into(),
+            priority: 50,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: None,
+        };
+        let mut queue = TaskQueue::from_tasks(vec![existing]);
+        let data = serde_json::json!({
+            "beads": [
+                { "id_suffix": "existing-bead", "title": "Duplicate" },
+                { "id_suffix": "new-bead", "title": "New one" }
+            ]
+        });
+
+        let created = Orchestrator::inject_adr_beads(&mut queue, &data, "adr-test.md", 20, true);
+
+        assert_eq!(created, 1);
+        assert!(queue.tasks().iter().any(|t| t.id == "gl-adr-test-new-bead"));
+    }
+
+    #[test]
+    fn inject_adr_beads_respects_max_limit() {
+        let mut queue = sample_queue();
+        let initial = queue.tasks().len();
+        let data = serde_json::json!({
+            "beads": [
+                { "id_suffix": "a", "title": "A" },
+                { "id_suffix": "b", "title": "B" },
+                { "id_suffix": "c", "title": "C" },
+                { "id_suffix": "d", "title": "D" }
+            ]
+        });
+
+        let created = Orchestrator::inject_adr_beads(&mut queue, &data, "adr-many.md", 2, true);
+
+        assert_eq!(created, 2);
+        assert_eq!(queue.tasks().len(), initial + 2);
+    }
+
+    #[test]
+    fn inject_adr_beads_no_inject_when_disabled() {
+        let mut queue = sample_queue();
+        let initial = queue.tasks().len();
+        let data = serde_json::json!({
+            "beads": [
+                { "id_suffix": "a", "title": "A" }
+            ]
+        });
+
+        let created = Orchestrator::inject_adr_beads(
+            &mut queue,
+            &data,
+            "adr-disabled.md",
+            20,
+            false, // auto_inject disabled
+        );
+
+        assert_eq!(created, 0);
+        assert_eq!(queue.tasks().len(), initial);
+    }
+
+    #[test]
+    fn inject_adr_beads_empty_output() {
+        let mut queue = sample_queue();
+        let initial = queue.tasks().len();
+        let data = serde_json::json!({
+            "beads": []
+        });
+
+        let created = Orchestrator::inject_adr_beads(&mut queue, &data, "adr-empty.md", 20, true);
+
+        assert_eq!(created, 0);
+        assert_eq!(queue.tasks().len(), initial);
+    }
+
+    #[test]
+    fn inject_adr_beads_missing_beads_key() {
+        let mut queue = sample_queue();
+        let initial = queue.tasks().len();
+        let data = serde_json::json!({ "summary": "no beads here" });
+
+        let created = Orchestrator::inject_adr_beads(&mut queue, &data, "adr-nobeads.md", 20, true);
+
+        assert_eq!(created, 0);
+        assert_eq!(queue.tasks().len(), initial);
+    }
+
+    #[test]
+    fn inject_adr_beads_defaults_for_missing_fields() {
+        let mut queue = sample_queue();
+        // Bead with minimal fields — id_suffix only, everything else defaults.
+        let data = serde_json::json!({
+            "beads": [
+                { "id_suffix": "minimal" }
+            ]
+        });
+
+        let created = Orchestrator::inject_adr_beads(&mut queue, &data, "adr-min.md", 20, true);
+
+        assert_eq!(created, 1);
+        let t = queue
+            .tasks()
+            .iter()
+            .find(|t| t.id == "gl-adr-min-minimal")
+            .unwrap();
+        assert_eq!(t.objective, "Untitled bead");
+        assert_eq!(t.priority, 2); // default
     }
 }

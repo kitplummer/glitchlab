@@ -455,15 +455,8 @@ mod tests {
 
     #[tokio::test]
     async fn all_backends_fail_record_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let bad1: Arc<dyn HistoryBackend> = Arc::new(crate::beads::BeadsClient::new(
-            dir.path(),
-            Some("nonexistent-bd-aaa".into()),
-        ));
-        let bad2: Arc<dyn HistoryBackend> = Arc::new(crate::beads::BeadsClient::new(
-            dir.path(),
-            Some("nonexistent-bd-bbb".into()),
-        ));
+        let bad1: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let bad2: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
         let composite = CompositeHistory::new(vec![bad1, bad2]);
 
         let result = composite.record(&sample_entry("t1", "ok")).await;
@@ -471,20 +464,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_write_failure_secondary_ok() {
+    async fn primary_record_failure_secondary_ok() {
         let dir = tempfile::tempdir().unwrap();
-        let bad: Arc<dyn HistoryBackend> = Arc::new(crate::beads::BeadsClient::new(
-            dir.path(),
-            Some("nonexistent-bd-xyz".into()),
-        ));
+        let bad: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
         let good: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
-        // bad is primary, good is secondary
+        // FailingBackend is primary (i == 0), JSONL is secondary
         let composite = CompositeHistory::new(vec![bad, good]);
 
         // Should succeed because the secondary (JSONL) succeeds.
+        // Covers lines 50-52: "primary backend record failed" warn log.
         composite
             .record(&sample_entry("t1", "pr_created"))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn secondary_record_failure_primary_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let good: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let bad: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        // JSONL is primary (i == 0), FailingBackend is secondary (i == 1)
+        let composite = CompositeHistory::new(vec![good, bad]);
+
+        // Should succeed because the primary (JSONL) succeeds.
+        // Covers lines 56-58: "secondary backend record failed" warn log.
+        composite
+            .record(&sample_entry("t1", "pr_created"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failure_context_all_fail_returns_empty() {
+        let bad1: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let bad2: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let composite = CompositeHistory::new(vec![bad1, bad2]);
+
+        // All backends fail failure_context, should return Ok("").
+        // Covers line 143: empty-string fallback when all backends fail.
+        let ctx = composite.failure_context(5).await.unwrap();
+        assert!(ctx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stats_all_fail_returns_defaults() {
+        let bad1: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let bad2: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let composite = CompositeHistory::new(vec![bad1, bad2]);
+
+        // All backends fail stats, should return default zero stats.
+        let stats = composite.stats().await.unwrap();
+        assert_eq!(stats.total_runs, 0);
+        assert_eq!(stats.successes, 0);
+        assert_eq!(stats.failures, 0);
+    }
+
+    #[tokio::test]
+    async fn query_all_fail_returns_empty() {
+        let bad1: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let bad2: Arc<dyn HistoryBackend> = Arc::new(FailingBackend);
+        let composite = CompositeHistory::new(vec![bad1, bad2]);
+
+        let query = HistoryQuery {
+            limit: 10,
+            ..Default::default()
+        };
+        // All backends fail query, should return empty vec.
+        let entries = composite.query(&query).await.unwrap();
+        assert!(entries.is_empty());
     }
 }

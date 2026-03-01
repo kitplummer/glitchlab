@@ -1,5 +1,7 @@
+pub mod adr_decomposer;
 pub mod architect;
 pub mod archivist;
+pub mod backlog_review;
 pub mod ciso;
 pub mod claude_code;
 pub mod debugger;
@@ -613,6 +615,7 @@ pub(crate) mod test_helpers {
             ("architect_review".to_string(), "seq/test".to_string()),
             ("ops_diagnosis".to_string(), "seq/test".to_string()),
             ("ciso".to_string(), "seq/test".to_string()),
+            ("backlog_review".to_string(), "seq/test".to_string()),
         ]);
         let budget = BudgetTracker::new(1_000_000, 100.0);
         let mut router = glitchlab_router::Router::new(routing, budget);
@@ -667,6 +670,8 @@ pub(crate) mod test_helpers {
             ("architect_review".to_string(), "mock/test".to_string()),
             ("ops_diagnosis".to_string(), "mock/test".to_string()),
             ("ciso".to_string(), "mock/test".to_string()),
+            ("backlog_review".to_string(), "mock/test".to_string()),
+            ("adr_decomposer".to_string(), "mock/test".to_string()),
         ]);
         let budget = BudgetTracker::new(1_000_000, 100.0);
         let mut router = glitchlab_router::Router::new(routing, budget);
@@ -955,6 +960,14 @@ mod tests {
                     raw_snippet: "{bad".into(),
                 },
                 "Parse failure (claude): {bad",
+            ),
+            (
+                ObstacleKind::SchemaMismatch {
+                    model: "sonnet".into(),
+                    expected_schema: "PlanOutput".into(),
+                    validation_error: "missing field steps".into(),
+                },
+                "Schema mismatch (sonnet)",
             ),
             (
                 ObstacleKind::Unknown {
@@ -1293,6 +1306,18 @@ mod tests {
         }];
         let tokens = estimate_message_tokens(&messages);
         assert_eq!(tokens, 200); // 800 chars / 4
+    }
+
+    #[test]
+    fn estimate_message_tokens_text_block() {
+        let messages = vec![Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::Text {
+                text: "x".repeat(400),
+            }]),
+        }];
+        let tokens = estimate_message_tokens(&messages);
+        assert_eq!(tokens, 100); // 400 chars / 4
     }
 
     // --- prune_messages tests ---

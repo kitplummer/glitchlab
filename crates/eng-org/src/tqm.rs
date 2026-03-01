@@ -583,7 +583,12 @@ fn remediation_task_id(kind: PatternKind, affected: &[String]) -> String {
         id.hash(&mut hasher);
     }
     let hash = hasher.finish();
-    format!("tqm-{}-{:016x}", kind_slug(kind), hash)
+    format!(
+        "{}-tqm-{}-{:016x}",
+        crate::config::BEAD_ID_PREFIX,
+        kind_slug(kind),
+        hash
+    )
 }
 
 /// Convert a single detected pattern into a remediation task (if actionable).
@@ -697,7 +702,11 @@ pub fn generate_deduplicated_remediation_tasks(
         .iter()
         .filter(|p| {
             is_actionable(p.kind)
-                && !queue.has_pending_with_prefix(&format!("tqm-{}", kind_slug(p.kind)))
+                && !queue.has_pending_with_prefix(&format!(
+                    "{}-tqm-{}",
+                    crate::config::BEAD_ID_PREFIX,
+                    kind_slug(p.kind)
+                ))
         })
         .collect();
 
@@ -1168,7 +1177,7 @@ mod tests {
         )];
         let tasks = generate_remediation_tasks(&patterns, &config);
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].id.starts_with("tqm-decomp-loop-"));
+        assert!(tasks[0].id.starts_with("gl-tqm-decomp-loop-"));
         assert!(tasks[0].objective.contains("decomposition loops"));
         assert!(tasks[0].objective.contains("t1"));
         assert_eq!(tasks[0].priority, 5);
@@ -1185,7 +1194,7 @@ mod tests {
         )];
         let tasks = generate_remediation_tasks(&patterns, &config);
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].id.starts_with("tqm-scope-creep-"));
+        assert!(tasks[0].id.starts_with("gl-tqm-scope-creep-"));
         assert!(tasks[0].objective.contains("deferred tasks"));
     }
 
@@ -1198,7 +1207,7 @@ mod tests {
         )];
         let tasks = generate_remediation_tasks(&patterns, &config);
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].id.starts_with("tqm-model-degrad-"));
+        assert!(tasks[0].id.starts_with("gl-tqm-model-degrad-"));
         assert!(tasks[0].objective.contains("model-related failures"));
     }
 
@@ -1208,7 +1217,7 @@ mod tests {
         let patterns = vec![make_pattern(PatternKind::StuckAgents, vec!["t1".into()])];
         let tasks = generate_remediation_tasks(&patterns, &config);
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].id.starts_with("tqm-stuck-agents-"));
+        assert!(tasks[0].id.starts_with("gl-tqm-stuck-agents-"));
         assert!(tasks[0].objective.contains("stuck tasks"));
     }
 
@@ -1221,7 +1230,7 @@ mod tests {
         )];
         let tasks = generate_remediation_tasks(&patterns, &config);
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].id.starts_with("tqm-test-flaky-"));
+        assert!(tasks[0].id.starts_with("gl-tqm-test-flaky-"));
         assert!(tasks[0].objective.contains("flaky tests"));
     }
 
@@ -1234,7 +1243,7 @@ mod tests {
         )];
         let tasks = generate_remediation_tasks(&patterns, &config);
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].id.starts_with("tqm-arch-reject-"));
+        assert!(tasks[0].id.starts_with("gl-tqm-arch-reject-"));
         assert!(tasks[0].objective.contains("architect rejection"));
     }
 
@@ -1305,7 +1314,7 @@ mod tests {
 
         // Put an existing tqm-stuck-agents task in the queue.
         let existing = crate::taskqueue::Task {
-            id: "tqm-stuck-agents-aaaa".into(),
+            id: "gl-tqm-stuck-agents-aaaa".into(),
             objective: "existing".into(),
             priority: 5,
             status: crate::taskqueue::TaskStatus::Pending,
@@ -1327,7 +1336,7 @@ mod tests {
         let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue);
         // StuckAgents is deduplicated, only TestFlakiness remains.
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].id.starts_with("tqm-test-flaky-"));
+        assert!(tasks[0].id.starts_with("gl-tqm-test-flaky-"));
     }
 
     #[test]
@@ -1513,7 +1522,7 @@ mod tests {
         )];
         let tasks = generate_remediation_tasks(&patterns, &config);
         assert_eq!(tasks.len(), 1);
-        assert!(tasks[0].id.starts_with("tqm-boundary-"));
+        assert!(tasks[0].id.starts_with("gl-tqm-boundary-"));
         assert!(tasks[0].objective.contains("boundary violations"));
         assert!(tasks[0].objective.contains("t1"));
     }
