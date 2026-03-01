@@ -2155,7 +2155,7 @@ impl Orchestrator {
                 title,
                 description: task.objective.clone(),
                 issue_type: "task".to_string(),
-                priority: task.priority as i32,
+                priority: (task.priority).min(4) as i32,
                 labels: vec!["tqm:remediation".to_string()],
             };
             if let Err(e) = client.create_bead_detailed(&req).await {
@@ -2198,7 +2198,8 @@ impl Orchestrator {
             let priority = bead_value
                 .get("priority")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(2) as i32;
+                .unwrap_or(2)
+                .min(4) as i32;
 
             let task_id = format!("{}-{adr_stem}-{id_suffix}", crate::config::BEAD_ID_PREFIX);
 
