@@ -2140,12 +2140,16 @@ impl Orchestrator {
     async fn persist_tasks_as_beads(repo_path: &Path, tasks: &[crate::taskqueue::Task]) {
         let client = glitchlab_memory::beads::BeadsClient::new(repo_path, None);
         for task in tasks {
-            let title = task
+            let mut title = task
                 .objective
                 .lines()
                 .next()
                 .unwrap_or("Remediation")
                 .to_string();
+            if title.len() > 200 {
+                title.truncate(197);
+                title.push_str("...");
+            }
             let req = glitchlab_memory::beads::BeadCreateRequest {
                 id: task.id.clone(),
                 title,

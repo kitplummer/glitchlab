@@ -149,7 +149,7 @@ impl BeadsClient {
 
     /// List all beads, parsed from JSON.
     pub async fn list_parsed(&self) -> Result<Vec<Bead>> {
-        let json = self.run_bd(&["list", "--json"]).await?;
+        let json = self.run_bd(&["list", "--json", "--limit", "0"]).await?;
         serde_json::from_str(&json)
             .map_err(|e| MemoryError::Beads(format!("failed to parse bd list: {e}")))
     }
