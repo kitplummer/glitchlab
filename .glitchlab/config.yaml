@@ -66,6 +66,7 @@ routing:
       min_tier: economy
       requires: [code]
 
+  adr_decomposer: "gemini/gemini-2.5-flash-lite"
   ops_diagnosis: "gemini/gemini-2.5-flash-lite"
   cost_quality_threshold: 0.7
 
@@ -82,6 +83,15 @@ pipeline:
   use_claude_code_implementer: true
   claude_code_model: sonnet
   claude_code_budget_usd: 0.50
+
+watch:
+  enabled: true
+  interval_tasks: 3
+  interval_secs: 120
+  auto_inject: true
+  consultation_enabled: true
+  confidence_threshold: 0.7
+  max_beads_per_adr: 20
 
 providers:
   gemini:
