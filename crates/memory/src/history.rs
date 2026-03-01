@@ -338,6 +338,7 @@ impl HistoryBackend for JsonlHistory {
 mod tests {
     use super::*;
     use chrono::{Datelike, TimeZone};
+    use std::io::Write;
 
     fn temp_history() -> (tempfile::TempDir, JsonlHistory) {
         let dir = tempfile::tempdir().unwrap();
@@ -615,6 +616,47 @@ mod tests {
         let json = r#"{"timestamp":"2026-02-21T14:30:00Z","task_id":"old","status":"error","budget":{},"events_summary":{}}"#;
         let entry: HistoryEntry = serde_json::from_str(json).unwrap();
         assert!(entry.outcome_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_jsonl_line_is_skipped() {
+        let (_dir, history) = temp_history();
+        // Write a valid entry, then a malformed line, then another valid entry.
+        history
+            .record(&sample_entry("task-1", "pr_created"))
+            .await
+            .unwrap();
+
+        // Append a malformed line directly to the file.
+        let path = _dir.path().join(".glitchlab/logs/history.jsonl");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"this is not valid json\n")
+            .unwrap();
+
+        history
+            .record(&sample_entry("task-2", "error"))
+            .await
+            .unwrap();
+
+        let query = HistoryQuery {
+            limit: 10,
+            ..Default::default()
+        };
+        let entries = history.query(&query).await.unwrap();
+        // The malformed line should be silently skipped.
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn timestamp_non_string_errors() {
+        let json =
+            r#"{"timestamp":12345,"task_id":"t","status":"ok","budget":{},"events_summary":{}}"#;
+        let result = serde_json::from_str::<HistoryEntry>(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected string"));
     }
 
     #[test]

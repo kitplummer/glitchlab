@@ -722,4 +722,16 @@ mod tests {
         let cost = estimate_openai_cost("openai", "gpt-4o", 0, 0);
         assert!((cost - 0.0).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn build_messages_maps_tool_role() {
+        let messages = vec![Message {
+            role: MessageRole::Tool,
+            content: MessageContent::Text("tool result".into()),
+        }];
+        let oai_messages = OpenAiProvider::build_messages(&messages);
+        assert_eq!(oai_messages.len(), 1);
+        assert_eq!(oai_messages[0].role, "tool");
+        assert_eq!(oai_messages[0].content, "tool result");
+    }
 }
