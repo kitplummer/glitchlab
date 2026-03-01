@@ -148,18 +148,53 @@ impl BeadsClient {
     }
 }
 
+/// Map a PipelineStatus serialization to a bead-native status.
+///
+/// PipelineStatus is serialized as snake_case strings by serde (e.g., "pr_merged").
+/// Beads expects: "open", "in_progress", "closed", "blocked", "deferred".
+fn pipeline_status_to_bead_status(pipeline_status: &str) -> &'static str {
+    match pipeline_status {
+        // Success outcomes → closed
+        "pr_created" | "pr_merged" | "committed" | "already_done" => "closed",
+
+        // Decomposition → in_progress (sub-tasks spawned)
+        "decomposed" => "in_progress",
+
+        // External dependency needed → blocked
+        "blocked" | "escalated" | "security_blocked" => "blocked",
+
+        // Deferrable/transient → deferred
+        "deferred" | "retryable" | "timed_out" => "deferred",
+
+        // Failures that need rework → open (available for retry)
+        "plan_failed"
+        | "implementation_failed"
+        | "tests_failed"
+        | "parse_error"
+        | "boundary_violation"
+        | "architect_rejected"
+        | "interrupted"
+        | "budget_exceeded"
+        | "error" => "open",
+
+        // Unknown → open (safe default, task stays visible)
+        _ => "open",
+    }
+}
+
 impl HistoryBackend for BeadsClient {
     fn record<'a>(
         &'a self,
         entry: &'a HistoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            let bead_status = pipeline_status_to_bead_status(&entry.status);
             // Try updating the existing bead first (task loaded from backlog).
             // If that fails (bead doesn't exist yet), create a new one.
-            match self.update_status(&entry.task_id, &entry.status).await {
+            match self.update_status(&entry.task_id, bead_status).await {
                 Ok(_) => Ok(()),
                 Err(_) => self
-                    .create_bead(&entry.task_id, &entry.status)
+                    .create_bead(&entry.task_id, bead_status)
                     .await
                     .map(|_| ()),
             }
@@ -517,10 +552,11 @@ mod tests {
         let args = std::fs::read_to_string(&args_file).unwrap();
         let lines: Vec<&str> = args.lines().collect();
         // Should have called update (tried first), not create
+        // pr_created maps to "closed" via pipeline_status_to_bead_status
         assert_eq!(lines[0], "update");
         assert_eq!(lines[1], "gl-99");
         assert_eq!(lines[2], "--status");
-        assert_eq!(lines[3], "pr_created");
+        assert_eq!(lines[3], "closed");
     }
 
     #[tokio::test]
@@ -632,5 +668,100 @@ mod tests {
                 .to_string()
                 .contains("failed to parse bd ready")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // pipeline_status_to_bead_status mapping tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn status_mapping_success_outcomes() {
+        assert_eq!(pipeline_status_to_bead_status("pr_created"), "closed");
+        assert_eq!(pipeline_status_to_bead_status("pr_merged"), "closed");
+        assert_eq!(pipeline_status_to_bead_status("committed"), "closed");
+        assert_eq!(pipeline_status_to_bead_status("already_done"), "closed");
+    }
+
+    #[test]
+    fn status_mapping_failure_outcomes() {
+        for status in &[
+            "plan_failed",
+            "implementation_failed",
+            "tests_failed",
+            "parse_error",
+            "boundary_violation",
+            "architect_rejected",
+            "interrupted",
+            "budget_exceeded",
+            "error",
+        ] {
+            assert_eq!(
+                pipeline_status_to_bead_status(status),
+                "open",
+                "{status} should map to open"
+            );
+        }
+    }
+
+    #[test]
+    fn status_mapping_decomposed() {
+        assert_eq!(pipeline_status_to_bead_status("decomposed"), "in_progress");
+    }
+
+    #[test]
+    fn status_mapping_blocked() {
+        assert_eq!(pipeline_status_to_bead_status("blocked"), "blocked");
+        assert_eq!(pipeline_status_to_bead_status("escalated"), "blocked");
+        assert_eq!(
+            pipeline_status_to_bead_status("security_blocked"),
+            "blocked"
+        );
+    }
+
+    #[test]
+    fn status_mapping_deferred() {
+        assert_eq!(pipeline_status_to_bead_status("deferred"), "deferred");
+        assert_eq!(pipeline_status_to_bead_status("retryable"), "deferred");
+        assert_eq!(pipeline_status_to_bead_status("timed_out"), "deferred");
+    }
+
+    #[test]
+    fn status_mapping_unknown() {
+        assert_eq!(
+            pipeline_status_to_bead_status("something_unexpected"),
+            "open"
+        );
+        assert_eq!(pipeline_status_to_bead_status(""), "open");
+    }
+
+    #[tokio::test]
+    async fn record_uses_mapped_status() {
+        // Verify that record() passes the mapped bead status, not the raw
+        // pipeline status, to update_status/create_bead.
+        let dir = tempfile::tempdir().unwrap();
+        let (script, args_file) = mock_bd_capture(dir.path(), "");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let entry = HistoryEntry {
+            timestamp: chrono::Utc::now(),
+            task_id: "gl-map".into(),
+            status: "tests_failed".into(), // should map to "open"
+            pr_url: None,
+            branch: None,
+            error: None,
+            budget: glitchlab_kernel::budget::BudgetSummary::default(),
+            events_summary: crate::history::EventsSummary::default(),
+            stage_outputs: None,
+            events: None,
+            outcome_context: None,
+        };
+        client.record(&entry).await.unwrap();
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert_eq!(lines[0], "update");
+        assert_eq!(lines[1], "gl-map");
+        assert_eq!(lines[2], "--status");
+        assert_eq!(lines[3], "open"); // mapped, not "tests_failed"
     }
 }
