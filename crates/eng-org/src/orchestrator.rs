@@ -1502,7 +1502,11 @@ impl Orchestrator {
             .enumerate()
             .filter_map(|(i, task_val)| {
                 let objective = task_val.get("objective")?.as_str()?;
-                let id = format!("circuit-fix-{i}-{:08x}", fxhash(objective));
+                let id = format!(
+                    "{}-circuit-fix-{i}-{:08x}",
+                    crate::config::BEAD_ID_PREFIX,
+                    fxhash(objective)
+                );
                 Some(crate::taskqueue::Task {
                     id,
                     objective: objective.into(),
@@ -4236,7 +4240,7 @@ mod tests {
         assert!(tasks[0].is_remediation);
         assert_eq!(tasks[0].remediation_depth, 1);
         assert_eq!(tasks[0].priority, 2);
-        assert!(tasks[0].id.starts_with("circuit-fix-"));
+        assert!(tasks[0].id.starts_with("gl-circuit-fix-"));
     }
 
     #[test]
