@@ -910,6 +910,7 @@ impl Orchestrator {
                                 count: circuit_tasks.len(),
                                 task_ids: ids,
                             });
+                            Self::persist_tasks_as_beads(&params.repo_path, &circuit_tasks).await;
                             queue.inject_tasks(circuit_tasks);
                         } else {
                             // Fallback to generic remediation if Circuit produced nothing.
@@ -931,6 +932,8 @@ impl Orchestrator {
                                     count: fallback_tasks.len(),
                                     task_ids: ids,
                                 });
+                                Self::persist_tasks_as_beads(&params.repo_path, &fallback_tasks)
+                                    .await;
                                 queue.inject_tasks(fallback_tasks);
                             }
                         }
@@ -952,6 +955,7 @@ impl Orchestrator {
                                 count: tasks.len(),
                                 task_ids: ids,
                             });
+                            Self::persist_tasks_as_beads(&params.repo_path, &tasks).await;
                             queue.inject_tasks(tasks);
                         }
                     }
@@ -1938,6 +1942,17 @@ impl Orchestrator {
                 self.config.watch.auto_inject,
             );
 
+            // Persist ADR-spawned tasks as beads so they survive across runs.
+            if adr_beads_created > 0 {
+                Self::persist_adr_beads_from_output(
+                    repo_path,
+                    &output.data,
+                    adr_filename,
+                    self.config.watch.max_beads_per_adr,
+                )
+                .await;
+            }
+
             total_beads_created += adr_beads_created;
 
             self.dash(DashboardEvent::AdrDecomposed {
@@ -2068,7 +2083,7 @@ impl Orchestrator {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(2) as u32;
 
-            let task_id = format!("{adr_stem}-{id_suffix}");
+            let task_id = format!("{}-{adr_stem}-{id_suffix}", crate::config::BEAD_ID_PREFIX);
 
             // Skip if task already in queue.
             if queue.tasks().iter().any(|t| t.id == task_id) {
@@ -2111,6 +2126,93 @@ impl Orchestrator {
         created
     }
 
+    /// Persist tasks as beads so they survive across batch runs.
+    ///
+    /// Non-fatal: logs a warning if any bead creation fails.
+    async fn persist_tasks_as_beads(repo_path: &Path, tasks: &[crate::taskqueue::Task]) {
+        let client = glitchlab_memory::beads::BeadsClient::new(repo_path, None);
+        for task in tasks {
+            let title = task
+                .objective
+                .lines()
+                .next()
+                .unwrap_or("Remediation")
+                .to_string();
+            let req = glitchlab_memory::beads::BeadCreateRequest {
+                id: task.id.clone(),
+                title,
+                description: task.objective.clone(),
+                issue_type: "task".to_string(),
+                priority: task.priority as i32,
+                labels: vec!["tqm:remediation".to_string()],
+            };
+            if let Err(e) = client.create_bead_detailed(&req).await {
+                warn!(task_id = %task.id, error = %e, "failed to persist remediation task as bead");
+            }
+        }
+    }
+
+    /// Persist ADR-decomposed beads using the decomposer's JSON output.
+    ///
+    /// Non-fatal: logs warnings on failure.
+    async fn persist_adr_beads_from_output(
+        repo_path: &Path,
+        output_data: &serde_json::Value,
+        adr_filename: &str,
+        max_beads: usize,
+    ) {
+        let client = glitchlab_memory::beads::BeadsClient::new(repo_path, None);
+        let beads = output_data
+            .get("beads")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let adr_stem = adr_filename.strip_suffix(".md").unwrap_or(adr_filename);
+
+        for bead_value in beads.iter().take(max_beads) {
+            let id_suffix = bead_value
+                .get("id_suffix")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let title = bead_value
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Untitled bead");
+            let description = bead_value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let priority = bead_value
+                .get("priority")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2) as i32;
+
+            let task_id = format!("{}-{adr_stem}-{id_suffix}", crate::config::BEAD_ID_PREFIX);
+
+            let mut labels = vec![format!("adr:{adr_filename}")];
+            if let Some(arr) = bead_value.get("labels").and_then(|v| v.as_array()) {
+                for l in arr {
+                    if let Some(s) = l.as_str() {
+                        labels.push(s.to_string());
+                    }
+                }
+            }
+
+            let req = glitchlab_memory::beads::BeadCreateRequest {
+                id: task_id.clone(),
+                title: title.to_string(),
+                description: description.to_string(),
+                issue_type: "task".to_string(),
+                priority,
+                labels,
+            };
+            if let Err(e) = client.create_bead_detailed(&req).await {
+                warn!(task_id = %task_id, error = %e, "failed to persist ADR bead");
+            }
+        }
+    }
+
     /// Inject a targeted diagnostic task on the first ParseError with empty output.
     ///
     /// Instead of waiting for TQM to accumulate 3+ failures and create a generic
@@ -2144,14 +2246,17 @@ impl Orchestrator {
             return;
         }
 
-        let diag_id = "infra-diag-empty-implementer-output";
+        let diag_id = format!(
+            "{}-infra-diag-empty-implementer-output",
+            crate::config::BEAD_ID_PREFIX
+        );
         warn!(
             diag_task_id = diag_id,
             "empty implementer output detected — injecting infrastructure diagnostic task"
         );
 
         let diag_task = crate::taskqueue::Task {
-            id: diag_id.into(),
+            id: diag_id,
             objective: concat!(
                 "INFRASTRUCTURE BUG: The Claude Code implementer CLI returns an empty `result` field. ",
                 "Diagnose why `claude --print --output-format json` produces a JSON envelope with an empty ",
@@ -3996,7 +4101,7 @@ mod tests {
         // Tasks should have been attempted (and failed due to no API keys).
         assert!(result.tasks_attempted >= 1);
         // Check that TQM remediation tasks were injected into the queue.
-        let has_tqm_task = queue.tasks().iter().any(|t| t.id.starts_with("tqm-"));
+        let has_tqm_task = queue.tasks().iter().any(|t| t.id.starts_with("gl-tqm-"));
         assert!(has_tqm_task, "expected TQM remediation tasks in queue");
     }
 
@@ -4697,7 +4802,7 @@ mod tests {
         let diag = queue
             .tasks()
             .iter()
-            .find(|t| t.id == "infra-diag-empty-implementer-output")
+            .find(|t| t.id == "gl-infra-diag-empty-implementer-output")
             .unwrap();
         assert_eq!(diag.priority, 0);
         assert!(diag.is_remediation);
@@ -4937,7 +5042,7 @@ mod tests {
 
         // Pre-populate queue with a task ID that would match a decomposed bead.
         let tasks = vec![Task {
-            id: "adr-dup-existing-bead".into(),
+            id: "gl-adr-dup-existing-bead".into(),
             objective: "Already exists".into(),
             priority: 50,
             status: TaskStatus::Pending,
@@ -5176,7 +5281,7 @@ mod tests {
         let t = queue
             .tasks()
             .iter()
-            .find(|t| t.id == "adr-auth-add-auth")
+            .find(|t| t.id == "gl-adr-auth-add-auth")
             .unwrap();
         assert_eq!(t.priority, 1);
         assert!(t.objective.contains("Add authentication"));
@@ -5187,7 +5292,7 @@ mod tests {
         let t2 = queue
             .tasks()
             .iter()
-            .find(|t| t.id == "adr-auth-add-tests")
+            .find(|t| t.id == "gl-adr-auth-add-tests")
             .unwrap();
         assert_eq!(t2.objective, "Add auth tests");
         assert!(t2.files_hint.is_none());
@@ -5196,7 +5301,7 @@ mod tests {
     #[test]
     fn inject_adr_beads_skips_duplicates() {
         let existing = crate::taskqueue::Task {
-            id: "adr-test-existing-bead".into(),
+            id: "gl-adr-test-existing-bead".into(),
             objective: "Already exists".into(),
             priority: 50,
             status: TaskStatus::Pending,
@@ -5220,7 +5325,7 @@ mod tests {
         let created = Orchestrator::inject_adr_beads(&mut queue, &data, "adr-test.md", 20, true);
 
         assert_eq!(created, 1);
-        assert!(queue.tasks().iter().any(|t| t.id == "adr-test-new-bead"));
+        assert!(queue.tasks().iter().any(|t| t.id == "gl-adr-test-new-bead"));
     }
 
     #[test]
@@ -5306,7 +5411,7 @@ mod tests {
         let t = queue
             .tasks()
             .iter()
-            .find(|t| t.id == "adr-min-minimal")
+            .find(|t| t.id == "gl-adr-min-minimal")
             .unwrap();
         assert_eq!(t.objective, "Untitled bead");
         assert_eq!(t.priority, 2); // default

@@ -1247,7 +1247,7 @@ mod tests {
     #[test]
     fn has_pending_with_prefix_finds_match() {
         let tasks = vec![Task {
-            id: "tqm-stuck-agents-abc123".into(),
+            id: "gl-tqm-stuck-agents-abc123".into(),
             objective: "fix stuck".into(),
             priority: 5,
             status: TaskStatus::Pending,
@@ -1261,7 +1261,7 @@ mod tests {
             files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
-        assert!(queue.has_pending_with_prefix("tqm-stuck-agents"));
+        assert!(queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
     }
 
     #[test]
@@ -1281,13 +1281,13 @@ mod tests {
             files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
-        assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
+        assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
     }
 
     #[test]
     fn has_pending_with_prefix_ignores_completed() {
         let tasks = vec![Task {
-            id: "tqm-stuck-agents-abc123".into(),
+            id: "gl-tqm-stuck-agents-abc123".into(),
             objective: "fix stuck".into(),
             priority: 5,
             status: TaskStatus::Completed,
@@ -1301,13 +1301,13 @@ mod tests {
             files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
-        assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
+        assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
     }
 
     #[test]
     fn has_pending_with_prefix_ignores_failed() {
         let tasks = vec![Task {
-            id: "tqm-stuck-agents-abc123".into(),
+            id: "gl-tqm-stuck-agents-abc123".into(),
             objective: "fix stuck".into(),
             priority: 5,
             status: TaskStatus::Failed,
@@ -1321,7 +1321,7 @@ mod tests {
             files_hint: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
-        assert!(!queue.has_pending_with_prefix("tqm-stuck-agents"));
+        assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
     }
 
     // -----------------------------------------------------------------------

@@ -7,6 +7,14 @@ use glitchlab_router::chooser::{ModelChooser, ModelProfile, ModelTier, RolePrefe
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// Bead ID prefix
+// ---------------------------------------------------------------------------
+
+/// Bead ID prefix for this project. All generated task IDs must start with
+/// this so that `bd` accepts them into the beads database.
+pub const BEAD_ID_PREFIX: &str = "gl";
+
+// ---------------------------------------------------------------------------
 // TaskSize — t-shirt sizing for token budgets
 // ---------------------------------------------------------------------------
 
