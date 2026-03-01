@@ -607,6 +607,7 @@ impl Orchestrator {
         };
 
         let mut detected_patterns: Vec<crate::tqm::DetectedPattern> = vec![];
+        let mut infra_diag_injected = false;
 
         self.dash(DashboardEvent::RunStarted {
             total_tasks: queue.summary().pending as usize,
@@ -989,6 +990,18 @@ impl Orchestrator {
             }
 
             if routing.task_status == TaskStatus::Deferred {
+                // --- Early infrastructure failure detection ---
+                // On ParseError, check if the raw output is empty (infrastructure
+                // issue, not model garbage). Inject a high-priority diagnostic
+                // task immediately instead of waiting for TQM's 3-failure threshold.
+                if pipeline_result.status == PipelineStatus::ParseError {
+                    Self::maybe_inject_infra_diagnostic(
+                        queue,
+                        &pipeline_result,
+                        &mut infra_diag_injected,
+                    );
+                }
+
                 let _ = queue.save();
                 info!(task_id = %task_id, "task deferred, will retry later");
                 continue;
@@ -1678,6 +1691,71 @@ impl Orchestrator {
         });
 
         result
+    }
+
+    /// Inject a targeted diagnostic task on the first ParseError with empty output.
+    ///
+    /// Instead of waiting for TQM to accumulate 3+ failures and create a generic
+    /// "investigate model degradation" task, this detects infrastructure-level
+    /// failures (empty CLI output) immediately and injects a high-priority fix
+    /// task that the system can act on in the same batch.
+    fn maybe_inject_infra_diagnostic(
+        queue: &mut TaskQueue,
+        pipeline_result: &glitchlab_kernel::pipeline::PipelineResult,
+        already_injected: &mut bool,
+    ) {
+        if *already_injected {
+            return;
+        }
+
+        // Extract the raw output preview from outcome context.
+        let raw_snippet = pipeline_result
+            .outcome_context
+            .as_ref()
+            .and_then(|ctx| match &ctx.obstacle {
+                glitchlab_kernel::outcome::ObstacleKind::ParseFailure { raw_snippet, .. } => {
+                    Some(raw_snippet.as_str())
+                }
+                _ => None,
+            })
+            .unwrap_or("");
+
+        // Only trigger for infrastructure failures (empty or whitespace-only output),
+        // not for model garbage (which model escalation or TQM can handle).
+        if !raw_snippet.trim().is_empty() {
+            return;
+        }
+
+        let diag_id = "infra-diag-empty-implementer-output";
+        warn!(
+            diag_task_id = diag_id,
+            "empty implementer output detected — injecting infrastructure diagnostic task"
+        );
+
+        let diag_task = crate::taskqueue::Task {
+            id: diag_id.into(),
+            objective: concat!(
+                "INFRASTRUCTURE BUG: The Claude Code implementer CLI returns an empty `result` field. ",
+                "Diagnose why `claude --print --output-format json` produces a JSON envelope with an empty ",
+                "`result` string. Check: (1) is the prompt being written to stdin correctly, (2) is the ",
+                "`--permission-mode bypassPermissions` flag accepted, (3) are the `--allowedTools` valid, ",
+                "(4) does the model parameter match an available model. Fix the invocation in ",
+                "`crates/eng-org/src/agents/claude_code.rs` or add a test that reproduces the empty-result scenario."
+            ).into(),
+            priority: 0, // highest priority — run before any other task
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: true,
+            files_hint: Some(vec!["crates/eng-org/src/agents/claude_code.rs".into()]),
+        };
+
+        queue.inject_tasks(vec![diag_task]);
+        *already_injected = true;
     }
 
     /// Apply review verdicts to the task queue, respecting confidence and config gates.
@@ -4158,6 +4236,95 @@ mod tests {
         let config = sample_review_config();
         let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
         assert_eq!(applied, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // maybe_inject_infra_diagnostic tests
+    // -----------------------------------------------------------------------
+
+    fn make_parse_error_result(raw_snippet: &str) -> glitchlab_kernel::pipeline::PipelineResult {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+        glitchlab_kernel::pipeline::PipelineResult {
+            status: PipelineStatus::ParseError,
+            stage_outputs: HashMap::new(),
+            events: vec![],
+            budget: glitchlab_kernel::budget::BudgetSummary::default(),
+            pr_url: None,
+            branch: None,
+            error: Some("implementer failed: parse_error".into()),
+            outcome_context: Some(OutcomeContext {
+                approach: "direct implementation".into(),
+                obstacle: ObstacleKind::ParseFailure {
+                    model: "claude-code/sonnet".into(),
+                    raw_snippet: raw_snippet.into(),
+                },
+                discoveries: vec![],
+                recommendation: None,
+                files_explored: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn infra_diagnostic_injected_on_empty_output() {
+        let mut queue = sample_queue();
+        let initial_count = queue.tasks().len();
+        let pr = make_parse_error_result(""); // empty = infrastructure failure
+        let mut injected = false;
+
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+
+        assert!(injected);
+        assert_eq!(queue.tasks().len(), initial_count + 1);
+        let diag = queue
+            .tasks()
+            .iter()
+            .find(|t| t.id == "infra-diag-empty-implementer-output")
+            .unwrap();
+        assert_eq!(diag.priority, 0);
+        assert!(diag.is_remediation);
+        assert!(diag.objective.contains("INFRASTRUCTURE BUG"));
+    }
+
+    #[test]
+    fn infra_diagnostic_not_injected_for_non_empty_output() {
+        let mut queue = sample_queue();
+        let initial_count = queue.tasks().len();
+        let pr = make_parse_error_result("some garbage output from model");
+        let mut injected = false;
+
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+
+        assert!(!injected);
+        assert_eq!(queue.tasks().len(), initial_count);
+    }
+
+    #[test]
+    fn infra_diagnostic_only_injected_once() {
+        let mut queue = sample_queue();
+        let pr = make_parse_error_result("");
+        let mut injected = false;
+
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        let count_after_first = queue.tasks().len();
+
+        // Second call should be a no-op.
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        assert_eq!(queue.tasks().len(), count_after_first);
+    }
+
+    #[test]
+    fn infra_diagnostic_skipped_for_whitespace_only_output() {
+        let mut queue = sample_queue();
+        let initial_count = queue.tasks().len();
+        // Whitespace-only is still "empty" — trigger diagnostic.
+        let pr = make_parse_error_result("   \n  ");
+        let mut injected = false;
+
+        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+
+        assert!(injected);
+        assert_eq!(queue.tasks().len(), initial_count + 1);
     }
 
     #[tokio::test]

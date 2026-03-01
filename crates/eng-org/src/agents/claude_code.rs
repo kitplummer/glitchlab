@@ -293,15 +293,21 @@ impl Agent for ClaudeCodeImplementer {
             "summary": "Failed to parse Claude Code output"
         });
 
-        let data = parse_implementer_json(&result.result).unwrap_or_else(|| {
+        let parsed = parse_implementer_json(&result.result);
+        let parse_error = parsed.is_none();
+        let data = parsed.unwrap_or_else(|| {
+            let raw_preview: String = result.result.chars().take(500).collect();
             warn!(
-                result_preview = %result.result.chars().take(300).collect::<String>(),
+                result_preview = %raw_preview,
                 "could not extract implementer JSON from claude code result"
             );
-            fallback.clone()
+            let mut fb = fallback;
+            // Preserve the actual raw output so OutcomeContext can carry it
+            // to Circuit/TQM for targeted diagnostics instead of generic
+            // "model degradation" remediation.
+            fb["_raw_output_preview"] = serde_json::Value::String(raw_preview);
+            fb
         });
-
-        let parse_error = data == fallback;
 
         info!(
             cost = result.total_cost_usd,
@@ -407,6 +413,25 @@ All tests pass."#;
     #[test]
     fn parse_returns_none_for_garbage() {
         assert!(parse_implementer_json("no json here").is_none());
+    }
+
+    #[test]
+    fn parse_returns_none_for_empty_string() {
+        // This is the actual production failure: Claude Code returns a valid
+        // outer JSON envelope but the `result` field is empty.
+        assert!(parse_implementer_json("").is_none());
+    }
+
+    #[test]
+    fn parse_returns_none_for_whitespace() {
+        assert!(parse_implementer_json("   \n\t  ").is_none());
+    }
+
+    #[test]
+    fn parse_returns_none_for_non_json_prose() {
+        // Claude Code sometimes returns prose instead of JSON in result field.
+        let input = "I was unable to complete the task because the repository has no Cargo.toml.";
+        assert!(parse_implementer_json(input).is_none());
     }
 
     #[test]
