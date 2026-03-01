@@ -2,12 +2,13 @@
 
 ## Metrics
 
-- **Rust LOC:** 31042
-- **Agent Count:** 9 (Planner, Implementer, Debugger, Security, Release, Archivist, ArchitectTriage, ArchitectReview, OpsDiagnosis)
+- **Rust LOC:** ~41,000
+- **Crates:** 6 (kernel, router, memory, eng-org, dashboard, cli)
+- **Agent Count:** 12 (Planner, Implementer, Debugger, Security, CISO, Release, Archivist, ArchitectTriage, ArchitectReview, OpsDiagnosis, AdrDecomposer, BacklogReview)
 - **Pipeline Stage Count:** 15+
 - **TQM Pattern Count:** 9
-- **Test Count:** 0
-- **Coverage:** N/A
+- **Test Count:** 1027
+- **Coverage:** ~87% (target: 90%)
 
 ## What It Does
 

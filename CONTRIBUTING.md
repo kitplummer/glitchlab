@@ -1,102 +1,110 @@
-# Contributing to ⚡ GLITCHLAB
+# Contributing to GLITCHLAB
 
-First off, thank you for considering contributing to GLITCHLAB! It’s people like you that make GLITCHLAB a better tool for everyone.
+First off, thank you for considering contributing to GLITCHLAB! It's people like you that make GLITCHLAB a better tool for everyone.
 
-As an agentic dev engine, GLITCHLAB has unique architectural patterns that you should understand before diving in.
+## Architectural Overview
 
-## 🧠 Architectural Overview
+GLITCHLAB is built as a **deterministic orchestrator** that manages a pipeline of **stateless agents**. The Rust workspace lives in `crates/` with six crates:
 
-GLITCHLAB is built as a **deterministic orchestrator** (the Controller) that manages a pipeline of **stateless agents**.
+1. **`kernel`** — Core traits and types (Agent, Pipeline, Governance, Budget, Context, Tool). Provider-agnostic, no external service dependencies.
 
-1. **The Controller (`glitchlab/controller.py`)**: The brainstem. It manages the linear pipeline: Index → Plan → Implement → Test → Security → Release → PR.
+2. **`router`** — Vendor-agnostic LLM routing. Provider trait with Anthropic, Gemini, and OpenAI-compatible implementations. `ModelChooser` for cost-aware model selection.
 
+3. **`memory`** — Persistence layer. JSONL history (fallback), Beads integration (graph-based issue tracking).
 
-2. 
-**Stateless Agents (`glitchlab/agents/`)**: Each agent is a specialized module with its own system prompt and JSON output schema.
+4. **`eng-org`** — Engineering org: 12 agents, workspace (git worktree isolation), repo indexer, config loading, TQM self-repair analyzer, orchestrator, pipeline.
 
+5. **`dashboard`** — SSE-based live dashboard for monitoring batch runs.
 
-3. 
-**Governance (`glitchlab/governance/`)**: Enforces safety boundaries and protected paths.
+6. **`cli`** — Binary crate. CLI commands via `clap`.
 
-
-4. 
-**Workspace (`glitchlab/workspace/`)**: Uses git worktrees to ensure that agent experimentation never touches your main branch directly.
-
-
-
-## 🛠 Getting Started
+## Getting Started
 
 ### Prerequisites
 
-* Python 3.11+
+* Rust nightly toolchain
 * Git
-* API Keys for Gemini (Google) and/or Claude (Anthropic) 
-
-
+* API keys for Gemini (Google) and/or Anthropic
 
 ### Local Setup
 
 1. Fork the repository and clone it locally.
-2. Create a virtual environment: `python -m venv .venv && source .venv/bin/activate`
-3. Install in editable mode with dev dependencies:
-```bash
-pip install -e ".[dev]"
+2. Build and run tests:
 
+```bash
+cargo build
+cargo test --workspace
 ```
 
+3. Enable pre-commit hooks (enforces `cargo fmt` + `cargo clippy`):
+
+```bash
+git config core.hooksPath .githooks
+```
 
 4. Configure your environment:
-```bash
-cp .env.example .env
-# Add your real keys to .env
-
-```
-
-
-
-## 🧪 Running Tests
-
-Before submitting a Pull Request, ensure all tests pass:
 
 ```bash
-python -m pytest
-
+export GEMINI_API_KEY="..."
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-We use **Ruff** for linting and formatting. Please run it to keep the code "clean":
+## Running Tests
+
+Before submitting a Pull Request, ensure all checks pass:
 
 ```bash
-python -m ruff check .
-
+make ci          # fmt-check + clippy + test + coverage
 ```
 
-## 🤝 How to Contribute
+Or run individually:
 
-### 🤖 Adding a New Agent
+```bash
+make test        # cargo test --workspace
+make lint        # cargo clippy --all-targets -- -D warnings
+make fmt-check   # cargo fmt --all -- --check
+make coverage    # cargo tarpaulin (90% minimum)
+```
 
-If you want to add a new specialist (e.g., a "Documentation Auditor" or "Performance Profiler"):
+## How to Contribute
 
-1. Create a new module in `glitchlab/agents/`.
-2. Inherit from `BaseAgent` in `glitchlab/agents/__init__.py`.
-3. Define a clear `system_prompt` and implement `parse_response`.
-4. Register the agent in the `Controller`.
+### Adding a New Agent
 
-### 🛠 Adding a New Tool
+1. Create a new module in `crates/eng-org/src/agents/`.
+2. Define a struct implementing the `Agent` trait from `kernel`.
+3. Implement `role()`, `persona()`, `system_prompt()`, and `execute()`.
+4. Register the agent in the pipeline stages (`crates/eng-org/src/pipeline.rs`).
+5. Write unit tests in the same file (inline `#[cfg(test)] mod tests`).
 
-To give agents more capabilities (e.g., `docker` or `sql-lint` support):
+### Adding a New Tool
 
-1. Add the base command to the `allowed_tools` list in `glitchlab/config.yaml`.
-2. Ensure it is safe and does not allow arbitrary shell injection.
+To give agents more capabilities:
 
-## 📜 Development Principles
+1. Add the tool definition in `crates/eng-org/src/tools.rs`.
+2. Implement the `ToolDefinition` schema and execution handler.
+3. Register it in the tool executor's allowlist.
+4. Ensure it does not allow arbitrary shell injection.
 
-* Build Weird. Ship Clean.: Agents can be chaotic, but the output must be surgical and high-quality.
+### Modifying the Pipeline
 
+1. Edit the relevant stage in `crates/eng-org/src/pipeline.rs`.
+2. Update `PipelineStatus` variants in `crates/kernel/src/pipeline.rs` if adding a new stage.
+3. Add pipeline tests covering the new behavior.
 
-* **Local-First**: We avoid cloud dependencies other than the model APIs.
+## Code Standards
 
+* Rust edition 2024, workspace resolver 2.
+* All code must pass `cargo clippy -- -D warnings` with no warnings.
+* All code must be formatted with `cargo fmt`.
+* Use `thiserror` for library error types, `anyhow` only in the CLI binary.
+* Use `tracing` for structured logging, never `println!` in library crates.
+* Minimum 90% test coverage (measured with `cargo-tarpaulin`).
+* Write tests in the same commit as the code they cover.
 
-* **Deterministic Orchestration**: The sequence of events should be explicit, not governed by "emergent behavior".
+## Development Principles
 
-
-* **Under 2k Lines**: Keep the core engine lean. If a feature adds significant bloat, consider making it an optional plugin.
+* **Build Weird. Ship Clean.** — Agents can be chaotic, but the output must be surgical and high-quality.
+* **Local-First** — We avoid cloud dependencies other than the model APIs.
+* **Deterministic Orchestration** — The sequence of events should be explicit, not governed by "emergent behavior".
+* **Provider-Agnostic** — LLM calls go through the Router, never directly to a provider API from agent code.
+* **Type-Level Governance** — `ApprovedAction<T>` cannot be constructed outside the governance module. The compiler enforces safety.

@@ -2,7 +2,7 @@
 
 ## Project
 
-GLITCHLAB is an agentic development engine being ported from Python to Rust. The Rust workspace lives in `crates/` with five crates: `kernel`, `memory`, `router`, `eng-org`, and `cli`.
+GLITCHLAB is an agentic development engine written in Rust. The workspace lives in `crates/` with six crates: `kernel`, `router`, `memory`, `eng-org`, `dashboard`, and `cli`.
 
 ## Test Coverage
 
@@ -43,7 +43,8 @@ Use the Makefile for common tasks: `make test`, `make lint`, `make fmt`, `make c
 - `kernel` — Core traits and types (Agent, Pipeline, Org, Governance, Budget, Context, Tool). No external service dependencies.
 - `router` — Vendor-agnostic LLM routing. Provider trait with Anthropic and OpenAI-compatible implementations.
 - `memory` — Persistence layer. JSONL history (fallback), Dolt and Beads integration (future).
-- `eng-org` — Engineering org: 6 agents (Planner, Implementer, Debugger, Security, Release, Archivist), workspace (git worktree), repo indexer, config loading.
+- `eng-org` — Engineering org: 12 agents (Planner, Implementer, Debugger, Security, CISO, Release, Archivist, ArchitectTriage, ArchitectReview, OpsDiagnosis, AdrDecomposer, BacklogReview), workspace (git worktree), repo indexer, config loading, TQM self-repair, orchestrator, pipeline.
+- `dashboard` — SSE-based live dashboard for monitoring batch runs.
 - `cli` — Binary crate. CLI commands via clap.
 
 ## Key Design Decisions
