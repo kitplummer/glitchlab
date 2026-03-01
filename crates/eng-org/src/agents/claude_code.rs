@@ -223,9 +223,32 @@ impl ClaudeCodeImplementer {
             "claude code invocation complete"
         );
 
+        // Log raw output for debugging empty-result issues.
+        tracing::debug!(
+            stdout_preview = %stdout.chars().take(500).collect::<String>(),
+            stderr_preview = %stderr.chars().take(500).collect::<String>(),
+            "claude code raw output"
+        );
+
+        // Try stdout first, fall back to stderr.
+        // Claude Code >=2.x may emit the JSON envelope on stderr
+        // when --print --output-format json are combined.
+        let json_source = if stdout.trim().is_empty()
+            || serde_json::from_str::<ClaudeCodeResult>(&stdout).is_err()
+        {
+            if !stderr.trim().is_empty() {
+                info!("stdout empty or unparseable, trying stderr for JSON envelope");
+                &stderr
+            } else {
+                &stdout
+            }
+        } else {
+            &stdout
+        };
+
         // Parse the JSON result. Claude --print --output-format json emits
-        // a single JSON object on stdout.
-        let result: ClaudeCodeResult = serde_json::from_str(&stdout).map_err(|e| {
+        // a single JSON object on stdout (or stderr in some versions).
+        let result: ClaudeCodeResult = serde_json::from_str(json_source).map_err(|e| {
             warn!(
                 error = %e,
                 stdout_preview = %stdout.chars().take(200).collect::<String>(),
@@ -285,29 +308,57 @@ impl Agent for ClaudeCodeImplementer {
         }
 
         // Parse the implementer's final JSON from the result text.
-        let fallback = serde_json::json!({
-            "files_changed": [],
-            "tests_added": [],
-            "tests_passing": false,
-            "commit_message": "chore: no changes produced",
-            "summary": "Failed to parse Claude Code output"
-        });
-
+        // If the result text is empty (Claude exhausted turns doing tool calls
+        // without a final text response), fall back to detecting changes from
+        // the git worktree.
         let parsed = parse_implementer_json(&result.result);
-        let parse_error = parsed.is_none();
-        let data = parsed.unwrap_or_else(|| {
+        let (data, parse_error) = if let Some(p) = parsed {
+            (p, false)
+        } else if result.result.trim().is_empty() {
+            // Result is empty — Claude likely used all turns on tool calls.
+            // Check git status in the worktree for actual file changes.
+            info!("result text empty, checking worktree for file changes");
+            match detect_changes_from_worktree(working_dir).await {
+                Some(detected) => {
+                    info!(
+                        files_changed = detected["files_changed"].as_array().map(|a| a.len()).unwrap_or(0),
+                        tests_passing = %detected.get("tests_passing").and_then(|v| v.as_bool()).unwrap_or(false),
+                        "detected file changes from worktree"
+                    );
+                    (detected, false)
+                }
+                None => {
+                    warn!("no file changes detected in worktree either");
+                    (
+                        serde_json::json!({
+                            "files_changed": [],
+                            "tests_added": [],
+                            "tests_passing": false,
+                            "commit_message": "chore: no changes produced",
+                            "summary": "Claude Code produced no output and no file changes"
+                        }),
+                        true,
+                    )
+                }
+            }
+        } else {
             let raw_preview: String = result.result.chars().take(500).collect();
             warn!(
                 result_preview = %raw_preview,
                 "could not extract implementer JSON from claude code result"
             );
-            let mut fb = fallback;
-            // Preserve the actual raw output so OutcomeContext can carry it
-            // to Circuit/TQM for targeted diagnostics instead of generic
-            // "model degradation" remediation.
-            fb["_raw_output_preview"] = serde_json::Value::String(raw_preview);
-            fb
-        });
+            (
+                serde_json::json!({
+                    "files_changed": [],
+                    "tests_added": [],
+                    "tests_passing": false,
+                    "commit_message": "chore: no changes produced",
+                    "summary": "Failed to parse Claude Code output",
+                    "_raw_output_preview": raw_preview,
+                }),
+                true,
+            )
+        };
 
         info!(
             cost = result.total_cost_usd,
@@ -374,6 +425,68 @@ fn parse_implementer_json(text: &str) -> Option<serde_json::Value> {
     }
 
     None
+}
+
+/// Detect file changes from the git worktree when Claude's text result is empty.
+///
+/// Runs `git diff --name-only` and `cargo test` in the worktree to construct
+/// the implementer output that Claude should have produced.
+async fn detect_changes_from_worktree(working_dir: &Path) -> Option<serde_json::Value> {
+    // Get list of changed files.
+    let diff_output = tokio::process::Command::new("git")
+        .args(["diff", "--name-only", "HEAD"])
+        .current_dir(working_dir)
+        .output()
+        .await
+        .ok()?;
+
+    let diff_text = String::from_utf8_lossy(&diff_output.stdout);
+    let files_changed: Vec<String> = diff_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(String::from)
+        .collect();
+
+    if files_changed.is_empty() {
+        // Also check untracked files.
+        let status = tokio::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(working_dir)
+            .output()
+            .await
+            .ok()?;
+        let status_text = String::from_utf8_lossy(&status.stdout);
+        if status_text.trim().is_empty() {
+            return None; // No changes at all.
+        }
+    }
+
+    let tests_added: Vec<&String> = files_changed
+        .iter()
+        .filter(|f| f.contains("test") || f.contains("_test") || f.ends_with("_tests.rs"))
+        .collect();
+
+    // Run cargo test to check if tests pass.
+    let test_result = tokio::process::Command::new("cargo")
+        .args(["test", "--quiet"])
+        .current_dir(working_dir)
+        .output()
+        .await;
+    let tests_passing = test_result.map(|o| o.status.success()).unwrap_or(false);
+
+    let summary = format!(
+        "Detected {} file change(s) from worktree (tests {})",
+        files_changed.len(),
+        if tests_passing { "passing" } else { "failing" }
+    );
+
+    Some(serde_json::json!({
+        "files_changed": files_changed,
+        "tests_added": tests_added,
+        "tests_passing": tests_passing,
+        "commit_message": format!("feat: implement changes ({} files)", files_changed.len()),
+        "summary": summary,
+    }))
 }
 
 #[cfg(test)]
@@ -519,6 +632,52 @@ All tests pass."#;
         assert!(!result.is_error);
         assert_eq!(result.num_turns, 5);
         assert_eq!(result.total_cost_usd, 0.05);
+    }
+
+    #[tokio::test]
+    async fn detect_changes_empty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        // Init a git repo with an initial commit.
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir.path())
+            .output();
+        // No changes → should return None.
+        let result = detect_changes_from_worktree(dir.path()).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_changes_with_modified_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output();
+        std::fs::write(dir.path().join("hello.rs"), "fn main() {}").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output();
+        // Modify the file.
+        std::fs::write(
+            dir.path().join("hello.rs"),
+            "fn main() { println!(\"hi\"); }",
+        )
+        .unwrap();
+        let result = detect_changes_from_worktree(dir.path()).await;
+        assert!(result.is_some());
+        let data = result.unwrap();
+        let files = data["files_changed"].as_array().unwrap();
+        assert!(files.iter().any(|f| f.as_str() == Some("hello.rs")));
     }
 
     fn test_context() -> AgentContext {
