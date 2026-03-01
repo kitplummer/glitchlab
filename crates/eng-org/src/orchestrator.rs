@@ -975,7 +975,9 @@ impl Orchestrator {
                     task_depth,
                     max_depth,
                     &pipeline_result.stage_outputs,
-                );
+                    &params.repo_path,
+                )
+                .await;
                 self.dash(DashboardEvent::TaskDecomposed {
                     task_id: task_id.clone(),
                     sub_task_ids: sub_ids,
@@ -1061,12 +1063,14 @@ impl Orchestrator {
                 // On ParseError, check if the raw output is empty (infrastructure
                 // issue, not model garbage). Inject a high-priority diagnostic
                 // task immediately instead of waiting for TQM's 3-failure threshold.
-                if pipeline_result.status == PipelineStatus::ParseError {
-                    Self::maybe_inject_infra_diagnostic(
+                if pipeline_result.status == PipelineStatus::ParseError
+                    && let Some(diag_task) = Self::maybe_inject_infra_diagnostic(
                         queue,
                         &pipeline_result,
                         &mut infra_diag_injected,
-                    );
+                    )
+                {
+                    Self::persist_tasks_as_beads(&params.repo_path, &[diag_task]).await;
                 }
 
                 let _ = queue.save();
@@ -1522,13 +1526,14 @@ impl Orchestrator {
     /// Returns `true` if decomposition succeeded (sub-tasks injected),
     /// `false` if it failed (depth exceeded or no sub-tasks found).
     /// Returns the IDs of injected sub-tasks (empty if decomposition failed).
-    fn handle_decomposition(
+    async fn handle_decomposition(
         queue: &mut TaskQueue,
         result: &mut OrchestratorResult,
         task_id: &str,
         task_depth: u32,
         max_depth: u32,
         stage_outputs: &HashMap<String, AgentOutput>,
+        repo_path: &Path,
     ) -> Vec<String> {
         if task_depth >= max_depth {
             warn!(
@@ -1551,6 +1556,7 @@ impl Orchestrator {
             let count = sub_tasks.len();
             let ids: Vec<String> = sub_tasks.iter().map(|t| t.id.clone()).collect();
             info!(task_id = %task_id, count, "decomposed into sub-tasks");
+            Self::persist_tasks_as_beads(repo_path, &sub_tasks).await;
             queue.inject_tasks(sub_tasks);
             queue.update_status(task_id, TaskStatus::Completed);
             let _ = queue.save();
@@ -1582,15 +1588,17 @@ impl Orchestrator {
 
         let mut tasks = Vec::new();
         for (i, item) in decomposition.iter().enumerate() {
-            let id = item
+            let raw_id = item
                 .get("id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let id = if id.is_empty() {
+            let id = if raw_id.is_empty() {
                 format!("{parent_id}-part{}", i + 1)
+            } else if raw_id.starts_with(&format!("{}-", crate::config::BEAD_ID_PREFIX)) {
+                raw_id
             } else {
-                id
+                format!("{}-{raw_id}", crate::config::BEAD_ID_PREFIX)
             };
 
             let objective = item
@@ -2223,9 +2231,9 @@ impl Orchestrator {
         queue: &mut TaskQueue,
         pipeline_result: &glitchlab_kernel::pipeline::PipelineResult,
         already_injected: &mut bool,
-    ) {
+    ) -> Option<crate::taskqueue::Task> {
         if *already_injected {
-            return;
+            return None;
         }
 
         // Extract the raw output preview from outcome context.
@@ -2243,7 +2251,7 @@ impl Orchestrator {
         // Only trigger for infrastructure failures (empty or whitespace-only output),
         // not for model garbage (which model escalation or TQM can handle).
         if !raw_snippet.trim().is_empty() {
-            return;
+            return None;
         }
 
         let diag_id = format!(
@@ -2277,8 +2285,9 @@ impl Orchestrator {
             files_hint: Some(vec!["crates/eng-org/src/agents/claude_code.rs".into()]),
         };
 
-        queue.inject_tasks(vec![diag_task]);
+        queue.inject_tasks(vec![diag_task.clone()]);
         *already_injected = true;
+        Some(diag_task)
     }
 
     /// Apply review verdicts to the task queue, respecting confidence and config gates.
@@ -3101,10 +3110,10 @@ mod tests {
 
         let sub_tasks = Orchestrator::extract_sub_tasks("parent", 0, &stage_outputs).unwrap();
         assert_eq!(sub_tasks.len(), 2);
-        assert_eq!(sub_tasks[0].id, "parent-part1");
+        assert_eq!(sub_tasks[0].id, "gl-parent-part1");
         assert_eq!(sub_tasks[0].objective, "Add uuid to Cargo.toml");
         assert!(sub_tasks[0].depends_on.is_empty());
-        assert_eq!(sub_tasks[1].id, "parent-part2");
+        assert_eq!(sub_tasks[1].id, "gl-parent-part2");
         assert_eq!(sub_tasks[1].depends_on, vec!["parent-part1"]);
     }
 
@@ -3699,6 +3708,8 @@ mod tests {
         // Parent at depth 2 → children should be depth 3.
         let sub_tasks = Orchestrator::extract_sub_tasks("parent", 2, &stage_outputs).unwrap();
         assert_eq!(sub_tasks.len(), 2);
+        assert_eq!(sub_tasks[0].id, "gl-child-1");
+        assert_eq!(sub_tasks[1].id, "gl-child-2");
         assert_eq!(sub_tasks[0].decomposition_depth, 3);
         assert_eq!(sub_tasks[1].decomposition_depth, 3);
     }
@@ -3750,8 +3761,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn handle_decomposition_depth_exceeded_marks_failed() {
+    #[tokio::test]
+    async fn handle_decomposition_depth_exceeded_marks_failed() {
         let tasks = vec![Task {
             id: "deep-task".into(),
             objective: "Too deep".into(),
@@ -3769,6 +3780,7 @@ mod tests {
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
         let stage_outputs = decomposition_stage_outputs();
+        let repo_path = Path::new(".");
 
         let ids = Orchestrator::handle_decomposition(
             &mut queue,
@@ -3777,7 +3789,9 @@ mod tests {
             3, // task_depth
             3, // max_depth — at limit
             &stage_outputs,
-        );
+            repo_path,
+        )
+        .await;
 
         assert!(ids.is_empty());
         assert_eq!(result.tasks_failed, 1);
@@ -3786,8 +3800,8 @@ mod tests {
         assert!(task.error.as_ref().unwrap().contains("decomposition depth"));
     }
 
-    #[test]
-    fn handle_decomposition_success_injects_sub_tasks() {
+    #[tokio::test]
+    async fn handle_decomposition_success_injects_sub_tasks() {
         let tasks = vec![Task {
             id: "parent-task".into(),
             objective: "Decomposable".into(),
@@ -3805,6 +3819,7 @@ mod tests {
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
         let stage_outputs = decomposition_stage_outputs();
+        let repo_path = Path::new(".");
 
         let ids = Orchestrator::handle_decomposition(
             &mut queue,
@@ -3813,9 +3828,12 @@ mod tests {
             1, // task_depth
             3, // max_depth — under limit
             &stage_outputs,
-        );
+            repo_path,
+        )
+        .await;
 
-        assert_eq!(ids, vec!["sub-1", "sub-2"]);
+        // IDs get gl- prefix enforced
+        assert_eq!(ids, vec!["gl-sub-1", "gl-sub-2"]);
         assert_eq!(result.tasks_failed, 0);
         // Parent should be completed.
         let parent = queue
@@ -3825,16 +3843,16 @@ mod tests {
             .unwrap();
         assert_eq!(parent.status, TaskStatus::Completed);
         // Sub-tasks should be injected with depth = 2.
-        let sub1 = queue.tasks().iter().find(|t| t.id == "sub-1").unwrap();
+        let sub1 = queue.tasks().iter().find(|t| t.id == "gl-sub-1").unwrap();
         assert_eq!(sub1.decomposition_depth, 2);
         assert_eq!(sub1.status, TaskStatus::Pending);
-        let sub2 = queue.tasks().iter().find(|t| t.id == "sub-2").unwrap();
+        let sub2 = queue.tasks().iter().find(|t| t.id == "gl-sub-2").unwrap();
         assert_eq!(sub2.decomposition_depth, 2);
         assert_eq!(sub2.depends_on, vec!["sub-1"]);
     }
 
-    #[test]
-    fn handle_decomposition_no_sub_tasks_marks_failed() {
+    #[tokio::test]
+    async fn handle_decomposition_no_sub_tasks_marks_failed() {
         let tasks = vec![Task {
             id: "empty-decomp".into(),
             objective: "No subs".into(),
@@ -3852,6 +3870,7 @@ mod tests {
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
         let empty_outputs = HashMap::new(); // no "plan" stage → no sub-tasks
+        let repo_path = Path::new(".");
 
         let ids = Orchestrator::handle_decomposition(
             &mut queue,
@@ -3860,7 +3879,9 @@ mod tests {
             0,
             3,
             &empty_outputs,
-        );
+            repo_path,
+        )
+        .await;
 
         assert!(ids.is_empty());
         assert_eq!(result.tasks_failed, 1);
@@ -4339,11 +4360,12 @@ mod tests {
         );
 
         // extract_sub_tasks should find the sub-tasks from the pre-flight output.
+        // IDs get gl- prefix enforced.
         let sub_tasks = Orchestrator::extract_sub_tasks("xl-task", 0, &stage_outputs).unwrap();
         assert_eq!(sub_tasks.len(), 2);
-        assert_eq!(sub_tasks[0].id, "xl-part1");
+        assert_eq!(sub_tasks[0].id, "gl-xl-part1");
         assert_eq!(sub_tasks[0].objective, "First half");
-        assert_eq!(sub_tasks[1].id, "xl-part2");
+        assert_eq!(sub_tasks[1].id, "gl-xl-part2");
         assert_eq!(sub_tasks[1].depends_on, vec!["xl-part1"]);
         // Sub-tasks should be at depth 1.
         assert_eq!(sub_tasks[0].decomposition_depth, 1);
@@ -4795,9 +4817,10 @@ mod tests {
         let pr = make_parse_error_result(""); // empty = infrastructure failure
         let mut injected = false;
 
-        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        let result = Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
 
         assert!(injected);
+        assert!(result.is_some());
         assert_eq!(queue.tasks().len(), initial_count + 1);
         let diag = queue
             .tasks()
@@ -4816,9 +4839,10 @@ mod tests {
         let pr = make_parse_error_result("some garbage output from model");
         let mut injected = false;
 
-        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        let result = Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
 
         assert!(!injected);
+        assert!(result.is_none());
         assert_eq!(queue.tasks().len(), initial_count);
     }
 
@@ -4828,11 +4852,13 @@ mod tests {
         let pr = make_parse_error_result("");
         let mut injected = false;
 
-        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        let result1 = Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        assert!(result1.is_some());
         let count_after_first = queue.tasks().len();
 
         // Second call should be a no-op.
-        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        let result2 = Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        assert!(result2.is_none());
         assert_eq!(queue.tasks().len(), count_after_first);
     }
 
@@ -4844,9 +4870,10 @@ mod tests {
         let pr = make_parse_error_result("   \n  ");
         let mut injected = false;
 
-        Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
+        let result = Orchestrator::maybe_inject_infra_diagnostic(&mut queue, &pr, &mut injected);
 
         assert!(injected);
+        assert!(result.is_some());
         assert_eq!(queue.tasks().len(), initial_count + 1);
     }
 
