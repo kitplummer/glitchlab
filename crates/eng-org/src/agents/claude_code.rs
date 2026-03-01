@@ -680,6 +680,138 @@ All tests pass."#;
         assert!(files.iter().any(|f| f.as_str() == Some("hello.rs")));
     }
 
+    #[tokio::test]
+    async fn detect_changes_with_untracked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir.path())
+            .output();
+        // Add an untracked file (not staged, not committed).
+        std::fs::write(dir.path().join("new_file.rs"), "fn new() {}").unwrap();
+        // git diff --name-only HEAD returns empty, but git status --porcelain shows ?? new_file.rs.
+        let result = detect_changes_from_worktree(dir.path()).await;
+        // Should return Some because untracked files exist.
+        assert!(result.is_some());
+        let data = result.unwrap();
+        // files_changed is empty (no diff), but untracked files triggered detection.
+        let files = data["files_changed"].as_array().unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detect_changes_with_test_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn greet() {}").unwrap();
+        std::fs::write(dir.path().join("test_greet.rs"), "#[test] fn t() {}").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output();
+        // Modify both files.
+        std::fs::write(dir.path().join("lib.rs"), "pub fn greet() { todo!() }").unwrap();
+        std::fs::write(
+            dir.path().join("test_greet.rs"),
+            "#[test] fn t() { assert!(true); }",
+        )
+        .unwrap();
+        let result = detect_changes_from_worktree(dir.path()).await;
+        assert!(result.is_some());
+        let data = result.unwrap();
+        // test_greet.rs contains "test" so it should be in tests_added.
+        let tests_added = data["tests_added"].as_array().unwrap();
+        assert!(
+            tests_added
+                .iter()
+                .any(|f| f.as_str() == Some("test_greet.rs")),
+            "expected test_greet.rs in tests_added: {tests_added:?}"
+        );
+        // lib.rs should NOT be in tests_added.
+        assert!(
+            !tests_added.iter().any(|f| f.as_str() == Some("lib.rs")),
+            "lib.rs should not be in tests_added"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_changes_summary_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output();
+        std::fs::write(dir.path().join("a.rs"), "fn a() { todo!() }").unwrap();
+        let result = detect_changes_from_worktree(dir.path()).await;
+        assert!(result.is_some());
+        let data = result.unwrap();
+        let summary = data["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("1 file change"),
+            "summary should mention file count: {summary}"
+        );
+        let commit_msg = data["commit_message"].as_str().unwrap();
+        assert!(
+            commit_msg.contains("1 files"),
+            "commit message: {commit_msg}"
+        );
+    }
+
+    #[test]
+    fn claude_code_result_error_subtype() {
+        let json = r#"{
+            "type": "result",
+            "subtype": "error_max_budget_usd",
+            "total_cost_usd": 0.50,
+            "duration_ms": 120000,
+            "is_error": false,
+            "num_turns": 10,
+            "result": "",
+            "session_id": "abc-123"
+        }"#;
+        let result: ClaudeCodeResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.subtype, "error_max_budget_usd");
+        assert!(result.result.is_empty());
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn claude_code_result_with_error_flag() {
+        let json = r#"{
+            "type": "result",
+            "subtype": "error",
+            "total_cost_usd": 0.01,
+            "duration_ms": 1000,
+            "is_error": true,
+            "num_turns": 1,
+            "result": "An error occurred",
+            "session_id": "err-456"
+        }"#;
+        let result: ClaudeCodeResult = serde_json::from_str(json).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.result, "An error occurred");
+    }
+
     fn test_context() -> AgentContext {
         AgentContext {
             task_id: "test-task".into(),

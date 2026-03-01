@@ -10,8 +10,8 @@ GLITCHLAB is an agentic development engine being ported from Python to Rust. The
 
 - Every module must have unit tests.
 - Every public function and trait implementation must be tested.
-- Use `cargo-tarpaulin` for coverage measurement: `cargo tarpaulin --exclude-files 'crates/cli/*' 'crates/memory/src/dolt.rs'`
-- The CLI binary and Dolt backend are excluded from coverage (thin orchestration / external DB integration layers, tested via integration).
+- Use `cargo-tarpaulin` for coverage measurement: `cargo tarpaulin --exclude-files 'crates/cli/*' 'crates/dashboard/*' 'crates/memory/src/dolt.rs'`
+- The CLI binary, dashboard binary, and Dolt backend are excluded from coverage (thin orchestration / external DB integration layers, tested via integration).
 - Do not merge code that drops coverage below 90%.
 - When writing new code, write tests in the same commit.
 - Prefer testing behavior over implementation details.

@@ -40,13 +40,13 @@ test-functional:
 # Coverage
 # ---------------------------------------------------------------------------
 
-# Measure test coverage (excludes CLI binary and Dolt backend)
+# Measure test coverage (excludes CLI binary, dashboard binary, and Dolt backend)
 coverage:
-	cargo tarpaulin --exclude-files 'crates/cli/*' 'crates/memory/src/dolt.rs' --skip-clean -o stdout
+	cargo tarpaulin --exclude-files 'crates/cli/*' 'crates/dashboard/*' 'crates/memory/src/dolt.rs' --skip-clean -o stdout
 
 # Coverage with HTML report
 coverage-html:
-	cargo tarpaulin --exclude-files 'crates/cli/*' 'crates/memory/src/dolt.rs' --skip-clean -o html
+	cargo tarpaulin --exclude-files 'crates/cli/*' 'crates/dashboard/*' 'crates/memory/src/dolt.rs' --skip-clean -o html
 	@echo "Report: tarpaulin-report.html"
 
 # ---------------------------------------------------------------------------
