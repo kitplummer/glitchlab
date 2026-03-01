@@ -79,13 +79,9 @@ tqm:
 
 pipeline:
   short_circuit_enabled: true
-  # Claude Code implementer disabled pending integration fixes:
-  # - Output JSON parsing (result field extraction)
-  # - Cost tracking (Claude Code cost not flowing to pipeline budget)
-  # - Budget gate incompatibility (80K native vs 200K Claude Code context)
-  # use_claude_code_implementer: true
-  # claude_code_model: sonnet
-  # claude_code_budget_usd: 0.50
+  use_claude_code_implementer: true
+  claude_code_model: sonnet
+  claude_code_budget_usd: 0.50
 
 providers:
   gemini:

@@ -419,6 +419,17 @@ impl Router {
         errors
     }
 
+    /// Record cost from an external tool (e.g. Claude Code CLI) that bypasses
+    /// the normal router→provider→budget flow.
+    ///
+    /// Claude Code doesn't expose token counts, so we only record dollar cost
+    /// and bump the call count.
+    pub async fn record_external_cost(&self, cost: f64) {
+        let mut budget = self.budget.lock().await;
+        budget.usage.estimated_cost += cost;
+        budget.usage.call_count += 1;
+    }
+
     /// Get a snapshot of the current budget state.
     pub async fn budget_summary(&self) -> glitchlab_kernel::budget::BudgetSummary {
         self.budget.lock().await.summary()
@@ -1390,6 +1401,29 @@ mod tests {
         assert!(result.is_ok());
         let summary = result.unwrap();
         assert_eq!(summary.total_tokens, 150);
+    }
+
+    #[tokio::test]
+    async fn record_external_cost_updates_budget() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget);
+
+        // Before: no usage.
+        let summary = router.budget_summary().await;
+        assert_eq!(summary.call_count, 0);
+        assert!((summary.estimated_cost).abs() < f64::EPSILON);
+        assert_eq!(summary.total_tokens, 0);
+
+        // Record external cost (e.g. from Claude Code CLI).
+        router.record_external_cost(0.42).await;
+
+        // After: cost and call count updated, tokens unchanged.
+        let summary = router.budget_summary().await;
+        assert_eq!(summary.call_count, 1);
+        assert!((summary.estimated_cost - 0.42).abs() < f64::EPSILON);
+        assert_eq!(summary.total_tokens, 0);
+        assert!((summary.dollars_remaining - 9.58).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

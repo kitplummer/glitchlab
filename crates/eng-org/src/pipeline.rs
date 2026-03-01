@@ -769,69 +769,74 @@ impl EngineeringPipeline {
             // --- Stage 3b2: Budget estimation gate ---
             // Estimate whether the plan fits within the task's token budget.
             // If it would exceed 80%, force the planner to decompose.
-            let plan_files: Vec<String> = plan_output.data["files_likely_affected"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let step_count = plan_output.data["steps"]
-                .as_array()
-                .map(|a| a.len())
-                .unwrap_or(1);
-            let estimated = estimate_plan_tokens(repo_path, &plan_files, step_count).await;
-            let budget = self.config.limits.max_tokens_per_task as usize;
+            //
+            // Skip when Claude Code is the implementer — it manages its own
+            // 200K context window, so the native token estimation doesn't apply.
+            if !self.config.pipeline.use_claude_code_implementer {
+                let plan_files: Vec<String> = plan_output.data["files_likely_affected"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let step_count = plan_output.data["steps"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(1);
+                let estimated = estimate_plan_tokens(repo_path, &plan_files, step_count).await;
+                let budget = self.config.limits.max_tokens_per_task as usize;
 
-            // 90% threshold — the estimator is deliberately pessimistic, so the
-            // gate catches plans that would clearly blow budget while allowing
-            // borderline cases to attempt execution.
-            if estimated > (budget * 90 / 100) {
-                warn!(
-                    task_id,
-                    estimated,
-                    budget,
-                    "plan estimated to exceed 90% of budget — forcing decomposition"
-                );
-                ctx.agent_context.previous_output = serde_json::json!({
-                    "original_plan": plan_output.data,
-                    "instruction": format!(
-                        "This plan would consume ~{estimated} tokens (budget: {budget}). \
-                         Decompose into smaller sub-tasks. Each sub-task should read only \
-                         the specific sections of files it needs (use line-range hints)."
-                    ),
-                });
-                let replan = PlannerAgent::new(Arc::clone(&self.router));
-                match replan.execute(&ctx.agent_context).await {
-                    Ok(new_plan) => {
-                        plan_output = new_plan;
-                        self.emit(&mut ctx, EventKind::PlanCreated, plan_output.data.clone());
-                        ctx.stage_outputs.insert("plan".into(), plan_output.clone());
-                        // Check if replan decomposed
-                        if plan_output
-                            .data
-                            .get("decomposition")
-                            .is_some_and(|d| d.is_array() && !d.as_array().unwrap().is_empty())
-                        {
-                            return PipelineResult {
-                                status: PipelineStatus::Decomposed,
-                                stage_outputs: ctx.stage_outputs,
-                                events: ctx.events,
-                                budget: self.router.budget_summary().await,
-                                pr_url: None,
-                                branch: None,
-                                error: None,
-                                outcome_context: None,
-                            };
+                // 90% threshold — the estimator is deliberately pessimistic, so the
+                // gate catches plans that would clearly blow budget while allowing
+                // borderline cases to attempt execution.
+                if estimated > (budget * 90 / 100) {
+                    warn!(
+                        task_id,
+                        estimated,
+                        budget,
+                        "plan estimated to exceed 90% of budget — forcing decomposition"
+                    );
+                    ctx.agent_context.previous_output = serde_json::json!({
+                        "original_plan": plan_output.data,
+                        "instruction": format!(
+                            "This plan would consume ~{estimated} tokens (budget: {budget}). \
+                             Decompose into smaller sub-tasks. Each sub-task should read only \
+                             the specific sections of files it needs (use line-range hints)."
+                        ),
+                    });
+                    let replan = PlannerAgent::new(Arc::clone(&self.router));
+                    match replan.execute(&ctx.agent_context).await {
+                        Ok(new_plan) => {
+                            plan_output = new_plan;
+                            self.emit(&mut ctx, EventKind::PlanCreated, plan_output.data.clone());
+                            ctx.stage_outputs.insert("plan".into(), plan_output.clone());
+                            // Check if replan decomposed
+                            if plan_output
+                                .data
+                                .get("decomposition")
+                                .is_some_and(|d| d.is_array() && !d.as_array().unwrap().is_empty())
+                            {
+                                return PipelineResult {
+                                    status: PipelineStatus::Decomposed,
+                                    stage_outputs: ctx.stage_outputs,
+                                    events: ctx.events,
+                                    budget: self.router.budget_summary().await,
+                                    pr_url: None,
+                                    branch: None,
+                                    error: None,
+                                    outcome_context: None,
+                                };
+                            }
                         }
-                    }
-                    Err(e) => {
-                        warn!(
-                            task_id,
-                            error = %e,
-                            "budget-aware replan failed, continuing with original"
-                        );
+                        Err(e) => {
+                            warn!(
+                                task_id,
+                                error = %e,
+                                "budget-aware replan failed, continuing with original"
+                            );
+                        }
                     }
                 }
             }
@@ -1183,7 +1188,12 @@ impl EngineeringPipeline {
             };
             let cc_agent = ClaudeCodeImplementer::new(cc_config);
             match cc_agent.execute(&ctx.agent_context).await {
-                Ok(o) => (o, 0u32),
+                Ok(o) => {
+                    // Record Claude Code's cost in the router budget so
+                    // budget_summary() reflects the full pipeline spend.
+                    self.router.record_external_cost(o.metadata.cost).await;
+                    (o, 0u32)
+                }
                 Err(e) => {
                     let err_str = e.to_string();
                     let obstacle = glitchlab_kernel::outcome::ObstacleKind::ModelLimitation {
