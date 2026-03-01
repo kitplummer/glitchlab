@@ -450,6 +450,161 @@ fn read_crate_purpose(repo_path: &Path, crate_dir: &Path) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// ADR Indexer
+// ---------------------------------------------------------------------------
+
+/// Maximum total size for ADR context injected into agents.
+const ADR_CONTEXT_MAX_BYTES: usize = 8 * 1024;
+
+/// Maximum bytes of the Decision section excerpt per ADR.
+const ADR_DECISION_EXCERPT_MAX: usize = 500;
+
+/// Structured summary of an Architecture Decision Record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdrSummary {
+    pub filename: String,
+    pub title: String,
+    pub status: String,
+    pub decision_excerpt: String,
+}
+
+/// Scan `docs/adr-*.md` files in a repo and extract structured summaries.
+pub async fn build_adr_index(repo_path: &Path) -> Result<Vec<AdrSummary>> {
+    let docs_dir = repo_path.join("docs");
+    if !docs_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut summaries = Vec::new();
+
+    let entries = std::fs::read_dir(&docs_dir)
+        .map_err(|e| Error::Workspace(format!("failed to read docs/: {e}")))?;
+
+    let mut filenames: Vec<String> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("adr-") && name.ends_with(".md") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    filenames.sort();
+
+    for filename in filenames {
+        let path = docs_dir.join(&filename);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let title = extract_adr_title(&content).unwrap_or_default();
+        let status = extract_adr_status(&content).unwrap_or_default();
+        let decision_excerpt = extract_adr_decision(&content).unwrap_or_default();
+
+        summaries.push(AdrSummary {
+            filename,
+            title,
+            status,
+            decision_excerpt,
+        });
+    }
+
+    Ok(summaries)
+}
+
+/// Format ADR summaries as markdown context for agent injection.
+pub fn adr_summaries_to_context(summaries: &[AdrSummary]) -> String {
+    if summaries.is_empty() {
+        return String::new();
+    }
+
+    let mut ctx = String::with_capacity(ADR_CONTEXT_MAX_BYTES);
+    ctx.push_str("## Architecture Decision Records\n\n");
+
+    for s in summaries {
+        if ctx.len() > ADR_CONTEXT_MAX_BYTES - 200 {
+            ctx.push_str("\n(ADR context truncated)\n");
+            break;
+        }
+        ctx.push_str(&format!("### {} — {}\n", s.filename, s.title));
+        if !s.status.is_empty() {
+            ctx.push_str(&format!("**Status:** {}\n", s.status));
+        }
+        if !s.decision_excerpt.is_empty() {
+            ctx.push_str(&format!("{}\n", s.decision_excerpt));
+        }
+        ctx.push('\n');
+    }
+
+    if ctx.len() > ADR_CONTEXT_MAX_BYTES {
+        ctx.truncate(ADR_CONTEXT_MAX_BYTES - 20);
+        ctx.push_str("\n(truncated)\n");
+    }
+
+    ctx
+}
+
+/// Extract the title from a `# ADR: <title>` or `# <title>` line.
+fn extract_adr_title(content: &str) -> Option<String> {
+    for line in content.lines().take(10) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("# ADR:") {
+            return Some(rest.trim().to_string());
+        }
+        if let Some(rest) = trimmed.strip_prefix("# ")
+            && !rest.is_empty()
+        {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+/// Extract the status from a `**Status:** <value>` line.
+fn extract_adr_status(content: &str) -> Option<String> {
+    for line in content.lines().take(20) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("**Status:**") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract the first ~500 chars after a `## Decision` heading.
+fn extract_adr_decision(content: &str) -> Option<String> {
+    let mut in_decision = false;
+    let mut excerpt = String::new();
+
+    for line in content.lines() {
+        if in_decision {
+            // Stop at the next heading.
+            if line.starts_with("## ") {
+                break;
+            }
+            if excerpt.len() < ADR_DECISION_EXCERPT_MAX
+                && (!excerpt.is_empty() || !line.trim().is_empty())
+            {
+                excerpt.push_str(line);
+                excerpt.push('\n');
+            }
+        } else if line.trim().starts_with("## Decision") {
+            in_decision = true;
+        }
+    }
+
+    let trimmed = excerpt.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +897,104 @@ mod tests {
     }
 
     #[test]
+    fn codebase_knowledge_node_project() {
+        let index = RepoIndex {
+            root: "/tmp/repo".into(),
+            total_files: 3,
+            languages: HashMap::from([("js".into(), 2), ("json".into(), 1)]),
+            files: vec![
+                "src/index.js".into(),
+                "src/utils.js".into(),
+                "package.json".into(),
+            ],
+            directories: vec!["src".into()],
+            key_files: vec!["package.json".into()],
+            test_files: vec![],
+        };
+
+        let kb = build_codebase_knowledge(&index, Path::new("/nonexistent"));
+        assert!(kb.contains("Node.js"));
+        assert!(kb.contains("npm test"));
+        assert!(!kb.contains("Rust"));
+    }
+
+    #[test]
+    fn codebase_knowledge_go_project() {
+        let index = RepoIndex {
+            root: "/tmp/repo".into(),
+            total_files: 3,
+            languages: HashMap::from([("go".into(), 2)]),
+            files: vec!["cmd/main.go".into(), "pkg/handler.go".into()],
+            directories: vec!["cmd".into(), "pkg".into()],
+            key_files: vec!["go.mod".into()],
+            test_files: vec![],
+        };
+
+        let kb = build_codebase_knowledge(&index, Path::new("/nonexistent"));
+        assert!(kb.contains("Go"));
+        assert!(kb.contains("go test"));
+        assert!(!kb.contains("Rust"));
+    }
+
+    #[test]
+    fn codebase_knowledge_with_crate_purpose() {
+        // Create a temp dir with a real lib.rs containing a doc comment.
+        let dir = tempfile::tempdir().unwrap();
+        let crate_dir = dir.path().join("crates/mylib/src");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::write(
+            crate_dir.join("lib.rs"),
+            "//! My awesome library for doing things.\nfn main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(crate_dir.join("utils.rs"), "fn helper() {}\n").unwrap();
+
+        // Create Cargo.toml files.
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            dir.path().join("crates/mylib/Cargo.toml"),
+            "[package]\nname = \"mylib\"\n",
+        )
+        .unwrap();
+
+        let index = RepoIndex {
+            root: dir.path().to_string_lossy().into(),
+            total_files: 4,
+            languages: HashMap::from([("rs".into(), 2), ("toml".into(), 2)]),
+            files: vec![
+                "crates/mylib/src/lib.rs".into(),
+                "crates/mylib/src/utils.rs".into(),
+            ],
+            directories: vec!["crates".into()],
+            key_files: vec!["Cargo.toml".into(), "crates/mylib/Cargo.toml".into()],
+            test_files: vec![],
+        };
+
+        let kb = build_codebase_knowledge(&index, dir.path());
+        assert!(kb.contains("Rust workspace"));
+        assert!(kb.contains("My awesome library for doing things"));
+        assert!(kb.contains("modules:"));
+    }
+
+    #[test]
+    fn codebase_knowledge_single_component_path() {
+        // Test files at root level (single path component).
+        let index = RepoIndex {
+            root: "/tmp/repo".into(),
+            total_files: 2,
+            languages: HashMap::from([("py".into(), 2)]),
+            files: vec!["main.py".into(), "utils.py".into()],
+            directories: vec![],
+            key_files: vec!["pyproject.toml".into()],
+            test_files: vec![],
+        };
+
+        let kb = build_codebase_knowledge(&index, Path::new("/nonexistent"));
+        assert!(kb.contains("Source files"));
+        assert!(kb.contains("main.py"));
+    }
+
+    #[test]
     fn codebase_knowledge_respects_size_limit() {
         // Create a large index that would exceed the 6KB limit.
         let files: Vec<String> = (0..500)
@@ -776,5 +1029,114 @@ mod tests {
         let json = serde_json::to_string(&index).unwrap();
         let parsed: RepoIndex = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.total_files, 1);
+    }
+
+    // --- ADR indexer tests ---
+
+    #[tokio::test]
+    async fn build_adr_index_finds_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            docs.join("adr-001.md"),
+            "# ADR: Use Rust\n\n**Status:** Accepted\n\n## Decision\n\nWe will use Rust for all backend services.\n\n## Consequences\n\nFast.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            docs.join("adr-002.md"),
+            "# ADR: Provider Agnostic\n\n**Status:** Proposed\n\n## Decision\n\nAll LLM calls go through the Router.\n",
+        )
+        .unwrap();
+        // Non-ADR file should be ignored.
+        std::fs::write(docs.join("readme.md"), "# Docs\n").unwrap();
+
+        let summaries = build_adr_index(dir.path()).await.unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].filename, "adr-001.md");
+        assert_eq!(summaries[0].title, "Use Rust");
+        assert_eq!(summaries[0].status, "Accepted");
+        assert!(summaries[0].decision_excerpt.contains("Rust"));
+        assert_eq!(summaries[1].filename, "adr-002.md");
+        assert_eq!(summaries[1].title, "Provider Agnostic");
+    }
+
+    #[test]
+    fn adr_summaries_to_context_formats_markdown() {
+        let summaries = vec![
+            AdrSummary {
+                filename: "adr-001.md".into(),
+                title: "Use Rust".into(),
+                status: "Accepted".into(),
+                decision_excerpt: "We will use Rust.".into(),
+            },
+            AdrSummary {
+                filename: "adr-002.md".into(),
+                title: "Router".into(),
+                status: "Proposed".into(),
+                decision_excerpt: "All calls go through Router.".into(),
+            },
+        ];
+        let ctx = adr_summaries_to_context(&summaries);
+        assert!(ctx.contains("Architecture Decision Records"));
+        assert!(ctx.contains("adr-001.md"));
+        assert!(ctx.contains("Use Rust"));
+        assert!(ctx.contains("Accepted"));
+        assert!(ctx.contains("We will use Rust."));
+        assert!(ctx.contains("adr-002.md"));
+    }
+
+    #[tokio::test]
+    async fn build_adr_index_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // No docs/ directory at all.
+        let summaries = build_adr_index(dir.path()).await.unwrap();
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn adr_summaries_to_context_empty() {
+        let ctx = adr_summaries_to_context(&[]);
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn extract_adr_title_hash_prefix() {
+        let content = "# ADR: My Decision\n\nSome text.\n";
+        assert_eq!(extract_adr_title(content), Some("My Decision".into()));
+    }
+
+    #[test]
+    fn extract_adr_title_plain_heading() {
+        let content = "# My Plain Title\n\nText.\n";
+        assert_eq!(extract_adr_title(content), Some("My Plain Title".into()));
+    }
+
+    #[test]
+    fn extract_adr_status_found() {
+        let content = "# ADR: Foo\n\n**Status:** Accepted\n\n## Decision\n";
+        assert_eq!(extract_adr_status(content), Some("Accepted".into()));
+    }
+
+    #[test]
+    fn extract_adr_decision_excerpt() {
+        let content = "# ADR: Foo\n\n## Decision\n\nWe will do X.\nAnd also Y.\n\n## Consequences\n\nThings.\n";
+        let excerpt = extract_adr_decision(content).unwrap();
+        assert!(excerpt.contains("We will do X."));
+        assert!(excerpt.contains("And also Y."));
+        assert!(!excerpt.contains("Things."));
+    }
+
+    #[test]
+    fn extract_adr_decision_truncates_long_excerpt() {
+        // Build multi-line content that exceeds the limit.
+        let lines: Vec<String> = (0..20)
+            .map(|i| format!("Line {i}: {}", "x".repeat(40)))
+            .collect();
+        let content = format!("## Decision\n\n{}\n\n## Consequences\n", lines.join("\n"));
+        let excerpt = extract_adr_decision(&content).unwrap();
+        // The function stops adding lines once the limit is reached.
+        assert!(excerpt.len() <= ADR_DECISION_EXCERPT_MAX + 50);
+        assert!(excerpt.len() < content.len());
     }
 }

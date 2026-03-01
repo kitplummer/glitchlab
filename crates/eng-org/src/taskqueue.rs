@@ -165,6 +165,16 @@ impl TaskQueue {
         }
     }
 
+    /// Set the priority of a task by ID.
+    ///
+    /// No-op if the task is not found.
+    pub fn set_priority(&mut self, task_id: &str, priority: u32) {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+            info!(task_id, priority, "task priority updated");
+            task.priority = priority;
+        }
+    }
+
     /// Set the error message on a task.
     pub fn set_error(&mut self, task_id: &str, error: String) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
@@ -494,6 +504,24 @@ mod tests {
         queue.update_status("task-1", TaskStatus::Completed);
         let task = queue.tasks().iter().find(|t| t.id == "task-1").unwrap();
         assert_eq!(task.status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn set_priority_updates_task() {
+        let mut queue = TaskQueue::from_tasks(sample_tasks());
+        queue.set_priority("task-1", 50);
+        let task = queue.tasks().iter().find(|t| t.id == "task-1").unwrap();
+        assert_eq!(task.priority, 50);
+    }
+
+    #[test]
+    fn set_priority_missing_task_noop() {
+        let mut queue = TaskQueue::from_tasks(sample_tasks());
+        // Should not panic.
+        queue.set_priority("nonexistent", 50);
+        // Original tasks unchanged.
+        let task = queue.tasks().iter().find(|t| t.id == "task-1").unwrap();
+        assert_eq!(task.priority, 1);
     }
 
     #[test]
@@ -1382,6 +1410,30 @@ mod tests {
         // fix-blocked depends on dep-1 which is pending, so dep-1 should be picked.
         let next = queue.pick_next().unwrap();
         assert_eq!(next.id, "dep-1");
+    }
+
+    #[test]
+    fn summary_covers_all_statuses() {
+        let mut queue = TaskQueue::from_tasks(sample_tasks());
+        queue.update_status("task-1", TaskStatus::InProgress);
+        queue.update_status("task-2", TaskStatus::Skipped);
+        // task-3 stays Pending
+        let s = queue.summary();
+        assert_eq!(s.in_progress, 1);
+        assert_eq!(s.skipped, 1);
+        assert_eq!(s.pending, 1);
+        assert_eq!(s.total, 3);
+    }
+
+    #[test]
+    fn is_empty_and_len() {
+        let empty = TaskQueue::from_tasks(vec![]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let queue = TaskQueue::from_tasks(sample_tasks());
+        assert!(!queue.is_empty());
+        assert_eq!(queue.len(), 3);
     }
 
     #[test]

@@ -65,6 +65,8 @@ pub struct EngConfig {
     pub tqm: crate::tqm::TQMConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    #[serde(default)]
+    pub review: ReviewConfig,
 }
 
 /// Configuration for pipeline execution behavior (e.g. short-circuit skipping).
@@ -110,6 +112,40 @@ impl Default for PipelineConfig {
             use_claude_code_implementer: false,
             claude_code_model: default_claude_code_model(),
             claude_code_budget_usd: default_claude_code_budget(),
+        }
+    }
+}
+
+/// Configuration for pre-batch backlog review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// Whether the backlog review agent runs before each batch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum confidence threshold for applying verdicts (0.0–1.0).
+    #[serde(default = "default_confidence_threshold")]
+    pub confidence_threshold: f64,
+    /// When true, automatically close beads the reviewer marks as done.
+    /// When false (default), close verdicts are logged but not applied.
+    #[serde(default)]
+    pub auto_close: bool,
+    /// When true, automatically adjust bead priorities per reviewer recommendation.
+    /// When false (default), reprioritize verdicts are logged but not applied.
+    #[serde(default)]
+    pub auto_reprioritize: bool,
+}
+
+fn default_confidence_threshold() -> f64 {
+    0.8
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            confidence_threshold: default_confidence_threshold(),
+            auto_close: false,
+            auto_reprioritize: false,
         }
     }
 }
@@ -164,6 +200,10 @@ pub struct RoutingConfig {
     #[serde(default = "default_ciso_model")]
     pub ciso: String,
 
+    /// Backlog review (Curator) agent — pre-batch ADR reconciliation.
+    #[serde(default = "default_backlog_review_model")]
+    pub backlog_review: String,
+
     /// Model pool for cost-aware chooser. When non-empty, enables
     /// the `ModelChooser` for dynamic model selection.
     #[serde(default)]
@@ -192,6 +232,10 @@ fn default_ops_diagnosis_model() -> String {
 
 fn default_ciso_model() -> String {
     "anthropic/claude-haiku-4-5-20251001".into()
+}
+
+fn default_backlog_review_model() -> String {
+    "gemini/gemini-2.5-flash-lite".into()
 }
 
 fn default_max_stuck_turns() -> u32 {
@@ -350,6 +394,8 @@ impl Default for EngConfig {
                 ops_diagnosis: default_ops_diagnosis_model(),
                 // CISO (Sentinel) agent model (provider/model-name).
                 ciso: default_ciso_model(),
+                // Backlog review (Curator) agent model (provider/model-name).
+                backlog_review: default_backlog_review_model(),
                 models: Vec::new(),
                 roles: HashMap::new(),
                 cost_quality_threshold: default_cost_quality_threshold(),
@@ -466,6 +512,7 @@ impl Default for EngConfig {
             providers: HashMap::new(),
             tqm: crate::tqm::TQMConfig::default(),
             pipeline: PipelineConfig::default(),
+            review: ReviewConfig::default(),
         }
     }
 }
@@ -524,7 +571,7 @@ impl EngConfig {
 
     /// Build the routing map (role → model string) from config.
     pub fn routing_map(&self) -> HashMap<String, String> {
-        HashMap::from([
+        let mut map = HashMap::from([
             ("planner".into(), self.routing.planner.clone()),
             ("implementer".into(), self.routing.implementer.clone()),
             ("debugger".into(), self.routing.debugger.clone()),
@@ -541,7 +588,13 @@ impl EngConfig {
             ),
             ("ops_diagnosis".into(), self.routing.ops_diagnosis.clone()),
             ("ciso".into(), self.routing.ciso.clone()),
-        ])
+        ]);
+        // Only include backlog_review when the feature is enabled, so the
+        // preflight check doesn't require its provider to be configured.
+        if self.review.enabled {
+            map.insert("backlog_review".into(), self.routing.backlog_review.clone());
+        }
+        map
     }
 
     /// Build a `ModelChooser` from the config's model pool and role preferences.
@@ -765,6 +818,8 @@ mod tests {
         assert!(map.contains_key("architect_review"));
         assert!(map.contains_key("ops_diagnosis"));
         assert!(map.contains_key("ciso"));
+        // backlog_review only included when review.enabled = true
+        assert!(!map.contains_key("backlog_review"));
         assert_eq!(map.len(), 10);
     }
 
@@ -1239,6 +1294,34 @@ boundaries:
         let (i, o) = default_cost("unknown/model");
         assert!((i - 1.0).abs() < f64::EPSILON);
         assert!((o - 5.0).abs() < f64::EPSILON);
+
+        let (i, o) = default_cost("gemini/gemini-2.5-pro");
+        assert!((i - 1.25).abs() < f64::EPSILON);
+        assert!((o - 10.0).abs() < f64::EPSILON);
+
+        let (i, o) = default_cost("anthropic/claude-haiku-4-5-20251001");
+        assert!((i - 0.80).abs() < f64::EPSILON);
+        assert!((o - 4.0).abs() < f64::EPSILON);
+
+        let (i, o) = default_cost("anthropic/claude-opus-4-20250514");
+        assert!((i - 15.0).abs() < f64::EPSILON);
+        assert!((o - 75.0).abs() < f64::EPSILON);
+
+        let (i, o) = default_cost("openai/gpt-4o-mini");
+        assert!((i - 0.15).abs() < f64::EPSILON);
+        assert!((o - 0.60).abs() < f64::EPSILON);
+
+        let (i, o) = default_cost("openai/gpt-4o");
+        assert!((i - 2.50).abs() < f64::EPSILON);
+        assert!((o - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn role_preference_config_defaults() {
+        let yaml = "requires: []\n";
+        let config: RolePreferenceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.min_tier, "economy");
+        assert!(config.requires.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1619,5 +1702,46 @@ base_url: http://localhost:8080
         assert_eq!(TaskSize::S, TaskSize::S);
         assert_ne!(TaskSize::S, TaskSize::M);
         assert_ne!(TaskSize::L, TaskSize::XL);
+    }
+
+    #[test]
+    fn routing_map_includes_backlog_review_when_enabled() {
+        let mut config = EngConfig::default();
+        config.review.enabled = true;
+        let map = config.routing_map();
+        assert!(map.contains_key("backlog_review"));
+        assert_eq!(map.len(), 11);
+    }
+
+    #[test]
+    fn review_config_defaults() {
+        let config = ReviewConfig::default();
+        assert!(!config.enabled);
+        assert!((config.confidence_threshold - 0.8).abs() < f64::EPSILON);
+        assert!(!config.auto_close);
+        assert!(!config.auto_reprioritize);
+    }
+
+    #[test]
+    fn review_config_roundtrip() {
+        let config = ReviewConfig {
+            enabled: true,
+            confidence_threshold: 0.9,
+            auto_close: true,
+            auto_reprioritize: false,
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let parsed: ReviewConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed.enabled);
+        assert!((parsed.confidence_threshold - 0.9).abs() < f64::EPSILON);
+        assert!(parsed.auto_close);
+        assert!(!parsed.auto_reprioritize);
+    }
+
+    #[test]
+    fn eng_config_includes_review() {
+        let config = EngConfig::default();
+        assert!(!config.review.enabled);
+        assert!(config.routing.backlog_review.contains("gemini"));
     }
 }

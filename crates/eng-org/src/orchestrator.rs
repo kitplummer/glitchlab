@@ -511,6 +511,30 @@ impl RestartIntensityMonitor {
 // Orchestrator
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// BacklogReviewResult
+// ---------------------------------------------------------------------------
+
+/// Result of a pre-batch backlog review sweep.
+#[derive(Debug)]
+pub(crate) struct BacklogReviewResult {
+    pub(crate) beads_reviewed: usize,
+    pub(crate) actions_applied: usize,
+    pub(crate) cost: f64,
+    pub(crate) skipped: bool,
+}
+
+impl BacklogReviewResult {
+    fn skipped() -> Self {
+        Self {
+            beads_reviewed: 0,
+            actions_applied: 0,
+            cost: 0.0,
+            skipped: true,
+        }
+    }
+}
+
 /// Multi-run autonomous orchestrator.
 ///
 /// Iterates through a task queue, running each task through the full
@@ -588,6 +612,24 @@ impl Orchestrator {
             total_tasks: queue.summary().pending as usize,
             budget_dollars: budget.limit_dollars(),
         });
+
+        // --- Pre-batch backlog review ---
+        match self
+            .run_backlog_review(queue, budget, &params.repo_path)
+            .await
+        {
+            review_result if review_result.skipped => {
+                // Nothing to do — review was disabled or had no tasks.
+            }
+            review_result => {
+                info!(
+                    beads_reviewed = review_result.beads_reviewed,
+                    actions_applied = review_result.actions_applied,
+                    cost = review_result.cost,
+                    "backlog review sweep complete"
+                );
+            }
+        }
 
         // --- Task loop ---
         loop {
@@ -1516,6 +1558,222 @@ impl Orchestrator {
         }
 
         if tasks.is_empty() { None } else { Some(tasks) }
+    }
+
+    /// Run a pre-batch backlog review using the BacklogReviewAgent.
+    ///
+    /// Non-fatal: errors are logged and a skipped result is returned.
+    async fn run_backlog_review(
+        &self,
+        queue: &mut TaskQueue,
+        budget: &mut CumulativeBudget,
+        repo_path: &Path,
+    ) -> BacklogReviewResult {
+        if !self.config.review.enabled {
+            return BacklogReviewResult::skipped();
+        }
+
+        self.dash(DashboardEvent::BacklogReviewStarted);
+        info!("running pre-batch backlog review");
+
+        // Build ADR index.
+        let adr_summaries = match crate::indexer::build_adr_index(repo_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to build ADR index for backlog review");
+                Vec::new()
+            }
+        };
+        let adr_context = crate::indexer::adr_summaries_to_context(&adr_summaries);
+
+        // Serialize open tasks as JSON for the agent.
+        let open_tasks: Vec<&crate::taskqueue::Task> = queue
+            .tasks()
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    crate::taskqueue::TaskStatus::Pending | crate::taskqueue::TaskStatus::Deferred
+                )
+            })
+            .collect();
+
+        if open_tasks.is_empty() {
+            info!("no open tasks for backlog review");
+            return BacklogReviewResult::skipped();
+        }
+
+        let beads_json = serde_json::to_string_pretty(&open_tasks).unwrap_or_default();
+        let prompt = crate::agents::backlog_review::BacklogReviewAgent::build_prompt(
+            &beads_json,
+            &adr_context,
+        );
+
+        // Create a lightweight router for the review agent.
+        let budget_tracker = BudgetTracker::new(
+            self.config.limits.max_tokens_per_task,
+            self.config.limits.max_dollars_per_task,
+        );
+        let provider_inits = self.config.resolve_providers();
+        let mut router =
+            Router::with_providers(self.config.routing_map(), budget_tracker, provider_inits);
+        if let Some(chooser) = self.config.build_chooser() {
+            router = router.with_chooser(chooser);
+        }
+        let router = Arc::new(router);
+
+        let agent = crate::agents::backlog_review::BacklogReviewAgent::new(router);
+
+        use glitchlab_kernel::agent::{Agent, AgentContext};
+        let ctx = AgentContext {
+            task_id: "backlog-review".into(),
+            objective: prompt,
+            repo_path: repo_path.to_string_lossy().into(),
+            working_dir: String::new(),
+            constraints: vec![],
+            acceptance_criteria: vec![],
+            risk_level: "low".into(),
+            file_context: std::collections::HashMap::new(),
+            previous_output: serde_json::Value::Null,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let output = match agent.execute(&ctx).await {
+            Ok(out) => out,
+            Err(e) => {
+                warn!(error = %e, "backlog review agent failed");
+                return BacklogReviewResult::skipped();
+            }
+        };
+
+        let cost = output.metadata.cost;
+        budget.record("backlog-review", cost, output.metadata.tokens, "review");
+
+        let beads_reviewed = output
+            .data
+            .get("total_beads_reviewed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let actions_applied = Self::apply_review_verdicts(queue, &output.data, &self.config.review);
+
+        let result = BacklogReviewResult {
+            beads_reviewed,
+            actions_applied,
+            cost,
+            skipped: false,
+        };
+
+        info!(
+            beads_reviewed = result.beads_reviewed,
+            actions_applied = result.actions_applied,
+            cost = result.cost,
+            "backlog review complete"
+        );
+
+        self.dash(DashboardEvent::BacklogReviewCompleted {
+            beads_reviewed: result.beads_reviewed,
+            actions_applied: result.actions_applied,
+            cost: result.cost,
+        });
+
+        result
+    }
+
+    /// Apply review verdicts to the task queue, respecting confidence and config gates.
+    ///
+    /// Returns the number of actions actually applied.
+    fn apply_review_verdicts(
+        queue: &mut TaskQueue,
+        review_output: &serde_json::Value,
+        review_config: &crate::config::ReviewConfig,
+    ) -> usize {
+        let actions = match review_output.get("actions").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return 0,
+        };
+
+        let threshold = review_config.confidence_threshold;
+        let mut applied = 0;
+
+        for action in actions {
+            let bead_id = match action.get("bead_id").and_then(|v| v.as_str()) {
+                Some(id) => id,
+                None => continue,
+            };
+            let action_type = match action.get("action").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => continue,
+            };
+            let confidence = action
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let reason = action.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+
+            if confidence < threshold {
+                info!(
+                    bead_id,
+                    action_type,
+                    confidence,
+                    threshold,
+                    "skipping verdict below confidence threshold"
+                );
+                continue;
+            }
+
+            match action_type {
+                "close" => {
+                    if review_config.auto_close {
+                        info!(bead_id, confidence, reason, "auto-closing bead");
+                        queue.update_status(bead_id, TaskStatus::Skipped);
+                        applied += 1;
+                    } else {
+                        info!(
+                            bead_id,
+                            confidence, reason, "close verdict logged (auto_close disabled)"
+                        );
+                    }
+                }
+                "reprioritize" => {
+                    if review_config.auto_reprioritize {
+                        if let Some(new_priority) =
+                            action.get("new_priority").and_then(|v| v.as_u64())
+                        {
+                            info!(
+                                bead_id,
+                                confidence, new_priority, reason, "auto-reprioritizing bead"
+                            );
+                            queue.set_priority(bead_id, new_priority as u32);
+                            applied += 1;
+                        }
+                    } else {
+                        info!(
+                            bead_id,
+                            confidence,
+                            reason,
+                            "reprioritize verdict logged (auto_reprioritize disabled)"
+                        );
+                    }
+                }
+                "flag_stale" | "flag_misaligned" => {
+                    info!(
+                        bead_id,
+                        action_type, confidence, reason, "bead flagged by backlog review"
+                    );
+                }
+                "no_action" => {}
+                other => {
+                    warn!(
+                        bead_id,
+                        action_type = other,
+                        "unknown backlog review action"
+                    );
+                }
+            }
+        }
+
+        applied
     }
 }
 
@@ -2791,6 +3049,7 @@ mod tests {
             FailureCategory::ImplementationFailed.to_string(),
             "implementation failed"
         );
+        assert_eq!(FailureCategory::ParseError.to_string(), "parse error");
         assert_eq!(FailureCategory::TestsFailed.to_string(), "tests failed");
         assert_eq!(
             FailureCategory::ArchitectRejected.to_string(),
@@ -3131,6 +3390,10 @@ mod tests {
         assert_eq!(
             pipeline_status_to_failure_category(PipelineStatus::ImplementationFailed),
             FailureCategory::ImplementationFailed
+        );
+        assert_eq!(
+            pipeline_status_to_failure_category(PipelineStatus::ParseError),
+            FailureCategory::ParseError
         );
         assert_eq!(
             pipeline_status_to_failure_category(PipelineStatus::TestsFailed),
@@ -3509,5 +3772,410 @@ mod tests {
         let budget = CumulativeBudget::new(0.01).with_repair_budget_fraction(0.01);
         assert!(!budget.can_afford_repair(0.50)); // per-task cost exceeds repair budget
         assert!(next.is_remediation);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_dashboard / dash coverage
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn orchestrator_with_dashboard_emits_events() {
+        let config = EngConfig::default();
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let (emitter, buf) = DashboardEmitter::in_memory();
+        let orchestrator =
+            Orchestrator::new(config, handler, history).with_dashboard(Arc::new(emitter));
+
+        // Run with an empty queue so it finishes quickly.
+        let mut queue = TaskQueue::from_tasks(vec![]);
+        let mut budget = CumulativeBudget::new(100.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: false,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+        assert_eq!(result.cease_reason, CeaseReason::AllTasksDone);
+
+        // Dashboard events are serialized as snake_case via serde tag.
+        let output = buf.lock().unwrap();
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("run_started"),
+            "expected run_started event in dashboard output, got: {text}"
+        );
+        assert!(
+            text.contains("run_completed"),
+            "expected run_completed event in dashboard output, got: {text}"
+        );
+    }
+
+    #[test]
+    fn dash_noop_without_emitter() {
+        let config = EngConfig::default();
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        // Should not panic — dash is a no-op when no emitter is attached.
+        orchestrator.dash(DashboardEvent::QualityGatePassed);
+    }
+
+    // -----------------------------------------------------------------------
+    // File hints appending in pick_next (lines 628, 631)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn orchestrator_appends_file_hints_to_objective() {
+        let config = EngConfig::default();
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        let tasks = vec![Task {
+            id: "fh-1".into(),
+            objective: "Fix the bug".into(),
+            priority: 1,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: Some(vec!["src/main.rs".into(), "src/lib.rs".into()]),
+        }];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        let mut budget = CumulativeBudget::new(100.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: true,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+        // The task will fail (no API keys) but the file hints path is exercised.
+        assert!(result.tasks_attempted >= 1);
+        assert!(result.tasks_failed >= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Remediation skip when repair budget exhausted (lines 642-643)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn orchestrator_skips_remediation_when_repair_budget_exhausted() {
+        let config = EngConfig::default();
+        let handler = Arc::new(AutoApproveHandler);
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+
+        let orchestrator = Orchestrator::new(config, handler, history);
+        // Create a remediation task.
+        let tasks = vec![Task {
+            id: "rem-skip-1".into(),
+            objective: "Fix the flaky test".into(),
+            priority: 1,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 1,
+            is_remediation: true,
+            files_hint: None,
+        }];
+        let mut queue = TaskQueue::from_tasks(tasks);
+        // Repair budget = 0 (fraction 0.0), so all remediation tasks should be skipped.
+        let mut budget = CumulativeBudget::new(100.0).with_repair_budget_fraction(0.0);
+        let params = OrchestratorParams {
+            repo_path: dir.path().to_path_buf(),
+            base_branch: "main".into(),
+            quality_gate_command: None,
+            stop_on_failure: false,
+        };
+
+        let result = orchestrator.run(&mut queue, &mut budget, &params).await;
+        // The remediation task should be skipped, not attempted.
+        assert_eq!(result.tasks_attempted, 0);
+        assert_eq!(result.cease_reason, CeaseReason::AllTasksDone);
+        // Task should be marked Skipped.
+        let task = queue.tasks().iter().find(|t| t.id == "rem-skip-1").unwrap();
+        assert_eq!(task.status, TaskStatus::Skipped);
+    }
+
+    // -----------------------------------------------------------------------
+    // AttemptTracker max-attempts unit test (lines 656-682)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attempt_tracker_count_exceeds_max() {
+        use glitchlab_kernel::outcome::ObstacleKind;
+
+        let mut tracker = AttemptTracker::new();
+        let max = 2;
+        let ctx = || OutcomeContext {
+            approach: "tried something".into(),
+            obstacle: ObstacleKind::Unknown {
+                detail: "test".into(),
+            },
+            discoveries: vec![],
+            recommendation: None,
+            files_explored: vec![],
+        };
+        // Record two attempts.
+        tracker.record("task-x", ctx());
+        tracker.record("task-x", ctx());
+        assert_eq!(tracker.count("task-x"), 2);
+        assert!(
+            tracker.count("task-x") >= max,
+            "expected count >= max_attempts"
+        );
+        // Contexts should be retrievable.
+        assert_eq!(tracker.contexts("task-x").len(), 2);
+        // Unrecorded task should have count 0.
+        assert_eq!(tracker.count("task-y"), 0);
+        assert!(tracker.contexts("task-y").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // record() with tracing coverage (line 127)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn budget_record_emits_tracing_event() {
+        // Install a no-op tracing subscriber so the info! macro in record()
+        // actually executes (covering line 127).
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+        let mut budget = CumulativeBudget::new(100.0);
+        budget.record("tracing-test", 1.0, 1000, "ok");
+        assert_eq!(budget.total_runs(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Backlog review tests
+    // -----------------------------------------------------------------------
+
+    fn sample_review_config() -> crate::config::ReviewConfig {
+        crate::config::ReviewConfig {
+            enabled: true,
+            confidence_threshold: 0.8,
+            auto_close: true,
+            auto_reprioritize: true,
+        }
+    }
+
+    fn sample_queue() -> TaskQueue {
+        TaskQueue::from_tasks(vec![
+            Task {
+                id: "gl-1e0.1".into(),
+                objective: "Implement feature A".into(),
+                priority: 50,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
+                files_hint: None,
+            },
+            Task {
+                id: "gl-1e0.5".into(),
+                objective: "Implement feature B".into(),
+                priority: 75,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
+                files_hint: None,
+            },
+        ])
+    }
+
+    #[test]
+    fn apply_review_verdicts_close_above_threshold() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.1",
+                    "action": "close",
+                    "reason": "already implemented",
+                    "confidence": 0.92
+                }
+            ]
+        });
+
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 1);
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.1").unwrap();
+        assert_eq!(task.status, TaskStatus::Skipped);
+    }
+
+    #[test]
+    fn apply_review_verdicts_below_threshold_skipped() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.1",
+                    "action": "close",
+                    "reason": "maybe done",
+                    "confidence": 0.5
+                }
+            ]
+        });
+
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 0);
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.1").unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn apply_review_verdicts_reprioritize() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.5",
+                    "action": "reprioritize",
+                    "reason": "higher priority per ADR",
+                    "new_priority": 10,
+                    "confidence": 0.85
+                }
+            ]
+        });
+
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 1);
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.5").unwrap();
+        assert_eq!(task.priority, 10);
+    }
+
+    #[test]
+    fn apply_review_verdicts_auto_close_disabled() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.1",
+                    "action": "close",
+                    "reason": "done",
+                    "confidence": 0.95
+                }
+            ]
+        });
+
+        let mut config = sample_review_config();
+        config.auto_close = false;
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 0);
+        // Task should remain pending.
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.1").unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn apply_review_verdicts_auto_reprioritize_disabled() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.5",
+                    "action": "reprioritize",
+                    "reason": "should be higher",
+                    "new_priority": 5,
+                    "confidence": 0.9
+                }
+            ]
+        });
+
+        let mut config = sample_review_config();
+        config.auto_reprioritize = false;
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 0);
+        let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.5").unwrap();
+        assert_eq!(task.priority, 75); // unchanged
+    }
+
+    #[test]
+    fn apply_review_verdicts_no_actions_array() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({"summary": "nothing"});
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 0);
+    }
+
+    #[test]
+    fn apply_review_verdicts_mixed_actions() {
+        let mut queue = sample_queue();
+        let review_output = serde_json::json!({
+            "actions": [
+                {
+                    "bead_id": "gl-1e0.1",
+                    "action": "close",
+                    "reason": "done",
+                    "confidence": 0.95
+                },
+                {
+                    "bead_id": "gl-1e0.5",
+                    "action": "no_action",
+                    "reason": "looks fine",
+                    "confidence": 0.9
+                }
+            ]
+        });
+
+        let config = sample_review_config();
+        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(applied, 1);
+    }
+
+    #[tokio::test]
+    async fn run_backlog_review_disabled_returns_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let history: Arc<dyn HistoryBackend> =
+            Arc::new(glitchlab_memory::history::JsonlHistory::new(dir.path()));
+        let handler = Arc::new(AutoApproveHandler);
+        let config = EngConfig::default(); // review.enabled is false by default
+        let orchestrator = Orchestrator::new(config, handler, history);
+
+        let mut queue = sample_queue();
+        let mut budget = CumulativeBudget::new(100.0);
+
+        let result = orchestrator
+            .run_backlog_review(&mut queue, &mut budget, dir.path())
+            .await;
+        assert!(result.skipped);
+        assert_eq!(result.actions_applied, 0);
     }
 }
