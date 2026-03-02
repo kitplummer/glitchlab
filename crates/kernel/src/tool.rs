@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
@@ -108,6 +109,108 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema for the tool's input parameters.
     pub input_schema: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// Minimal tool parameter schemas
+// ---------------------------------------------------------------------------
+
+/// Parameters for the `read_file` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReadFileParams {
+    /// Absolute or workspace-relative path of the file to read.
+    pub path: String,
+}
+
+/// Parameters for the `write_file` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WriteFileParams {
+    /// Absolute or workspace-relative path of the file to write.
+    pub path: String,
+    /// Full content to write to the file (overwrites existing content).
+    pub content: String,
+}
+
+/// Parameters for the `edit_file` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EditFileParams {
+    /// Absolute or workspace-relative path of the file to edit.
+    pub path: String,
+    /// Exact string to search for in the file (must be unique).
+    pub old_str: String,
+    /// Replacement string that will replace `old_str`.
+    pub new_str: String,
+}
+
+/// Parameters for the `run_command` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RunCommandParams {
+    /// Shell command to execute within the sandboxed working directory.
+    pub command: String,
+}
+
+fn default_list_files_path() -> String {
+    ".".into()
+}
+
+/// Parameters for the `list_files` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ListFilesParams {
+    /// Directory path to list. Defaults to `"."` (workspace root).
+    #[serde(default = "default_list_files_path")]
+    pub path: String,
+    /// Whether to list files recursively. Defaults to `false`.
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+/// Returns the minimal set of `ToolDefinition` objects required for code editing:
+/// `read_file`, `write_file`, `edit_file`, `run_command`, and `list_files`.
+///
+/// The `input_schema` for each tool is generated from the corresponding
+/// parameter struct using [`schemars`].
+pub fn get_minimal_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "read_file".into(),
+            description: "Read the contents of a file from the workspace. \
+                Returns the full text content of the specified file."
+                .into(),
+            input_schema: serde_json::to_value(schemars::schema_for!(ReadFileParams))
+                .expect("ReadFileParams schema is always serializable"),
+        },
+        ToolDefinition {
+            name: "write_file".into(),
+            description: "Write content to a file, creating it if it does not exist \
+                or overwriting it if it does."
+                .into(),
+            input_schema: serde_json::to_value(schemars::schema_for!(WriteFileParams))
+                .expect("WriteFileParams schema is always serializable"),
+        },
+        ToolDefinition {
+            name: "edit_file".into(),
+            description: "Replace an exact substring in a file with new text. \
+                The `old_str` must appear exactly once in the file."
+                .into(),
+            input_schema: serde_json::to_value(schemars::schema_for!(EditFileParams))
+                .expect("EditFileParams schema is always serializable"),
+        },
+        ToolDefinition {
+            name: "run_command".into(),
+            description: "Execute a shell command in the sandboxed working directory. \
+                Returns stdout, stderr, and the exit code."
+                .into(),
+            input_schema: serde_json::to_value(schemars::schema_for!(RunCommandParams))
+                .expect("RunCommandParams schema is always serializable"),
+        },
+        ToolDefinition {
+            name: "list_files".into(),
+            description: "List files in a directory. Optionally recurse into subdirectories."
+                .into(),
+            input_schema: serde_json::to_value(schemars::schema_for!(ListFilesParams))
+                .expect("ListFilesParams schema is always serializable"),
+        },
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -463,5 +566,183 @@ mod tests {
         assert!(parsed.is_error);
         assert_eq!(parsed.tool_call_id, "call_2");
         assert!(parsed.content.contains("exit code 1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // get_minimal_tool_definitions() tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn minimal_tool_definitions_returns_five_tools() {
+        let defs = get_minimal_tool_definitions();
+        assert_eq!(defs.len(), 5);
+    }
+
+    #[test]
+    fn minimal_tool_definitions_names_are_correct() {
+        let defs = get_minimal_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"run_command"));
+        assert!(names.contains(&"list_files"));
+    }
+
+    #[test]
+    fn minimal_tool_definitions_have_descriptions() {
+        let defs = get_minimal_tool_definitions();
+        for def in &defs {
+            assert!(
+                !def.description.is_empty(),
+                "tool `{}` has empty description",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn minimal_tool_definitions_schemas_are_objects() {
+        let defs = get_minimal_tool_definitions();
+        for def in &defs {
+            assert!(
+                def.input_schema.is_object(),
+                "tool `{}` schema is not a JSON object",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn read_file_schema_requires_path() {
+        let defs = get_minimal_tool_definitions();
+        let read_def = defs.iter().find(|d| d.name == "read_file").unwrap();
+        let schema = &read_def.input_schema;
+        // The schema should have a "properties" object containing "path"
+        assert!(
+            schema["properties"]["path"].is_object(),
+            "read_file schema missing 'path' property"
+        );
+    }
+
+    #[test]
+    fn write_file_schema_requires_path_and_content() {
+        let defs = get_minimal_tool_definitions();
+        let def = defs.iter().find(|d| d.name == "write_file").unwrap();
+        let schema = &def.input_schema;
+        assert!(
+            schema["properties"]["path"].is_object(),
+            "write_file schema missing 'path' property"
+        );
+        assert!(
+            schema["properties"]["content"].is_object(),
+            "write_file schema missing 'content' property"
+        );
+    }
+
+    #[test]
+    fn edit_file_schema_has_required_fields() {
+        let defs = get_minimal_tool_definitions();
+        let def = defs.iter().find(|d| d.name == "edit_file").unwrap();
+        let schema = &def.input_schema;
+        assert!(
+            schema["properties"]["path"].is_object(),
+            "edit_file schema missing 'path' property"
+        );
+        assert!(
+            schema["properties"]["old_str"].is_object(),
+            "edit_file schema missing 'old_str' property"
+        );
+        assert!(
+            schema["properties"]["new_str"].is_object(),
+            "edit_file schema missing 'new_str' property"
+        );
+    }
+
+    #[test]
+    fn run_command_schema_has_command_field() {
+        let defs = get_minimal_tool_definitions();
+        let def = defs.iter().find(|d| d.name == "run_command").unwrap();
+        let schema = &def.input_schema;
+        assert!(
+            schema["properties"]["command"].is_object(),
+            "run_command schema missing 'command' property"
+        );
+    }
+
+    #[test]
+    fn list_files_schema_has_path_field() {
+        let defs = get_minimal_tool_definitions();
+        let def = defs.iter().find(|d| d.name == "list_files").unwrap();
+        let schema = &def.input_schema;
+        assert!(
+            schema["properties"]["path"].is_object(),
+            "list_files schema missing 'path' property"
+        );
+    }
+
+    #[test]
+    fn read_file_params_serde_roundtrip() {
+        let params = ReadFileParams {
+            path: "src/main.rs".into(),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: ReadFileParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.path, "src/main.rs");
+    }
+
+    #[test]
+    fn write_file_params_serde_roundtrip() {
+        let params = WriteFileParams {
+            path: "out.txt".into(),
+            content: "hello".into(),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: WriteFileParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.path, "out.txt");
+        assert_eq!(parsed.content, "hello");
+    }
+
+    #[test]
+    fn edit_file_params_serde_roundtrip() {
+        let params = EditFileParams {
+            path: "lib.rs".into(),
+            old_str: "foo".into(),
+            new_str: "bar".into(),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: EditFileParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.path, "lib.rs");
+        assert_eq!(parsed.old_str, "foo");
+        assert_eq!(parsed.new_str, "bar");
+    }
+
+    #[test]
+    fn run_command_params_serde_roundtrip() {
+        let params = RunCommandParams {
+            command: "cargo test".into(),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: RunCommandParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.command, "cargo test");
+    }
+
+    #[test]
+    fn list_files_params_defaults() {
+        let params: ListFilesParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(params.path, ".");
+        assert!(!params.recursive);
+    }
+
+    #[test]
+    fn list_files_params_serde_roundtrip() {
+        let params = ListFilesParams {
+            path: "src/".into(),
+            recursive: true,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: ListFilesParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.path, "src/");
+        assert!(parsed.recursive);
     }
 }
