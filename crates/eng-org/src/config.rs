@@ -1890,4 +1890,47 @@ base_url: http://localhost:8080
         assert!(!config.watch.enabled);
         assert!(config.routing.adr_decomposer.contains("gemini"));
     }
+
+    // -----------------------------------------------------------------------
+    // PipelineConfig — use_claude_code_implementer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pipeline_config_defaults_use_native_implementer() {
+        let config = PipelineConfig::default();
+        assert!(!config.use_claude_code_implementer);
+        assert_eq!(config.claude_code_model, "sonnet");
+        assert!((config.claude_code_budget_usd - 0.50).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pipeline_config_use_claude_code_implementer_loads_from_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "pipeline:\n  use_claude_code_implementer: true\n  claude_code_model: opus\n  claude_code_budget_usd: 2.0\n",
+        )
+        .unwrap();
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert!(config.pipeline.use_claude_code_implementer);
+        assert_eq!(config.pipeline.claude_code_model, "opus");
+        assert!((config.pipeline.claude_code_budget_usd - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pipeline_config_use_claude_code_implementer_absent_defaults_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "limits:\n  max_fix_attempts: 3\n",
+        )
+        .unwrap();
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert!(!config.pipeline.use_claude_code_implementer);
+        assert_eq!(config.pipeline.claude_code_model, "sonnet");
+    }
 }
