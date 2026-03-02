@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use glitchlab_kernel::agent::{Agent, AgentContext, AgentMetadata, AgentOutput};
 use glitchlab_kernel::error;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::build_user_message;
@@ -42,6 +42,122 @@ struct ClaudeCodeResult {
     result: String,
     #[serde(default)]
     session_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Implementer output schema (from the `result` field of ClaudeCodeResult)
+// ---------------------------------------------------------------------------
+
+/// A single step the implementer executed (optional extension field).
+#[derive(Debug, Deserialize, Serialize, PartialEq, Default, Clone)]
+pub struct ImplementerStep {
+    /// Human-readable description of the step.
+    #[serde(default)]
+    pub description: String,
+    /// Status of the step, e.g. "done", "failed".
+    #[serde(default)]
+    pub status: String,
+}
+
+/// Structured JSON summary produced by the implementer agent.
+///
+/// Maps to the JSON object that the system prompt instructs the implementer
+/// to emit as its final output.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Default, Clone)]
+pub struct ImplementerOutputSummary {
+    /// Paths of files modified or created.
+    #[serde(default)]
+    pub files_changed: Vec<String>,
+    /// Paths of test files added or updated.
+    #[serde(default)]
+    pub tests_added: Vec<String>,
+    /// Whether all tests passed at the end of implementation.
+    #[serde(default)]
+    pub tests_passing: bool,
+    /// Conventional commit message for the changes.
+    #[serde(default)]
+    pub commit_message: String,
+    /// Brief human-readable description of what was done.
+    #[serde(default)]
+    pub summary: String,
+    /// Optional step-by-step breakdown (extension field, may be absent).
+    #[serde(default)]
+    pub steps: Vec<ImplementerStep>,
+}
+
+/// Cost and timing information extracted from the Claude CLI envelope.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
+pub struct CostInfo {
+    /// Total USD cost of the invocation.
+    pub total_cost_usd: f64,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+    /// Number of agentic turns used.
+    pub num_turns: u32,
+}
+
+/// Fully parsed output of a `claude --print --output-format json` invocation.
+///
+/// Combines the cost/timing envelope with the typed implementer summary.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct ClaudeCliOutput {
+    /// Cost and timing metadata from the CLI envelope.
+    pub cost: CostInfo,
+    /// Parsed implementer summary extracted from the `result` field.
+    pub summary: ImplementerOutputSummary,
+    /// The raw text of the `result` field, present when non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_response: Option<String>,
+}
+
+/// Parse the raw JSON emitted by `claude --print --output-format json`.
+///
+/// Extracts cost information from the outer envelope and attempts to parse
+/// the implementer's structured summary from the `result` field.  When the
+/// `result` field is empty or unparseable the summary defaults to all-empty
+/// values rather than returning an error — only a malformed envelope causes
+/// this function to return `Err`.
+///
+/// # Errors
+///
+/// Returns an error when `raw` is not valid JSON or does not match the
+/// expected `ClaudeCodeResult` schema (e.g. missing required `type` field).
+pub fn parse_claude_cli_output(raw: &str) -> anyhow::Result<ClaudeCliOutput> {
+    let envelope: ClaudeCodeResult = serde_json::from_str(raw).map_err(|e| {
+        tracing::error!(error = %e, "failed to parse claude CLI output envelope");
+        e
+    })?;
+
+    let cost = CostInfo {
+        total_cost_usd: envelope.total_cost_usd,
+        duration_ms: envelope.duration_ms,
+        num_turns: envelope.num_turns,
+    };
+
+    let raw_response = if envelope.result.is_empty() {
+        None
+    } else {
+        Some(envelope.result.clone())
+    };
+
+    // Try to parse the implementer's JSON from the result text.
+    let summary = if let Some(parsed) = parse_implementer_json(&envelope.result) {
+        serde_json::from_value(parsed).unwrap_or_default()
+    } else {
+        if !envelope.result.is_empty() {
+            tracing::warn!(
+                result_preview = %envelope.result.chars().take(200).collect::<String>(),
+                "could not parse implementer JSON from result field, using default summary"
+            );
+        }
+        ImplementerOutputSummary::default()
+    };
+
+    Ok(ClaudeCliOutput {
+        cost,
+        summary,
+        raw_response,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +1006,156 @@ All tests pass."#;
         let result: ClaudeCodeResult = serde_json::from_str(json).unwrap();
         assert!(result.is_error);
         assert_eq!(result.result, "An error occurred");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests for parse_claude_cli_output
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn parse_claude_cli_output_valid_full() {
+        let json = r#"{
+            "type": "result",
+            "subtype": "success",
+            "total_cost_usd": 0.05,
+            "duration_ms": 12345,
+            "is_error": false,
+            "num_turns": 5,
+            "result": "{\"files_changed\": [\"src/lib.rs\"], \"tests_added\": [\"src/lib.rs\"], \"tests_passing\": true, \"commit_message\": \"feat: add greet\", \"summary\": \"done\"}",
+            "session_id": "abc-123"
+        }"#;
+        let output = parse_claude_cli_output(json).unwrap();
+        assert_eq!(output.cost.total_cost_usd, 0.05);
+        assert_eq!(output.cost.duration_ms, 12345);
+        assert_eq!(output.cost.num_turns, 5);
+        assert_eq!(output.summary.files_changed, vec!["src/lib.rs"]);
+        assert!(output.summary.tests_passing);
+        assert_eq!(output.summary.commit_message, "feat: add greet");
+        assert_eq!(output.summary.summary, "done");
+        assert!(output.raw_response.is_some());
+    }
+
+    #[test]
+    fn parse_claude_cli_output_empty_result_field() {
+        let json = r#"{
+            "type": "result",
+            "subtype": "error_max_budget_usd",
+            "total_cost_usd": 0.50,
+            "duration_ms": 120000,
+            "is_error": false,
+            "num_turns": 30,
+            "result": "",
+            "session_id": "abc-456"
+        }"#;
+        let output = parse_claude_cli_output(json).unwrap();
+        assert_eq!(output.cost.total_cost_usd, 0.50);
+        assert_eq!(output.cost.num_turns, 30);
+        assert!(output.summary.files_changed.is_empty());
+        assert!(!output.summary.tests_passing);
+        assert!(output.raw_response.is_none());
+    }
+
+    #[test]
+    fn parse_claude_cli_output_invalid_json_envelope() {
+        let result = parse_claude_cli_output("not valid json at all");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_claude_cli_output_missing_required_type_field() {
+        // Missing "type" field — should fail since it maps to result_type which
+        // is not optional in ClaudeCodeResult.
+        let json = r#"{"total_cost_usd": 0.01, "result": ""}"#;
+        // ClaudeCodeResult.result_type has no #[serde(default)], so missing "type" → error
+        let result = parse_claude_cli_output(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_claude_cli_output_markdown_wrapped_result() {
+        let inner = "```json\n{\"files_changed\": [\"a.rs\"], \"tests_added\": [], \"tests_passing\": false, \"commit_message\": \"chore: fix\", \"summary\": \"fixed\"}\n```";
+        let json = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "total_cost_usd": 0.01,
+            "duration_ms": 1000,
+            "is_error": false,
+            "num_turns": 3,
+            "result": inner,
+            "session_id": "xyz"
+        });
+        let output = parse_claude_cli_output(&json.to_string()).unwrap();
+        assert_eq!(output.summary.files_changed, vec!["a.rs"]);
+        assert!(!output.summary.tests_passing);
+        assert_eq!(output.summary.commit_message, "chore: fix");
+    }
+
+    #[test]
+    fn parse_claude_cli_output_result_with_steps() {
+        let inner = serde_json::json!({
+            "files_changed": ["src/main.rs"],
+            "tests_added": [],
+            "tests_passing": true,
+            "commit_message": "feat: implement",
+            "summary": "implemented",
+            "steps": [
+                {"description": "write tests", "status": "done"},
+                {"description": "implement", "status": "done"}
+            ]
+        });
+        let json = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "total_cost_usd": 0.02,
+            "duration_ms": 5000,
+            "is_error": false,
+            "num_turns": 7,
+            "result": inner.to_string(),
+            "session_id": "steps-test"
+        });
+        let output = parse_claude_cli_output(&json.to_string()).unwrap();
+        assert_eq!(output.summary.steps.len(), 2);
+        assert_eq!(output.summary.steps[0].description, "write tests");
+        assert_eq!(output.summary.steps[1].status, "done");
+    }
+
+    #[test]
+    fn cost_info_fields() {
+        let cost = CostInfo {
+            total_cost_usd: 0.123,
+            duration_ms: 9999,
+            num_turns: 7,
+        };
+        assert_eq!(cost.total_cost_usd, 0.123);
+        assert_eq!(cost.duration_ms, 9999);
+        assert_eq!(cost.num_turns, 7);
+    }
+
+    #[test]
+    fn implementer_output_summary_default() {
+        let s = ImplementerOutputSummary::default();
+        assert!(s.files_changed.is_empty());
+        assert!(s.tests_added.is_empty());
+        assert!(!s.tests_passing);
+        assert!(s.commit_message.is_empty());
+        assert!(s.summary.is_empty());
+        assert!(s.steps.is_empty());
+    }
+
+    #[test]
+    fn claude_cli_output_no_raw_response_when_result_empty() {
+        let json = r#"{
+            "type": "result",
+            "subtype": "success",
+            "total_cost_usd": 0.0,
+            "duration_ms": 0,
+            "is_error": false,
+            "num_turns": 0,
+            "result": "",
+            "session_id": "empty"
+        }"#;
+        let output = parse_claude_cli_output(json).unwrap();
+        assert!(output.raw_response.is_none());
     }
 
     fn test_context() -> AgentContext {
