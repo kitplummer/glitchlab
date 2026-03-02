@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 // ---------------------------------------------------------------------------
 // ModelChooser — rule-based cost-aware model routing (Tier 1)
 // ---------------------------------------------------------------------------
 
 /// Model quality/cost tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ModelTier {
     Economy,      // Flash Lite, Haiku, local
     Standard,     // Flash, GPT-4o-mini
@@ -50,7 +52,7 @@ impl fmt::Display for ModelTier {
 }
 
 /// A model available in the pool with cost and capability metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
     pub model_string: String,
     pub input_cost_per_m: f64,
@@ -67,7 +69,7 @@ impl ModelProfile {
 }
 
 /// Per-role requirements for model selection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolePreference {
     pub min_tier: ModelTier,
     pub required_capabilities: HashSet<String>,
@@ -96,7 +98,11 @@ impl fmt::Display for RolePreference {
 
 /// Rule-based model chooser. Selects the cheapest eligible model for a role,
 /// taking into account tier requirements, capabilities, and budget pressure.
-#[derive(Debug, Clone)]
+///
+/// # Serialization
+/// The `models` list must be pre-sorted by cost ascending when deserializing from JSON
+/// (the `new()` constructor always sorts on construction).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelChooser {
     /// Available models, sorted by combined cost ascending at construction.
     models: Vec<ModelProfile>,
@@ -104,6 +110,18 @@ pub struct ModelChooser {
     role_preferences: HashMap<String, RolePreference>,
     /// 0.0 = quality-first, 1.0 = cost-first. Controls budget pressure sensitivity.
     cost_quality_threshold: f64,
+}
+
+impl Default for ModelChooser {
+    /// Creates an empty `ModelChooser` with no models, no role preferences, and
+    /// a balanced `cost_quality_threshold` of `0.7`.
+    fn default() -> Self {
+        Self {
+            models: Vec::new(),
+            role_preferences: HashMap::new(),
+            cost_quality_threshold: 0.7,
+        }
+    }
 }
 
 impl ModelChooser {
@@ -702,5 +720,92 @@ mod tests {
                 "anthropic/claude-sonnet-4-20250514".to_string()
             ]
         );
+    }
+
+    // --- Default, Serialize, Deserialize ---
+
+    #[test]
+    fn model_chooser_default_is_empty() {
+        let chooser = ModelChooser::default();
+        assert!(chooser.is_empty());
+        // An empty chooser selects nothing for any role.
+        assert_eq!(chooser.select("any_role", 10.0, 10.0), None);
+        assert_eq!(chooser.fallback_for_role(), None);
+    }
+
+    #[test]
+    fn model_chooser_default_threshold_is_seventy_percent() {
+        let chooser = ModelChooser::default();
+        // Default threshold should be 0.7 — a balanced cost/quality setting.
+        assert!(
+            (chooser.cost_quality_threshold - 0.7).abs() < f64::EPSILON,
+            "expected 0.7, got {}",
+            chooser.cost_quality_threshold
+        );
+    }
+
+    #[test]
+    fn model_chooser_serializes_to_json() {
+        let chooser = ModelChooser::new(vec![economy_model()], HashMap::new(), 0.5);
+        let json = serde_json::to_string(&chooser).expect("serialize should succeed");
+        assert!(json.contains("gemini/gemini-2.5-flash-lite"));
+        assert!(json.contains("cost_quality_threshold"));
+        assert!(json.contains("0.5"));
+    }
+
+    #[test]
+    fn model_chooser_round_trips_json() {
+        let chooser = test_chooser(0.7);
+        let json = serde_json::to_string(&chooser).expect("serialize");
+        let restored: ModelChooser = serde_json::from_str(&json).expect("deserialize");
+        // Verify selection behaviour is preserved after the round-trip.
+        assert_eq!(
+            chooser.select("debugger", 10.0, 10.0),
+            restored.select("debugger", 10.0, 10.0),
+        );
+        assert_eq!(
+            chooser.select("planner", 10.0, 10.0),
+            restored.select("planner", 10.0, 10.0),
+        );
+    }
+
+    #[test]
+    fn model_chooser_deserializes_from_empty_json() {
+        let json = r#"{"models":[],"role_preferences":{},"cost_quality_threshold":0.5}"#;
+        let chooser: ModelChooser = serde_json::from_str(json).expect("deserialize");
+        assert!(chooser.is_empty());
+        assert_eq!(chooser.select("any_role", 10.0, 10.0), None);
+    }
+
+    #[test]
+    fn model_tier_serializes() {
+        let tier = ModelTier::StandardPlus;
+        let json = serde_json::to_string(&tier).expect("serialize tier");
+        assert_eq!(json, "\"StandardPlus\"");
+        let restored: ModelTier = serde_json::from_str(&json).expect("deserialize tier");
+        assert_eq!(restored, ModelTier::StandardPlus);
+    }
+
+    #[test]
+    fn model_profile_serializes() {
+        let profile = economy_model();
+        let json = serde_json::to_string(&profile).expect("serialize profile");
+        assert!(json.contains("gemini/gemini-2.5-flash-lite"));
+        assert!(json.contains("tool_use"));
+        let restored: ModelProfile = serde_json::from_str(&json).expect("deserialize profile");
+        assert_eq!(restored.model_string, profile.model_string);
+        assert_eq!(restored.tier, profile.tier);
+    }
+
+    #[test]
+    fn role_preference_serializes() {
+        let pref = RolePreference {
+            min_tier: ModelTier::Standard,
+            required_capabilities: HashSet::from(["tool_use".into()]),
+        };
+        let json = serde_json::to_string(&pref).expect("serialize pref");
+        assert!(json.contains("tool_use"));
+        let restored: RolePreference = serde_json::from_str(&json).expect("deserialize pref");
+        assert_eq!(restored, pref);
     }
 }
