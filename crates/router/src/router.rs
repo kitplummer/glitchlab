@@ -576,6 +576,18 @@ mod tests {
             let resp = self.response.clone();
             Box::pin(async move { Ok(resp) })
         }
+
+        fn complete_with_tools(
+            &self,
+            model: &str,
+            messages: &[Message],
+            temperature: f32,
+            max_tokens: u32,
+            _tools: &[glitchlab_kernel::tool::ToolDefinition],
+            response_format: Option<&serde_json::Value>,
+        ) -> ProviderFuture<'_> {
+            self.complete(model, messages, temperature, max_tokens, response_format)
+        }
     }
 
     struct ErrorProvider;
@@ -590,6 +602,18 @@ mod tests {
             _response_format: Option<&serde_json::Value>,
         ) -> ProviderFuture<'_> {
             Box::pin(async move { Err(ProviderError::Parse("test error".into())) })
+        }
+
+        fn complete_with_tools(
+            &self,
+            model: &str,
+            messages: &[Message],
+            temperature: f32,
+            max_tokens: u32,
+            _tools: &[glitchlab_kernel::tool::ToolDefinition],
+            response_format: Option<&serde_json::Value>,
+        ) -> ProviderFuture<'_> {
+            self.complete(model, messages, temperature, max_tokens, response_format)
         }
     }
 
@@ -706,6 +730,18 @@ mod tests {
                     retry_after_ms: Some(1),
                 })
             })
+        }
+
+        fn complete_with_tools(
+            &self,
+            model: &str,
+            messages: &[Message],
+            temperature: f32,
+            max_tokens: u32,
+            _tools: &[glitchlab_kernel::tool::ToolDefinition],
+            response_format: Option<&serde_json::Value>,
+        ) -> ProviderFuture<'_> {
+            self.complete(model, messages, temperature, max_tokens, response_format)
         }
     }
 
