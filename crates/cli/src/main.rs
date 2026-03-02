@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 mod commands;
 #[cfg(test)]
 mod main_test;
+mod paths;
 
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
@@ -32,9 +33,9 @@ struct Cli {
 enum Commands {
     /// Run a single task
     Run {
-        /// Path to the target repository
+        /// Path to the target repository (absolute or sibling directory name)
         #[arg(long)]
-        repo: PathBuf,
+        repo: String,
 
         /// GitHub issue number
         #[arg(long)]
@@ -133,8 +134,8 @@ enum Commands {
 
     /// Initialize GLITCHLAB in a repository
     Init {
-        /// Path to the repository to initialize
-        path: PathBuf,
+        /// Path to the repository to initialize (absolute or sibling directory name)
+        path: String,
     },
 
     /// Check configuration, API keys, and tools
@@ -191,6 +192,7 @@ async fn main() -> Result<()> {
             verbose,
         } => {
             commands::setup_logging(verbose);
+            let repo = paths::resolve_repo_path(&repo);
             commands::run::execute(commands::run::RunArgs {
                 repo: &repo,
                 issue,
@@ -237,7 +239,7 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Commands::Init { path } => commands::init::execute(&path).await,
+        Commands::Init { path } => commands::init::execute(&paths::resolve_repo_path(&path)).await,
         Commands::Status { repo } => commands::status::execute(repo.as_deref()).await,
         Commands::History { repo, count, stats } => {
             commands::history::execute(&repo, count, stats).await
