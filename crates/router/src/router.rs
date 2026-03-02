@@ -1144,6 +1144,33 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn complete_with_tools_uses_chooser() {
+        let routing = HashMap::from([("planner".to_string(), "mock/fallback".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+
+        // The chooser will select "mock/mid" (Standard tier, cheapest eligible for planner).
+        // The provider name extracted from "mock/mid" is "mock", which is registered below.
+        let mut router = Router::new(routing, budget).with_chooser(test_chooser());
+        router.register_provider("mock".into(), Arc::new(MockToolProvider::with_tool_call()));
+
+        let result = router
+            .complete_with_tools(
+                "planner",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        // The chooser-selected model should be used, not the static fallback.
+        assert_eq!(response.model, "mock/test-model");
+        assert_eq!(response.tool_calls.len(), 1);
+    }
+
     // -----------------------------------------------------------------------
     // with_providers / create_provider tests
     // -----------------------------------------------------------------------
