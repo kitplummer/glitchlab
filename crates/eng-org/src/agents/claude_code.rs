@@ -233,18 +233,10 @@ impl ClaudeCodeImplementer {
         // Try stdout first, fall back to stderr.
         // Claude Code >=2.x may emit the JSON envelope on stderr
         // when --print --output-format json are combined.
-        let json_source = if stdout.trim().is_empty()
-            || serde_json::from_str::<ClaudeCodeResult>(&stdout).is_err()
-        {
-            if !stderr.trim().is_empty() {
-                info!("stdout empty or unparseable, trying stderr for JSON envelope");
-                &stderr
-            } else {
-                &stdout
-            }
-        } else {
-            &stdout
-        };
+        let json_source = select_json_source(&stdout, &stderr);
+        if std::ptr::addr_eq(json_source as *const str, stderr.as_str() as *const str) {
+            info!("stdout empty or unparseable, using stderr for JSON envelope");
+        }
 
         // Parse the JSON result. Claude --print --output-format json emits
         // a single JSON object on stdout (or stderr in some versions).
@@ -293,15 +285,10 @@ impl Agent for ClaudeCodeImplementer {
                 "claude code reported an error"
             );
             return Ok(AgentOutput {
-                data: serde_json::json!({
-                    "files_changed": [],
-                    "tests_added": [],
-                    "tests_passing": false,
-                    "commit_message": "chore: no changes produced",
-                    "summary": format!("Claude Code error: {}", &result.result),
-                    "stuck": true,
-                    "stuck_reason": "consecutive_errors",
-                }),
+                data: build_error_output(
+                    &format!("Claude Code error: {}", &result.result),
+                    "model_limitation",
+                ),
                 metadata,
                 parse_error: true,
             });
@@ -326,15 +313,10 @@ impl Agent for ClaudeCodeImplementer {
                     );
                     detected
                 }
-                None => serde_json::json!({
-                    "files_changed": [],
-                    "tests_added": [],
-                    "tests_passing": false,
-                    "commit_message": "chore: no changes produced",
-                    "summary": "Claude Code budget exhausted with no file changes",
-                    "stuck": true,
-                    "stuck_reason": "budget_exhausted",
-                }),
+                None => build_error_output(
+                    "Claude Code budget exhausted with no file changes",
+                    "budget_exhaustion",
+                ),
             };
             let parse_error = !data
                 .get("tests_passing")
@@ -370,13 +352,10 @@ impl Agent for ClaudeCodeImplementer {
                 None => {
                     warn!("no file changes detected in worktree either");
                     (
-                        serde_json::json!({
-                            "files_changed": [],
-                            "tests_added": [],
-                            "tests_passing": false,
-                            "commit_message": "chore: no changes produced",
-                            "summary": "Claude Code produced no output and no file changes"
-                        }),
+                        build_error_output(
+                            "Claude Code produced no output and no file changes",
+                            "parse_failure",
+                        ),
                         true,
                     )
                 }
@@ -387,17 +366,10 @@ impl Agent for ClaudeCodeImplementer {
                 result_preview = %raw_preview,
                 "could not extract implementer JSON from claude code result"
             );
-            (
-                serde_json::json!({
-                    "files_changed": [],
-                    "tests_added": [],
-                    "tests_passing": false,
-                    "commit_message": "chore: no changes produced",
-                    "summary": "Failed to parse Claude Code output",
-                    "_raw_output_preview": raw_preview,
-                }),
-                true,
-            )
+            let mut data =
+                build_error_output("Failed to parse Claude Code output", "parse_failure");
+            data["_raw_output_preview"] = serde_json::json!(raw_preview);
+            (data, true)
         };
 
         info!(
@@ -414,6 +386,43 @@ impl Agent for ClaudeCodeImplementer {
             parse_error,
         })
     }
+}
+
+/// Choose which output stream contains the JSON envelope from `claude --print`.
+///
+/// Claude Code may emit the JSON result on stdout or stderr depending on the
+/// version. Strategy:
+/// - If stdout is non-empty and parses as a valid `ClaudeCodeResult`, use it.
+/// - Otherwise fall back to stderr if stderr is non-empty (Claude Code ≥2.x).
+/// - If both are empty/invalid, return stdout (the caller handles the parse error).
+pub(crate) fn select_json_source<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {
+    let stdout_parseable =
+        !stdout.trim().is_empty() && serde_json::from_str::<ClaudeCodeResult>(stdout).is_ok();
+    if stdout_parseable {
+        stdout
+    } else if !stderr.trim().is_empty() {
+        stderr
+    } else {
+        stdout
+    }
+}
+
+/// Build the fallback `AgentOutput.data` JSON for error / stuck conditions.
+///
+/// The `obstacle_kind` string must match a
+/// `glitchlab_kernel::outcome::ObstacleKind` serde tag (e.g.
+/// `"model_limitation"`, `"budget_exhaustion"`, `"parse_failure"`).
+fn build_error_output(summary: &str, obstacle_kind: &str) -> serde_json::Value {
+    serde_json::json!({
+        "files_changed": [],
+        "tests_added": [],
+        "tests_passing": false,
+        "commit_message": "chore: no changes produced",
+        "summary": summary,
+        "obstacle_kind": obstacle_kind,
+        "stuck": true,
+        "stuck_reason": obstacle_kind,
+    })
 }
 
 /// Extract the implementer's JSON output from Claude Code's result text.
@@ -890,6 +899,90 @@ All tests pass."#;
         let result: ClaudeCodeResult = serde_json::from_str(json).unwrap();
         assert!(result.is_error);
         assert_eq!(result.result, "An error occurred");
+    }
+
+    // ------------------------------------------------------------------
+    // select_json_source
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn select_json_source_prefers_valid_stdout() {
+        let valid_stdout =
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        let stderr = r#"{"type":"result","subtype":"success","is_error":false,"result":"stderr"}"#;
+        assert_eq!(select_json_source(valid_stdout, stderr), valid_stdout);
+    }
+
+    #[test]
+    fn select_json_source_falls_back_to_stderr_when_stdout_invalid() {
+        let stdout = "not json at all";
+        let stderr = r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        assert_eq!(select_json_source(stdout, stderr), stderr);
+    }
+
+    #[test]
+    fn select_json_source_falls_back_to_stderr_when_stdout_empty() {
+        let stdout = "   ";
+        let stderr = r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        assert_eq!(select_json_source(stdout, stderr), stderr);
+    }
+
+    #[test]
+    fn select_json_source_uses_stdout_when_both_unparseable() {
+        // Neither stream has valid JSON; function should return stdout (caller handles error).
+        assert_eq!(select_json_source("not json", ""), "not json");
+    }
+
+    #[test]
+    fn select_json_source_uses_stdout_when_both_empty() {
+        assert_eq!(select_json_source("", ""), "");
+    }
+
+    // ------------------------------------------------------------------
+    // parse_implementer_json — bare code fence (Strategy 2b)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_bare_code_fence() {
+        let input = concat!(
+            "Result:\n",
+            "```\n",
+            r#"{"files_changed":["a.rs"],"tests_added":[],"tests_passing":true,"commit_message":"feat","summary":"done"}"#,
+            "\n```"
+        );
+        let result = parse_implementer_json(input).unwrap();
+        assert_eq!(result["files_changed"][0], "a.rs");
+        assert_eq!(result["tests_passing"], true);
+    }
+
+    // ------------------------------------------------------------------
+    // build_error_output
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_error_output_model_limitation() {
+        let data = build_error_output("some model error", "model_limitation");
+        assert_eq!(data["obstacle_kind"], "model_limitation");
+        assert_eq!(data["tests_passing"], false);
+        assert!(data["stuck"].as_bool().unwrap());
+        assert!(data["files_changed"].as_array().unwrap().is_empty());
+        assert_eq!(data["stuck_reason"], "model_limitation");
+    }
+
+    #[test]
+    fn build_error_output_budget_exhaustion() {
+        let data = build_error_output("budget hit", "budget_exhaustion");
+        assert_eq!(data["obstacle_kind"], "budget_exhaustion");
+        assert_eq!(data["stuck_reason"], "budget_exhaustion");
+        assert_eq!(data["commit_message"], "chore: no changes produced");
+    }
+
+    #[test]
+    fn build_error_output_parse_failure() {
+        let data = build_error_output("could not parse output", "parse_failure");
+        assert_eq!(data["obstacle_kind"], "parse_failure");
+        assert_eq!(data["summary"], "could not parse output");
+        assert!(data["tests_added"].as_array().unwrap().is_empty());
     }
 
     fn test_context() -> AgentContext {
