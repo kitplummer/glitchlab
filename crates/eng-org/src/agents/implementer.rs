@@ -12,7 +12,7 @@ use super::{StuckReason, ToolLoopOutcome, ToolLoopParams, tool_use_loop};
 use crate::agents::RouterRef;
 use crate::tools::{ToolDispatcher, tool_definitions, tool_definitions_no_list};
 
-fn system_prompt(max_turns: u32, has_file_context: bool) -> String {
+fn system_prompt(max_turns: u32, has_file_context: bool, exclude_list_files: bool) -> String {
     let file_context_rule = if has_file_context {
         "\n\nCRITICAL — The user message contains a \"Relevant File Contents\" section with \
          pre-loaded file contents. These files are ALREADY in your context. \
@@ -21,6 +21,12 @@ fn system_prompt(max_turns: u32, has_file_context: bool) -> String {
          in that section."
     } else {
         ""
+    };
+
+    let list_files_tool = if exclude_list_files {
+        ""
+    } else {
+        "- `list_files` — List files matching a glob. Only use if the Module Map doesn't already\n  answer your question.\n"
     };
 
     format!(
@@ -53,9 +59,7 @@ Your context is assembled in priority order. Use the HIGHEST priority source ava
 - `read_file` — Read a file NOT already in Relevant File Contents. Supports optional
   `start_line` and `end_line` for ranges (1-based, inclusive). For large files (>200
   lines), you MUST use line ranges from the plan's read hints.
-- `list_files` — List files matching a glob. Only use if the Module Map doesn't already
-  answer your question.
-- `write_file` — Create or overwrite a file.
+{list_files_tool}- `write_file` — Create or overwrite a file.
 - `edit_file` — Replace an exact string in a file. The `old_string` must be a UNIQUE,
   EXACT match (copy it from pre-loaded content or `read_file` output).
 - `run_command` — Run a shell command. Allowed: build, test, lint, git, and read-only
@@ -164,7 +168,11 @@ impl Agent for ImplementerAgent {
         let mut messages = vec![
             Message {
                 role: MessageRole::System,
-                content: MessageContent::Text(system_prompt(self.max_tool_turns, has_file_context)),
+                content: MessageContent::Text(system_prompt(
+                    self.max_tool_turns,
+                    has_file_context,
+                    self.exclude_list_files,
+                )),
             },
             Message {
                 role: MessageRole::User,
@@ -283,7 +291,7 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_turn_count() {
-        let prompt = system_prompt(15, false);
+        let prompt = system_prompt(15, false, false);
         assert!(
             prompt.contains("15 tool-call turns"),
             "prompt should embed the turn count"
@@ -308,7 +316,7 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_context_hierarchy() {
-        let prompt = system_prompt(10, true);
+        let prompt = system_prompt(10, true, false);
         assert!(
             prompt.contains("Context hierarchy"),
             "prompt should have context hierarchy section"
@@ -329,7 +337,7 @@ mod tests {
 
     #[test]
     fn system_prompt_without_file_context_omits_critical_warning() {
-        let prompt = system_prompt(10, false);
+        let prompt = system_prompt(10, false, false);
         assert!(
             !prompt.contains("Do NOT call `read_file` on any file listed there"),
             "no-context prompt should not have the critical file context warning"
@@ -338,7 +346,7 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_module_map_hint() {
-        let prompt = system_prompt(10, false);
+        let prompt = system_prompt(10, false, false);
         assert!(
             prompt.contains("Rust Module Map"),
             "prompt should reference Rust Module Map"
@@ -351,7 +359,7 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_tdd_workflow() {
-        let prompt = system_prompt(10, false);
+        let prompt = system_prompt(10, false, false);
         assert!(
             prompt.contains("Write tests first"),
             "prompt should enforce test-first ordering"
@@ -368,7 +376,7 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_read_hints() {
-        let prompt = system_prompt(10, false);
+        let prompt = system_prompt(10, false, false);
         assert!(
             prompt.contains("MUST use line ranges from the plan's read hints"),
             "prompt should enforce read hints for large files"
@@ -377,7 +385,7 @@ mod tests {
 
     #[test]
     fn system_prompt_contains_red_green() {
-        let prompt = system_prompt(10, false);
+        let prompt = system_prompt(10, false, false);
         assert!(
             prompt.contains("MUST fail"),
             "prompt should require red phase"
@@ -389,6 +397,44 @@ mod tests {
         assert!(
             prompt.contains("tests_passing"),
             "prompt schema should include tests_passing"
+        );
+    }
+
+    #[test]
+    fn without_list_files_excludes_list_files_from_system_prompt() {
+        let prompt = system_prompt(10, false, true);
+        assert!(
+            !prompt.contains("- `list_files` —"),
+            "system prompt should not list list_files as a tool when excluded"
+        );
+    }
+
+    #[test]
+    fn with_list_files_includes_list_files_in_system_prompt() {
+        let prompt = system_prompt(10, false, false);
+        assert!(
+            prompt.contains("- `list_files` —"),
+            "system prompt should include list_files tool when not excluded"
+        );
+    }
+
+    #[test]
+    fn without_list_files_is_chainable() {
+        let agent = make_agent(mock_router_ref()).without_list_files();
+        assert_eq!(
+            agent.role(),
+            "implementer",
+            "without_list_files() should return a valid ImplementerAgent"
+        );
+    }
+
+    #[test]
+    fn cache_hit_count_starts_at_zero() {
+        let agent = make_agent(mock_router_ref());
+        assert_eq!(
+            agent.cache_hit_count(),
+            0,
+            "cache hit count should start at zero"
         );
     }
 
