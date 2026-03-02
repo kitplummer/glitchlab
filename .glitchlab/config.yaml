@@ -79,6 +79,8 @@ memory:
 tqm:
   remediation_enabled: true
   remediation_priority: 2
+  max_open_remediation: 10
+  max_new_per_run: 3
 
 pipeline:
   short_circuit_enabled: true
@@ -91,6 +93,7 @@ review:
   auto_close: true
   auto_reprioritize: true
   confidence_threshold: 0.8
+  stale_threshold_days: 14
 
 watch:
   enabled: true
