@@ -26,19 +26,9 @@ tasks:
     (3) PartialEq equality and inequality. This is a 1-file, ~4-edit change.
     Use `read_file` to read lines 60-120 of `chooser.rs`.
   priority: 10
-  status: failed
+  status: completed
   depends_on: []
   decomposition_depth: 0
-  error: 'budget exceeded: token limit exceeded: 80318 / 73590 tokens used'
-  outcome_context:
-    approach: direct implementation
-    obstacle:
-      kind: model_limitation
-      model: unknown
-      error_class: budget_exceeded
-    discoveries: []
-    recommendation: Try a different implementation approach or simpler plan
-    files_explored: []
   remediation_depth: 0
   is_remediation: false
 - id: canary-size-l-provider-error-diagnostics
@@ -89,19 +79,9 @@ tasks:
 - id: add-model-profile-display-part1
   objective: Implement the `Display` trait for the `ModelProfile` struct.
   priority: 50
-  status: failed
+  status: pending
   depends_on: []
   decomposition_depth: 1
-  error: 'budget exceeded: token limit exceeded: 75028 / 65000 tokens used'
-  outcome_context:
-    approach: direct implementation
-    obstacle:
-      kind: model_limitation
-      model: unknown
-      error_class: budget_exceeded
-    discoveries: []
-    recommendation: Try a different implementation approach or simpler plan
-    files_explored: []
   remediation_depth: 0
   is_remediation: false
   files_hint:
@@ -156,19 +136,9 @@ tasks:
 - id: add-router-tracing-part1-setup-and-metrics-struct
   objective: Add `tracing` dependency to `glitchlab-router`'s `Cargo.toml` and define the `RouterMetrics` struct in `router.rs` to aggregate call count, total tokens, total cost, and average latency.
   priority: 50
-  status: failed
+  status: pending
   depends_on: []
   decomposition_depth: 1
-  error: 'budget exceeded: token limit exceeded: 73559 / 65000 tokens used'
-  outcome_context:
-    approach: direct implementation
-    obstacle:
-      kind: model_limitation
-      model: unknown
-      error_class: budget_exceeded
-    discoveries: []
-    recommendation: Try a different implementation approach or simpler plan
-    files_explored: []
   remediation_depth: 0
   is_remediation: false
   files_hint:
@@ -221,19 +191,9 @@ tasks:
 - id: circuit-fix-0-e72b8892
   objective: Investigate and potentially update the models used in the 'canary-size-m-role-preference-derives' task. Check for any known limitations or parsing errors specific to this model's application.
   priority: 2
-  status: failed
+  status: completed
   depends_on: []
   decomposition_depth: 0
-  error: 'budget exceeded: token limit exceeded: 99997 / 71213 tokens used'
-  outcome_context:
-    approach: direct implementation
-    obstacle:
-      kind: model_limitation
-      model: unknown
-      error_class: budget_exceeded
-    discoveries: []
-    recommendation: Try a different implementation approach or simpler plan
-    files_explored: []
   remediation_depth: 1
   is_remediation: true
 - id: circuit-fix-1-45fcb436
@@ -256,19 +216,9 @@ tasks:
 - id: add-model-profile-display-part1-sub1-define-struct
   objective: Define a new `ModelProfile` data structure to encapsulate model-specific information (e.g., capabilities, cost, latency). Integrate this into the `Provider` trait or related structs in `crates/router`.
   priority: 50
-  status: failed
+  status: pending
   depends_on: []
   decomposition_depth: 1
-  error: 'budget exceeded: token limit exceeded: 65212 / 65000 tokens used'
-  outcome_context:
-    approach: direct implementation
-    obstacle:
-      kind: model_limitation
-      model: unknown
-      error_class: budget_exceeded
-    discoveries: []
-    recommendation: Try a different implementation approach or simpler plan
-    files_explored: []
   remediation_depth: 0
   is_remediation: false
   files_hint:
@@ -298,3 +248,1838 @@ tasks:
   is_remediation: false
   files_hint:
   - crates/router/src/provider_diagnostics.rs
+- id: gl-canary-size-m-role-preference-derives-part1-investigate-chooser
+  objective: Understand the definition and usage of `RolePreference` within the `ModelChooser` logic, and how it influences model selection based on capabilities.
+  priority: 50
+  status: pending
+  depends_on: []
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: gl-canary-size-m-role-preference-derives-part2-investigate-config
+  objective: Investigate how model routing configuration, including `RolePreference` settings and agent-specific model assignments, is loaded and applied from `EngConfig`.
+  priority: 50
+  status: pending
+  depends_on:
+  - canary-size-m-role-preference-derives-part1-investigate-chooser
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/config.rs
+- id: gl-canary-size-m-role-preference-derives-part3-analyze-limitations
+  objective: Analyze the current model selection process for potential limitations or parsing errors, specifically regarding tool-calling capabilities for agents like the Implementer, based on the findings from previous steps and the `README.md`.
+  priority: 50
+  status: pending
+  depends_on:
+  - canary-size-m-role-preference-derives-part2-investigate-config
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+  - crates/eng-org/src/config.rs
+- id: gl-adr-agentic-corporation-framework-define-org-construct
+  objective: |-
+    Define the core 'Org' construct
+
+    Implement the `Org` struct or equivalent data structure that encapsulates the six properties: Agents, Tools, Leader, Pipeline, Governance, and Memory, as described in the ADR.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/org.rs
+- id: gl-adr-agentic-corporation-framework-implement-ceo-layer
+  objective: |-
+    Implement the CEO layer
+
+    Develop the CEO layer as an org whose 'tools' are other orgs. This layer should handle decomposing high-level objectives, allocating budget, tracking cross-org progress, and escalating issues.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/ceo.rs
+  - src/org.rs
+- id: gl-adr-agentic-corporation-framework-integrate-zephyr-governance
+  objective: |-
+    Integrate Zephyr as the governance substrate
+
+    Ensure Zephyr is deeply integrated to provide per-org, per-agent, and per-context tool permissions, blast radius controls, autonomy level settings, credential access, and audit trails.
+  priority: 0
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/governance.rs
+  - src/org.rs
+- id: gl-adr-agentic-corporation-framework-integrate-beads-and-dolt-memory
+  objective: |-
+    Integrate Beads and Dolt for institutional memory
+
+    Implement the integration of Beads for task graphs and institutional knowledge, and Dolt for versioned, queryable state, ensuring org-scoped memory and shared company-wide tables.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/memory.rs
+  - src/org.rs
+- id: gl-adr-agentic-corporation-framework-implement-inter-org-communication
+  objective: |-
+    Implement inter-org communication mechanisms
+
+    Develop the hybrid communication model using Dolt for source of truth, Beads for coordination, and events for reactivity between organizations.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/communication.rs
+- id: gl-adr-agentic-corporation-framework-phase-0-glitchlab-reliability
+  objective: |-
+    Ensure GLITCHLAB runs reliably
+
+    Validate that the existing GLITCHLAB engineering org functions reliably, including tests, end-to-end validation, and CI processes, as a prerequisite for further development.
+  priority: 0
+  status: failed
+  depends_on: []
+  decomposition_depth: 0
+  error: pipeline exceeded wall-clock timeout of 600s
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/lib.rs
+  - crates/eng-org/src/lib.rs
+- id: gl-adr-agentic-corporation-framework-phase-1-integrate-memory-layer
+  objective: |-
+    Integrate Beads and Dolt for institutional memory
+
+    Implement Phase 1 of the build plan: integrate Beads and Dolt for institutional memory across sessions.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/memory.rs
+- id: gl-adr-agentic-corporation-framework-phase-2-integrate-governance-substrate
+  objective: |-
+    Integrate Zephyr as governance substrate
+
+    Implement Phase 2 of the build plan: integrate Zephyr as the governance substrate beyond GLITCHLAB's built-in boundaries.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/governance.rs
+- id: gl-adr-agentic-corporation-framework-phase-3-stand-up-ops-org-option-a
+  objective: |-
+    Stand up Ops org for LowEndInsight (Option A)
+
+    Implement Phase 3: stand up the Operations org as a second GLITCHLAB instance with different configuration to discover seams between engineering-specific and general patterns.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/lib.rs
+  - crates/eng-org/src/lib.rs
+  - src/org.rs
+- id: gl-adr-agentic-corporation-framework-phase-4-stand-up-finance-org
+  objective: |-
+    Stand up Finance org
+
+    Implement Phase 4: stand up the Finance org, including token ledger in Dolt and metering, to validate cross-org state and budget flow.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/org.rs
+  - src/memory.rs
+- id: gl-adr-agentic-corporation-framework-phase-5-implement-ceo-layer
+  objective: |-
+    Implement CEO layer for cross-org coordination
+
+    Implement Phase 5: build the CEO layer to handle cross-org routing, budget allocation, and progress tracking.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/ceo.rs
+- id: gl-adr-agentic-corporation-framework-phase-6-kernel-extraction
+  objective: |-
+    Extract kernel for modular orgs
+
+    Implement Phase 6: refactor the framework based on seams discovered in Phases 3-5 to enable modular org registration with the kernel.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/kernel.rs
+  - src/org.rs
+- id: gl-adr-agentic-corporation-framework-phase-7-gtm-org-external-product
+  objective: |-
+    Stand up GTM org for external product
+
+    Implement Phase 7: stand up the GTM org for LowEndInsight as the first external product, covering the full lifecycle of build, deploy, sell, and support.
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - src/org.rs
+  - src/ceo.rs
+- id: gl-adr-agentic-corporation-framework-decide-event-bus-implementation
+  objective: |-
+    Decide on event bus implementation
+
+    Make a decision on the event bus implementation (in-process pub/sub, Redis Streams, Dolt triggers, Beads graph polling) for real-time cross-org signals.
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-agentic-corporation-framework-decide-dolt-schema-design
+  objective: |-
+    Decide on Dolt schema design
+
+    Make a decision on the Dolt schema design (per-org schemas vs. shared schema with row-level org scoping).
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-agentic-corporation-framework-decide-beads-namespace-isolation
+  objective: |-
+    Decide on Beads namespace isolation
+
+    Make a decision on Beads namespace isolation (per-org Beads instances vs. shared instance with namespace tagging).
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-agentic-corporation-framework-decide-ceo-agent-model
+  objective: |-
+    Decide on CEO agent model
+
+    Make a decision on the CEO agent model (deterministic router vs. LLM agent vs. human-only).
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-agentic-corporation-framework-decide-multi-tenancy
+  objective: |-
+    Decide on multi-tenancy strategy
+
+    Make a decision on the multi-tenancy strategy (single-tenant vs. multi-tenant marketplace).
+  priority: 4
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-agentic-corporation-framework-decide-token-settlement
+  objective: |-
+    Decide on token settlement mechanism
+
+    Make a decision on the token settlement mechanism (internal accounting only vs. fiat conversion).
+  priority: 4
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-aggressive-task-decomposition-update-config-token-limit
+  objective: |-
+    Set max_tokens_per_task to 30000
+
+    Update the `.glitchlab/config.yaml` file to set the `limits.max_tokens_per_task` to 30000.
+  priority: 0
+  status: failed
+  depends_on: []
+  decomposition_depth: 0
+  error: 'objective references protected path(s): .glitchlab/config.yaml'
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - .glitchlab/config.yaml
+- id: gl-adr-aggressive-task-decomposition-update-planner-prompt-decomposition-rules
+  objective: |-
+    Tighten planner decomposition rules
+
+    Update the planner system prompt to include stricter decomposition rules: decompose on 2+ files, 3+ steps, or target files >150 lines. Also, enforce that sub-tasks touch exactly 1 file (or 1 file + test file), require 1-2 edits, and are completable within ~5 tool turns.
+  priority: 0
+  status: completed
+  depends_on: []
+  decomposition_depth: 0
+  pr_url: https://github.com/kitplummer/glitchlab/pull/109
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - planner_system_prompt.txt
+- id: gl-adr-aggressive-task-decomposition-update-planner-schema-add-files-likely-affected
+  objective: |-
+    Add files_likely_affected to planner sub-task schema
+
+    Modify the JSON schema used by the planner for decomposition output to include the `files_likely_affected` array for each sub-task.
+  priority: 0
+  status: in_progress
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - planner_schema.json
+- id: gl-adr-aggressive-task-decomposition-update-orchestrator-propagate-files-likely-affected
+  objective: |-
+    Propagate files_likely_affected from planner to sub-tasks
+
+    Update the `extract_sub_tasks()` function in `orchestrator.rs` to store the `files_likely_affected` array from the planner's output onto the created sub-task metadata.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/orchestrator/src/orchestrator.rs
+- id: gl-adr-aggressive-task-decomposition-implement-max-tool-turns-enforcement
+  objective: |-
+    Enforce max_tool_turns in implementer loop
+
+    Modify the implementer's tool-use loop to include a hard stop when the `max_tool_turns` limit (derived from the new token budget) is reached, preventing runaway loops.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/implementer/src/implementer.rs
+- id: gl-adr-aggressive-task-decomposition-run-canary-validation
+  objective: |-
+    Run canary to validate new decomposition strategy
+
+    Execute a canary run with the new configuration and planner rules to validate the effectiveness of the aggressive decomposition strategy, monitoring success rates, token usage, and failure modes.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-claude-code-implementer-add-claude-code-implementer-agent
+  objective: |-
+    Implement ClaudeCodeImplementer agent
+
+    Create a new `ClaudeCodeImplementer` struct that implements the `Agent` trait. This agent will be responsible for invoking the `claude --print` CLI with the appropriate prompt and parameters.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/pipeline/src/agents/implementer/claude_code.rs
+- id: gl-adr-claude-code-implementer-configure-pipeline-to-use-claude-code
+  objective: |-
+    Add config flag for Claude Code implementer
+
+    Introduce a configuration flag (e.g., `pipeline.use_claude_code_implementer`) to enable or disable the `ClaudeCodeImplementer` backend. Update the pipeline's agent selection logic to use this flag.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/pipeline/src/pipeline.rs
+  - crates/eng-org/src/config.rs
+- id: gl-adr-claude-code-implementer-parse-claude-cli-output
+  objective: |-
+    Parse Claude Code CLI JSON output
+
+    Implement robust parsing for the JSON output of the `claude --print` command, specifically extracting the implementer's summary JSON and cost information.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/pipeline/src/agents/implementer/claude_code.rs
+- id: gl-adr-claude-code-implementer-integrate-claude-cost-tracking
+  objective: |-
+    Integrate Claude Code cost reporting
+
+    Ensure that the cost reported by Claude Code (in USD) is correctly captured and fed into the pipeline's overall budget tracking system.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/pipeline/src/agents/implementer/claude_code.rs
+  - crates/pipeline/src/budget_tracker.rs
+- id: gl-adr-claude-code-implementer-adjust-budget-gates-for-claude
+  objective: |-
+    Adjust pipeline budget gates for Claude Code
+
+    Review and adjust the pipeline's budget gates to accommodate the potentially higher cost per task of Claude Code, considering its larger context window and improved success rate.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/pipeline/src/budget_tracker.rs
+- id: gl-adr-claude-code-implementer-update-tool-governance-for-claude
+  objective: |-
+    Configure Claude Code's allowed tools
+
+    Implement the `--allowedTools` flag when invoking Claude Code CLI to restrict its operations to safe actions (Read, Edit, Write, Bash(cargo:*), Bash(git diff:*), Glob, Grep), mirroring GLITCHLAB's existing tool governance.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/pipeline/src/agents/implementer/claude_code.rs
+- id: gl-adr-claude-code-implementer-add-claude-cli-dependency
+  objective: |-
+    Add Claude CLI as a runtime dependency
+
+    Document and ensure the `claude` CLI binary is installed and accessible in the runtime environment where the pipeline executes. This may involve updating Dockerfiles or deployment scripts.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - Dockerfile
+  - scripts/setup.sh
+- id: gl-adr-claude-code-implementer-validate-claude-code-subprocess-integration
+  objective: |-
+    Validate Claude Code subprocess integration
+
+    Perform canary runs to validate the successful integration of Claude Code as a subprocess implementer, focusing on parsing output, cost tracking, and budget adherence.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/pipeline/src/agents/implementer/claude_code.rs
+  - crates/pipeline/src/pipeline.rs
+- id: gl-adr-context-evaluation-lifecycle-implement-context-manifest-generation
+  objective: |-
+    Implement context manifest generation CLI
+
+    Add a `glitchlab context manifest` CLI command that generates a machine-readable summary of the assembled context for each agent role by dry-running `ContextAssembler::assemble()`.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/glitchlab/src/cli/context.rs
+  - crates/context_assembler/src/lib.rs
+- id: gl-adr-context-evaluation-lifecycle-define-context-scenario-struct-and-schema
+  objective: |-
+    Define ContextScenario struct and YAML schema
+
+    Define the `ContextScenario` struct in Rust and a corresponding YAML schema for storing context scenarios, including fields for name, role, frozen context, and expectations.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/context_evaluator/src/lib.rs
+  - crates/glitchlab/scenarios/schema.yaml
+- id: gl-adr-context-evaluation-lifecycle-implement-context-scenario-runner
+  objective: |-
+    Implement context scenario evaluation runner
+
+    Develop the `glitchlab context eval` CLI command to execute defined context scenarios against the current system configuration, reporting pass/fail status based on statistical thresholds.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/glitchlab/src/cli/context.rs
+  - crates/context_evaluator/src/runner.rs
+- id: gl-adr-context-evaluation-lifecycle-add-initial-context-scenarios
+  objective: |-
+    Add initial context scenarios for core agent roles
+
+    Create and commit at least one context scenario for each core agent role (planner, implementer, architect) to the repository, covering critical behaviors.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - .glitchlab/scenarios/
+- id: gl-adr-context-evaluation-lifecycle-implement-context-drift-detection
+  objective: |-
+    Implement context drift detection mechanism
+
+    Store `ScenarioResult` metrics over time and implement threshold-based detection for context drift signals (token inflation, decomposition shift, latency regression, pass rate degradation).
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/context_evaluator/src/drift_detector.rs
+  - crates/history_backend/src/lib.rs
+- id: gl-adr-context-evaluation-lifecycle-integrate-context-drift-into-tqm
+  objective: |-
+    Integrate context drift detection into TQM
+
+    Wire the context drift detection mechanism to emit new TQM patterns of type `ContextDrift`, allowing these issues to be surfaced and managed within the existing TQM system.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/tqm/src/lib.rs
+  - crates/context_evaluator/src/drift_detector.rs
+- id: gl-adr-context-evaluation-lifecycle-formalize-context-packages
+  objective: |-
+    Formalize context packages for cross-org dependency
+
+    Define and document the structure of a 'context package' (config + scenarios + manifest) as the versioned unit for cross-organizational context dependencies.
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - .glitchlab/README.md
+  - docs/adr/context-packages.md
+- id: gl-adr-context-evaluation-lifecycle-refine-scenario-expectations-based-on-phase1-results
+  objective: |-
+    Refine scenario expectations based on Phase 1 results
+
+    After Phase 1 (implementing scenarios), revisit the `Expectation` types and statistical thresholds based on observed results and the need for signal granularity versus cost.
+  priority: 4
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/context_evaluator/src/lib.rs
+- id: gl-adr-context-evaluation-lifecycle-develop-auto-scenario-generation-prototype
+  objective: |-
+    Develop prototype for auto-scenario generation
+
+    Build a prototype system that can automatically generate new context scenarios from successful production batch runs, potentially involving the Archivist agent.
+  priority: 4
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/context_evaluator/src/auto_generator.rs
+  - crates/archivist/src/lib.rs
+- id: gl-adr-cost-aware-model-routing-define-model-profile-struct
+  objective: |-
+    Define ModelProfile struct
+
+    Define the `ModelProfile` struct in the router crate to hold model metadata including `model_string`, `input_cost_per_m`, `output_cost_per_m`, `capabilities`, and `tier`.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-define-model-tier-enum
+  objective: |-
+    Define ModelTier enum
+
+    Define the `ModelTier` enum (Economy, Standard, Premium) to categorize models based on their cost and capability.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-define-role-preference-struct
+  objective: |-
+    Define RolePreference struct
+
+    Define the `RolePreference` struct to capture per-role requirements like `min_tier` and `requires` capabilities.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-define-model-chooser-struct
+  objective: |-
+    Define ModelChooser struct
+
+    Define the `ModelChooser` struct to manage available models, role preferences, and the global cost-quality threshold.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-implement-model-chooser-config-parsing
+  objective: |-
+    Implement ModelChooser configuration parsing
+
+    Implement logic to parse the `routing.models` and `routing.roles` sections from the configuration file into `ModelProfile` and `RolePreference` data structures.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/config.rs
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-implement-model-chooser-selection-logic
+  objective: |-
+    Implement ModelChooser selection logic
+
+    Implement the core selection logic within `ModelChooser::select` to filter models by capabilities, apply role preferences, consider budget, and select the cheapest eligible model.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-integrate-model-chooser-into-router
+  objective: |-
+    Integrate ModelChooser into Router
+
+    Modify the `Router::complete` and `Router::complete_with_tools` methods to use the `ModelChooser` for dynamic model selection instead of the static `role → model` map.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+- id: gl-adr-cost-aware-model-routing-implement-budget-pressure-logic
+  objective: |-
+    Implement budget pressure logic
+
+    Add logic to the `ModelChooser` to dynamically bias selection towards cheaper models as the remaining budget depletes, based on the `cost_quality_threshold`.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-implement-cascade-fallback-for-tool-use
+  objective: |-
+    Implement cascade fallback for tool use
+
+    Implement the Tier 2 cascade pattern: if a model response for tool use has `parse_error: true`, fails validation, or contains refusal markers, escalate to the next eligible model in the ordered list.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-track-escalation-rates
+  objective: |-
+    Track escalation rates
+
+    Modify the history logging mechanism to record model escalations (e.g., when a fallback model is used due to quality failure) to gather data for Tier 3 and threshold tuning.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+  - crates/history/src/lib.rs
+- id: gl-adr-cost-aware-model-routing-add-fallback-behavior-to-config
+  objective: |-
+    Add fallback behavior to config
+
+    Allow configuration of fallback behavior (e.g., escalation strategy, max retries for cascade) within the routing configuration.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/config.rs
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-add-test-for-model-chooser-selection
+  objective: |-
+    Add unit tests for ModelChooser selection
+
+    Write unit tests for the `ModelChooser::select` method to verify its logic under various scenarios, including different role preferences, budgets, and model capabilities.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-add-test-for-budget-pressure-logic
+  objective: |-
+    Add unit tests for budget pressure logic
+
+    Write unit tests for the budget pressure logic in `ModelChooser` to ensure it correctly adjusts model selection based on remaining budget.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/chooser.rs
+- id: gl-adr-cost-aware-model-routing-add-test-for-cascade-fallback
+  objective: |-
+    Add unit tests for cascade fallback
+
+    Write unit tests for the cascade fallback mechanism to verify that it correctly escalates to alternative models when quality criteria are not met.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/router.rs
+- id: gl-adr-delivery-and-sre-ops-org-document-manual-deploy-process
+  objective: |-
+    Document the manual deploy process
+
+    Create a detailed document in `docs/runbook-lowendinsight-deploy.md` outlining the current manual deployment steps for LowEndInsight.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - docs/runbook-lowendinsight-deploy.md
+- id: gl-adr-delivery-and-sre-ops-org-implement-deploy-pipeline
+  objective: |-
+    Implement the deploy pipeline
+
+    Develop the triggered deploy pipeline, integrating `glitchlab ops deploy` to wrap Fly CLI commands, including pre-deploy checks, Oban drain wait, `fly deploy` with rolling strategy, health checks, and automated rollback on failure.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/lib.rs
+  - crates/ops-org/src/config.rs
+  - crates/ops-org/src/pipeline/deploy.rs
+- id: gl-adr-delivery-and-sre-ops-org-implement-maintenance-pipeline
+  objective: |-
+    Implement the maintenance pipeline
+
+    Develop the periodic maintenance pipeline for automated, read-only checks including health endpoints, TLS certificate expiry, Fly.io machine status, Postgres connection count, Redis connectivity, cost snapshots, and Oban queue depth.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/pipeline/maintenance.rs
+- id: gl-adr-delivery-and-sre-ops-org-implement-incident-pipeline
+  objective: |-
+    Implement the incident pipeline
+
+    Develop the reactive incident pipeline, including alert classification, diagnosis, response (scaling, restarts), and postmortem bead creation. This pipeline will be triggered by anomalies detected by the maintenance pipeline.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/pipeline/incident.rs
+- id: gl-adr-delivery-and-sre-ops-org-define-deployer-agent
+  objective: |-
+    Define the Deployer agent (Uplink-Deploy)
+
+    Define the system prompt, tool subset, and governance profile for the Uplink-Deploy agent, responsible for executing the deploy pipeline.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/agents/deployer.rs
+- id: gl-adr-delivery-and-sre-ops-org-define-monitor-agent
+  objective: |-
+    Define the Monitor agent (Uplink-Watch)
+
+    Define the system prompt, tool subset, and governance profile for the Uplink-Watch agent, responsible for executing maintenance pipeline checks and incident classification.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/agents/monitor.rs
+- id: gl-adr-delivery-and-sre-ops-org-define-responder-agent
+  objective: |-
+    Define the Responder agent (Uplink-Respond)
+
+    Define the system prompt, tool subset, and governance profile for the Uplink-Respond agent, responsible for incident diagnosis and response actions.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/agents/responder.rs
+- id: gl-adr-delivery-and-sre-ops-org-configure-tool-allowlist
+  objective: |-
+    Configure the tool allowlist
+
+    Implement the strict tool allowlist for each agent (Deployer, Monitor, Responder) as defined in the ADR, ensuring only permitted commands can be executed.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/agents/mod.rs
+  - crates/ops-org/src/tools.rs
+- id: gl-adr-delivery-and-sre-ops-org-configure-governance-rules
+  objective: |-
+    Configure governance rules
+
+    Implement the governance rules per pipeline mode and agent, including default gates, auto-rollback logic, scaling change approvals, migration handling, and budget caps. Set up the burn-in counter mechanism.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/governance.rs
+  - crates/ops-org/src/config.rs
+- id: gl-adr-delivery-and-sre-ops-org-implement-engineering-ops-handoff
+  objective: |-
+    Implement engineering-ops handoff contract
+
+    Ensure the merge event on the release branch triggers the deploy pipeline. Implement the creation of incident beads in the engineering namespace with cross-namespace links for feedback.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/beads.rs
+  - crates/ops-org/src/pipeline/deploy.rs
+  - crates/ops-org/src/pipeline/incident.rs
+- id: gl-adr-delivery-and-sre-ops-org-update-ops-org-crate-structure
+  objective: |-
+    Update ops-org crate structure
+
+    Refactor the `crates/ops-org/` crate to replace the single `OpsPipelineStage` enum with distinct pipeline modes (Deploy, Incident, Maintenance) and their respective stages.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/lib.rs
+  - crates/ops-org/src/config.rs
+- id: gl-adr-delivery-and-sre-ops-org-integrate-lowendinsight-specific-concerns
+  objective: |-
+    Integrate LowEndInsight-specific operational concerns
+
+    Encode LowEndInsight-specific operational concerns (Oban queue drain, Ecto migration sequencing, BEAM crash detection, Redis connectivity, LiveView state, Postgres connection pool) into the Monitor agent's system prompt and pipeline logic.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops-org/src/agents/monitor.rs
+  - crates/ops-org/src/pipeline/deploy.rs
+  - crates/ops-org/src/pipeline/maintenance.rs
+- id: gl-adr-delivery-and-sre-ops-org-validate-deploy-pipeline-phase1
+  objective: |-
+    Validate deploy pipeline (Phase 1)
+
+    After at least 10 real deployments, revisit and validate the deploy pipeline, governance gates, and tool allowlist against actual outcomes.
+  priority: 4
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-dev-mode-external-repository-operation-setup-dev-mode-workflow
+  objective: |-
+    Setup sibling-directory dev-mode workflow
+
+    Configure the development environment to use a sibling-directory structure for GLITCHLAB and target repositories (e.g., lowendinsight, lowendinsight-get).
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - ~/Code/
+- id: gl-adr-dev-mode-external-repository-operation-initialize-target-repo-glitchlab-config
+  objective: |-
+    Initialize GLITCHLAB config in target repos
+
+    Run `cargo run -- init` for each target repository (lowendinsight, lowendinsight-get) to create the `.glitchlab/` directory and its contents (config.yaml, .gitignore, tasks/, worktrees/, logs/).
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - ~/Code/lowendinsight/.glitchlab/
+  - ~/Code/lowendinsight-get/.glitchlab/
+- id: gl-adr-dev-mode-external-repository-operation-commit-target-repo-glitchlab-config
+  objective: |-
+    Commit GLITCHLAB config to target repos
+
+    Commit the generated `.glitchlab/config.yaml` file to the respective target repositories (lowendinsight, lowendinsight-get).
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - ~/Code/lowendinsight/.glitchlab/config.yaml
+  - ~/Code/lowendinsight-get/.glitchlab/config.yaml
+- id: gl-adr-dev-mode-external-repository-operation-configure-elixir-overrides
+  objective: |-
+    Configure Elixir-specific overrides
+
+    Add recommended Elixir-specific overrides to `.glitchlab/config.yaml` for both target repositories, including protected paths (mix.lock, .formatter.exs, dump.rdb) and limits (max_tool_turns, max_dollars_per_task).
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - ~/Code/lowendinsight/.glitchlab/config.yaml
+  - ~/Code/lowendinsight-get/.glitchlab/config.yaml
+- id: gl-adr-dev-mode-external-repository-operation-run-batch-tasks-lowendinsight
+  objective: |-
+    Run batch tasks on lowendinsight
+
+    Execute batch tasks against the lowendinsight repository using `cargo run -- batch --repo ../lowendinsight --budget 5.0 --quality-gate "mix test" --auto-approve` from the GLITCHLAB source directory.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - ~/Code/glitchlab/
+  - ~/Code/lowendinsight/
+- id: gl-adr-dev-mode-external-repository-operation-run-batch-tasks-lowendinsight-get
+  objective: |-
+    Run batch tasks on lowendinsight-get
+
+    Execute batch tasks against the lowendinsight-get repository using `cargo run -- batch --repo ../lowendinsight-get --budget 5.0 --quality-gate "mix test" --auto-approve` from the GLITCHLAB source directory.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - ~/Code/glitchlab/
+  - ~/Code/lowendinsight-get/
+- id: gl-adr-dev-mode-external-repository-operation-implement-multi-repo-batch-mode
+  objective: |-
+    Implement multi-repo batch mode
+
+    Develop the multi-repo batch mode for GLITCHLAB, allowing a single invocation to run tasks on the GLITCHLAB repo itself and multiple target repositories, sharing a unified budget.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/cli/src/main.rs
+  - crates/cli/src/batch.rs
+  - crates/core/src/project.rs
+- id: gl-adr-dev-mode-external-repository-operation-document-dev-mode-workflow
+  objective: |-
+    Document dev-mode workflow
+
+    Document the sibling-directory dev-mode workflow, including setup, configuration, and execution steps, for use by GLITCHLAB developers.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - docs/development.md
+- id: gl-adr-dev-mode-external-repository-operation-enhance-init-command-for-elixir
+  objective: |-
+    Enhance init command for Elixir
+
+    Improve the `glitchlab init` command to auto-detect Elixir projects and suggest relevant configuration overrides, such as protecting `mix.lock` and setting `mix test` as the quality gate.
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/cli/src/init.rs
+  - crates/core/src/project.rs
+- id: gl-adr-dual-product-evolution-strategy-fix-implementer-reliability
+  objective: |-
+    Fix GLITCHLAB implementer reliability
+
+    Resolve reliability failures in the Claude Code implementer integration to unblock autonomous development.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/implementer/src/claude_code.rs
+- id: gl-adr-dual-product-evolution-strategy-document-manual-deploy-process
+  objective: |-
+    Document LowEndInsight manual deployment process
+
+    Write a runbook detailing the manual deployment process for LowEndInsight, serving as Phase 0 for the ops ADR.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - docs/runbook-lowendinsight-deploy.md
+- id: gl-adr-dual-product-evolution-strategy-batch-run-lowendinsight-features
+  objective: |-
+    Batch run GLITCHLAB for LowEndInsight features
+
+    Utilize GLITCHLAB to work on the LowEndInsight backlog, shipping customer value and validating the implementer fix.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/glitchlab/src/main.rs
+  - crates/router/src/lib.rs
+- id: gl-adr-dual-product-evolution-strategy-build-deploy-pipeline
+  objective: |-
+    Implement GLITCHLAB deploy pipeline
+
+    Implement the `glitchlab ops deploy` command to automate the documented manual deployment process for LowEndInsight.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/ops/src/deploy.rs
+  - crates/glitchlab/src/main.rs
+- id: gl-adr-dual-product-evolution-strategy-batch-run-with-deploy
+  objective: |-
+    Batch run with automated deployment
+
+    Integrate automated deployments into the batch run process, allowing GLITCHLAB to build features and then deploy them autonomously.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/glitchlab/src/main.rs
+  - crates/ops/src/deploy.rs
+- id: gl-adr-implementation-language-bootstrap-rust-workspace
+  objective: |-
+    Bootstrap Rust workspace for the framework
+
+    Create a new Rust workspace with the specified crate structure: kernel, memory, router, eng-org, and cli.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/Cargo.toml
+  - framework/crates/kernel/Cargo.toml
+  - framework/crates/memory/Cargo.toml
+  - framework/crates/router/Cargo.toml
+  - framework/crates/eng-org/Cargo.toml
+  - framework/crates/cli/Cargo.toml
+- id: gl-adr-implementation-language-implement-kernel-traits
+  objective: |-
+    Implement core kernel traits in Rust
+
+    Implement the core traits in the kernel crate: Org, Agent, Tool, Pipeline, and Governance. This includes defining AgentContext, BoundaryEnforcer, ApprovedAction, BudgetTracker, and the linear Pipeline variant.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/kernel/src/lib.rs
+  - framework/crates/kernel/src/org.rs
+  - framework/crates/kernel/src/agent.rs
+  - framework/crates/kernel/src/tool.rs
+  - framework/crates/kernel/src/governance.rs
+  - framework/crates/kernel/src/budget.rs
+  - framework/crates/kernel/src/pipeline.rs
+  - framework/crates/kernel/src/error.rs
+- id: gl-adr-implementation-language-implement-memory-dolt-integration
+  objective: |-
+    Implement Dolt integration in memory crate
+
+    Implement DoltConnection, DoltHistory (as HistoryBackend), and schema initialization within the memory crate. Include a JSONL fallback for history.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/memory/src/lib.rs
+  - framework/crates/memory/src/dolt.rs
+  - framework/crates/memory/src/history.rs
+- id: gl-adr-implementation-language-implement-memory-beads-client
+  objective: |-
+    Implement Beads client in memory crate
+
+    Implement the BeadsClient as a subprocess wrapper for the 'bd' CLI, ensuring correct parsing of 'bd ready --json' output.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/memory/src/beads.rs
+- id: gl-adr-implementation-language-implement-router-llm-routing
+  objective: |-
+    Implement LLM routing in router crate
+
+    Implement the router crate, including model resolution, multi-provider routing using rig-core, and structured output parsing. Add provider adapters.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/router/src/lib.rs
+  - framework/crates/router/src/router.rs
+  - framework/crates/router/src/response.rs
+  - framework/crates/router/src/providers.rs
+- id: gl-adr-implementation-language-port-glitchlab-agents-to-rust
+  objective: |-
+    Port GLITCHLAB agents to Rust
+
+    Port the existing GLITCHLAB agents (Planner, Implementer, Debugger, Security, Release, Archivist) into the eng-org crate, ensuring prompts and parsing logic are correctly translated.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/eng-org/src/agents/planner.rs
+  - framework/crates/eng-org/src/agents/implementer.rs
+  - framework/crates/eng-org/src/agents/debugger.rs
+  - framework/crates/eng-org/src/agents/security.rs
+  - framework/crates/eng-org/src/agents/release.rs
+  - framework/crates/eng-org/src/agents/archivist.rs
+- id: gl-adr-implementation-language-port-glitchlab-workspace-and-indexer-to-rust
+  objective: |-
+    Port GLITCHLAB workspace and indexer to Rust
+
+    Port the workspace management (git worktree) and repository indexer logic from GLITCHLAB into the eng-org crate.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/eng-org/src/workspace.rs
+  - framework/crates/eng-org/src/indexer.rs
+- id: gl-adr-implementation-language-implement-engineering-pipeline
+  objective: |-
+    Implement the engineering pipeline in Rust
+
+    Implement the engineering-specific linear pipeline (Controller port) within the eng-org crate, orchestrating the ported agents.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/eng-org/src/pipeline.rs
+- id: gl-adr-implementation-language-implement-cli-binary
+  objective: |-
+    Implement the CLI binary in Rust
+
+    Implement the command-line interface using clap, including commands for run, next, status, init, batch, and history.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/cli/src/main.rs
+- id: gl-adr-implementation-language-add-kernel-tests
+  objective: |-
+    Add unit tests for kernel traits
+
+    Write unit tests for the core traits and components implemented in the kernel crate.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/kernel/src/*.rs
+- id: gl-adr-implementation-language-add-memory-tests
+  objective: |-
+    Add unit tests for memory crate
+
+    Write unit tests for the Dolt integration and Beads client within the memory crate.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/memory/src/*.rs
+- id: gl-adr-implementation-language-add-router-tests
+  objective: |-
+    Add unit tests for router crate
+
+    Write unit tests for the LLM routing logic, provider adapters, and response parsing within the router crate.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/router/src/*.rs
+- id: gl-adr-implementation-language-add-eng-org-tests
+  objective: |-
+    Add unit tests for eng-org crate
+
+    Write unit tests for the ported agents, workspace management, indexer, and the engineering pipeline within the eng-org crate.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/eng-org/src/*.rs
+- id: gl-adr-implementation-language-add-cli-tests
+  objective: |-
+    Add unit tests for CLI crate
+
+    Write unit tests for the CLI commands to ensure they function as expected.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/cli/src/main.rs
+- id: gl-adr-implementation-language-add-integration-tests
+  objective: |-
+    Add integration tests for the framework
+
+    Write integration tests that cover the end-to-end flow of the framework, including agent execution, memory persistence, and routing.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - tests/*.rs
+- id: gl-adr-implementation-language-validate-against-lowendinsight
+  objective: |-
+    Validate framework against LowEndInsight
+
+    Run the newly implemented Rust framework against the LowEndInsight project to validate its functionality and architecture.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-implementation-language-validate-framework-against-glitchlab-repo
+  objective: |-
+    Validate framework against GLITCHLAB repo
+
+    Run the Rust framework against the GLITCHLAB repository itself to ensure it can correctly process and manage its own codebase.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-implementation-language-integrate-beads-cli-command
+  objective: |-
+    Integrate Beads CLI command into framework
+
+    Ensure the 'next' CLI command correctly interacts with the Beads system via the memory crate's BeadsClient to pull and process tasks.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/cli/src/main.rs
+- id: gl-adr-implementation-language-integrate-dolt-history-querying
+  objective: |-
+    Integrate Dolt history querying into framework
+
+    Ensure the 'status' CLI command can query and display historical data using the Dolt integration in the memory crate.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/cli/src/main.rs
+- id: gl-adr-implementation-language-implement-ops-org-skeleton
+  objective: |-
+    Implement Ops org skeleton
+
+    Create the basic structure for the Ops org, allowing it to register with the kernel and be managed as a second organization.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - framework/crates/kernel/src/org.rs
+- id: gl-adr-implementation-strategy-tool-use-vs-api-add-toolcall-toolresult-types
+  objective: |-
+    Define ToolCall and ToolResult types
+
+    Add `ToolCall` and `ToolResult` data structures to the kernel to represent LLM tool invocations and their outcomes.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/kernel/src/lib.rs
+- id: gl-adr-implementation-strategy-tool-use-vs-api-extend-provider-trait-with-tool-completion
+  objective: |-
+    Extend Provider trait for tool completion
+
+    Modify the `Provider` trait to include a `complete_with_tools` method that accepts a tool schema and returns tool calls or text, enabling the router to marshal tool schemas per provider.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/provider.rs
+- id: gl-adr-implementation-strategy-tool-use-vs-api-implement-tool-executor-sandbox-governance
+  objective: |-
+    Implement sandboxed tool executor with governance
+
+    Develop the tool execution logic within the eng-org layer, ensuring it runs in a sandboxed environment (git worktree) and enforces GLITCHLAB's existing tool allowlist and blocked patterns.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/lib.rs
+  - crates/eng-org/src/tool_executor.rs
+- id: gl-adr-implementation-strategy-tool-use-vs-api-add-tool-use-loop-to-implementer-agent
+  objective: |-
+    Add tool-use loop to implementer agent
+
+    Integrate the tool-use execution loop into the implementer agent, enabling it to perform iterative code implementation by prompting the LLM, executing tool calls, and processing results.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/agent/src/implementer.rs
+- id: gl-adr-implementation-strategy-tool-use-vs-api-add-tool-use-loop-to-debugger-agent
+  objective: |-
+    Add tool-use loop to debugger agent
+
+    Integrate the tool-use execution loop into the debugger agent, allowing it to read test outputs, modify files, and re-run tests iteratively.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/agent/src/debugger.rs
+- id: gl-adr-implementation-strategy-tool-use-vs-api-add-max-tool-turns-config-and-budget-tracking
+  objective: |-
+    Add max_tool_turns config and budget tracking
+
+    Introduce a new configuration field `limits.max_tool_turns` and implement budget tracking per tool-use turn to govern iteration depth and costs.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/config.rs
+  - crates/router/src/lib.rs
+- id: gl-adr-implementation-strategy-tool-use-vs-api-test-with-local-model-ollama-llama-cpp
+  objective: |-
+    Test tool-use loop with local model
+
+    Validate the provider-agnostic claim by testing the tool-use loop with a local model served via Ollama and llama.cpp, ensuring compatibility.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/provider/mod.rs
+  - crates/router/src/provider/ollama.rs
+- id: gl-adr-implementation-strategy-tool-use-vs-api-define-tool-schema-for-code-editing
+  objective: |-
+    Define minimal tool schema for code editing
+
+    Define the YAML schema for the minimal set of tools required: `read_file`, `write_file`, `edit_file`, `run_command`, and `list_files`.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/kernel/src/lib.rs
+- id: gl-adr-implementer-token-efficiency-restructure-implementer-system-prompt
+  objective: |-
+    Restructure implementer system prompt
+
+    Update the implementer agent's system prompt to establish a clear hierarchy of context sources (pre-loaded files > Rust module map > tools) and emphasize budget constraints, discouraging exploration.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/agent_core/src/implementer.rs
+- id: gl-adr-implementer-token-efficiency-remove-list-files-from-short-circuit-tasks
+  objective: |-
+    Remove list_files tool from short-circuit tasks
+
+    Conditionally filter out the `list_files` tool from the implementer's available tools when a task is identified as short-circuit eligible, to prevent its use.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/agent_core/src/tool_dispatch.rs
+- id: gl-adr-implementer-token-efficiency-add-read-file-deduplication-check
+  objective: |-
+    Add read_file deduplication check
+
+    Implement a check within the tool dispatcher for the `read_file` tool. If the requested file path already exists in the agent's context, return the cached content immediately without executing the tool or consuming a turn.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/agent_core/src/tool_dispatch.rs
+- id: gl-adr-implementer-token-efficiency-track-redundant-tool-calls-tqm-signal
+  objective: |-
+    Track redundant tool calls as TQM signal
+
+    Add a counter for 'redundant tool calls' (e.g., `list_files` or `read_file` returning cached info) to pipeline events. Define and implement the `ImplementerEfficiency` struct to track tool call metrics.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/pipeline_events/src/lib.rs
+  - crates/agent_core/src/implementer.rs
+- id: gl-adr-implementer-token-efficiency-canary-run-validate-efficiency-changes
+  objective: |-
+    Canary run to validate efficiency changes
+
+    Perform a canary run to measure the impact of the implemented changes on token usage per task, `list_files` call frequency, and the redundant call rate. Target average tokens per task: <15k for short-circuit, <25k for full-pipeline.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint: []
+- id: gl-adr-layered-security-review-add-ciso-agent-to-pipeline
+  objective: |-
+    Add CISO Risk Analysis Agent to Pipeline
+
+    Integrate the CISO agent as stage 10b in the review pipeline, ensuring it runs after the Security Agent and receives its findings as input.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/pipeline.rs
+- id: gl-adr-layered-security-review-implement-ciso-agent-logic
+  objective: |-
+    Implement CISO Agent Logic
+
+    Develop the core logic for the CISO agent (`crates/eng-org/src/agents/ciso.rs`), including its system prompt, input processing (diff, plan, security findings), and output generation according to the defined schema.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/agents/ciso.rs
+- id: gl-adr-layered-security-review-define-ciso-output-schema-handling
+  objective: |-
+    Define and Handle CISO Output Schema
+
+    Implement the parsing and handling of the CISO agent's structured JSON output within the pipeline context. This includes defining the `PipelineContext.stage_outputs` key for 'ciso' and ensuring the pipeline can interpret `risk_verdict` (accept, conditional, escalate).
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/pipeline.rs
+  - crates/kernel/src/pipeline_status.rs
+- id: gl-adr-layered-security-review-configure-ciso-agent-behavior
+  objective: |-
+    Configure CISO Agent Behavior
+
+    Add configuration options for the CISO agent, including the default model (`routing.ciso` in `.glitchlab/config.yaml`) and potentially risk score thresholds or escalation policies.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - .glitchlab/config.yaml
+  - crates/eng-org/src/config.rs
+- id: gl-adr-layered-security-review-implement-ciso-escalation-handling
+  objective: |-
+    Implement CISO Escalation Handling
+
+    Ensure that when the CISO agent returns `risk_verdict: 'escalate'`, the pipeline halts with `PipelineStatus::Escalated` and surfaces this status to the orchestrator and TQM. Also, enforce the rule that CISO must escalate if the security agent blocks.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/pipeline.rs
+  - crates/kernel/src/pipeline_status.rs
+- id: gl-adr-layered-security-review-implement-ciso-graceful-degradation
+  objective: |-
+    Implement CISO Graceful Degradation
+
+    Ensure that if the CISO agent fails (LLM error, timeout, parse failure), the pipeline logs a warning and defaults to `risk_verdict: 'accept'`, allowing the pipeline to proceed. The security scan remains the hard gate.
+  priority: 0
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/pipeline.rs
+- id: gl-adr-layered-security-review-implement-short-circuit-bypass-for-ciso
+  objective: |-
+    Implement Short-Circuit Bypass for CISO Stage
+
+    Modify the pipeline logic to skip both the security scan and CISO review for short-circuit-eligible tasks, as defined by their trivial complexity.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/pipeline.rs
+- id: gl-adr-layered-security-review-update-pipeline-event-kinds
+  objective: |-
+    Update Pipeline Event Kinds
+
+    Define and register the new `EventKind::CisoReview` in `crates/kernel/src/events.rs` to track CISO review events.
+  priority: 2
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/kernel/src/events.rs
+- id: gl-adr-layered-security-review-document-ciso-agent-behavior-and-output
+  objective: |-
+    Document CISO Agent Behavior and Output
+
+    Update relevant documentation (e.g., agent READMEs, pipeline guides) to describe the CISO agent's role, its output schema, and how its verdicts affect the pipeline.
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - docs/agents/ciso.md
+  - docs/pipeline/review-stages.md
+- id: gl-adr-layered-security-review-add-risk-score-guide-to-documentation
+  objective: |-
+    Add Risk Score Guide to Documentation
+
+    Incorporate the risk score guide (1-10) into the agent's documentation or a central security policy document to clarify the meaning of different scores.
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - docs/agents/ciso.md
+- id: gl-adr-layered-security-review-establish-ciso-context-evaluation-scenarios
+  objective: |-
+    Establish CISO Context Evaluation Scenarios
+
+    Create a set of frozen diffs with known risk profiles to be used for verifying the CISO agent's risk assessment quality and calibration, as per the ADR's 'Context Evaluation Lifecycle' relationship.
+  priority: 3
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - tests/fixtures/context_evaluation/ciso_scenarios.yaml
+- id: gl-adr-layered-security-review-configure-ciso-model-to-flash-tier
+  objective: |-
+    Configure CISO Model to Flash-Tier for Production
+
+    Update the default CISO model configuration to use a flash-tier model (e.g., `gemini-2.5-flash`) for production environments, as specified in the ADR, while allowing for configurable alternatives.
+  priority: 1
+  status: pending
+  depends_on: []
+  decomposition_depth: 0
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - .glitchlab/config.yaml
+- id: gl-integrate-zephyr-governance-part1-define-core-structures
+  objective: Define the core Zephyr governance data structures (permissions, blast radius, autonomy, credential policy, audit entry) in crates/kernel/src/governance.rs. This establishes the foundational data model for Zephyr.
+  priority: 50
+  status: pending
+  depends_on: []
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/kernel/src/governance.rs
+- id: gl-integrate-zephyr-governance-part2-link-org-agent
+  objective: Integrate the ZephyrPolicy into the Org trait and AgentContext struct to make governance settings available at the organizational and agent execution levels.
+  priority: 50
+  status: pending
+  depends_on:
+  - integrate-zephyr-governance-part1-define-core-structures
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/kernel/src/org.rs
+  - crates/kernel/src/agent.rs
+- id: gl-integrate-zephyr-governance-part3-tool-permissions
+  objective: Implement tool permission checks using the ZephyrPolicy within crates/kernel/src/tool.rs. This ensures that agents can only call tools for which they have explicit permission.
+  priority: 50
+  status: pending
+  depends_on:
+  - integrate-zephyr-governance-part1-define-core-structures
+  - integrate-zephyr-governance-part2-link-org-agent
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/kernel/src/tool.rs
+- id: gl-integrate-zephyr-governance-part4-credential-access
+  objective: Integrate ZephyrPolicy to control credential access in crates/router/src/credentials.rs. This ensures sensitive credentials are only accessed by authorized agents/contexts.
+  priority: 50
+  status: pending
+  depends_on:
+  - integrate-zephyr-governance-part1-define-core-structures
+  - integrate-zephyr-governance-part2-link-org-agent
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/router/src/credentials.rs
+- id: gl-integrate-zephyr-governance-part5-audit-trail-logging
+  objective: Establish a basic audit trail mechanism by defining an AuditEntry struct and an AuditLogger trait in crates/kernel/src/governance.rs. This lays the groundwork for recording governance-related actions.
+  priority: 50
+  status: pending
+  depends_on:
+  - integrate-zephyr-governance-part1-define-core-structures
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/kernel/src/governance.rs
+  - crates/kernel/src/lib.rs
+- id: gl-integrate-zephyr-governance-part6-blast-autonomy-enforcement
+  objective: Implement high-level enforcement points for blast radius controls and autonomy level settings within the eng-org pipeline, specifically in crates/eng-org/src/orchestrator.rs and crates/eng-org/src/pipeline.rs.
+  priority: 50
+  status: pending
+  depends_on:
+  - integrate-zephyr-governance-part1-define-core-structures
+  - integrate-zephyr-governance-part2-link-org-agent
+  decomposition_depth: 1
+  remediation_depth: 0
+  is_remediation: false
+  files_hint:
+  - crates/eng-org/src/orchestrator.rs
+  - crates/eng-org/src/pipeline.rs
