@@ -173,6 +173,29 @@ enum Commands {
         #[arg(long, default_value = "3000")]
         port: u16,
     },
+
+    /// Pick and run the next pending task from the backlog
+    Next {
+        /// Path to the target repository
+        #[arg(long)]
+        repo: PathBuf,
+
+        /// Allow modifications to protected paths
+        #[arg(long)]
+        allow_core: bool,
+
+        /// Skip human intervention gates
+        #[arg(long)]
+        auto_approve: bool,
+
+        /// Override test command
+        #[arg(long, short)]
+        test: Option<String>,
+
+        /// Enable verbose logging
+        #[arg(long, short)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
@@ -248,6 +271,16 @@ async fn main() -> Result<()> {
         Commands::Dashboard { repo, port } => {
             commands::setup_logging(false);
             commands::dashboard::execute(commands::dashboard::DashboardArgs { repo, port }).await
+        }
+        Commands::Next {
+            repo,
+            allow_core,
+            auto_approve,
+            test,
+            verbose,
+        } => {
+            commands::setup_logging(verbose);
+            commands::next::execute(&repo, allow_core, auto_approve, test.as_deref()).await
         }
     }
 }
