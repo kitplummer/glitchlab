@@ -1,3 +1,7 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentContext, AgentOutput};
@@ -233,6 +237,116 @@ pub enum EventKind {
     PrMerged,
     BudgetExceeded,
     Error,
+}
+
+// ---------------------------------------------------------------------------
+// StageRunner — object-safe agent invocation for LinearPipeline
+// ---------------------------------------------------------------------------
+
+/// Object-safe callable that executes a named agent role within a pipeline stage.
+///
+/// This trait bridges the gap between the RPIT-based [`Agent`] trait (which is
+/// not object-safe) and the needs of [`LinearPipeline`], which must dispatch to
+/// agents by role name at runtime.
+///
+/// [`Agent`]: crate::agent::Agent
+pub trait StageRunner: Send + Sync {
+    /// Run the agent with the given role, returning its output.
+    fn run_stage<'a>(
+        &'a self,
+        role: &'a str,
+        ctx: &'a AgentContext,
+    ) -> Pin<Box<dyn Future<Output = error::Result<AgentOutput>> + Send + 'a>>;
+}
+
+// ---------------------------------------------------------------------------
+// LinearPipeline — sequential stage execution
+// ---------------------------------------------------------------------------
+
+/// A pipeline that executes stages sequentially, in declaration order.
+///
+/// Each stage is checked for its run condition before execution.
+/// Required stages that fail terminate the pipeline with [`PipelineStatus::Error`].
+/// Optional stages that fail are silently skipped and execution continues.
+pub struct LinearPipeline {
+    stages: Vec<PipelineStage>,
+    runner: Arc<dyn StageRunner>,
+}
+
+impl LinearPipeline {
+    /// Create a new `LinearPipeline` with the given stages and runner.
+    pub fn new(stages: Vec<PipelineStage>, runner: Arc<dyn StageRunner>) -> Self {
+        Self { stages, runner }
+    }
+
+    fn should_run_stage(&self, stage: &PipelineStage, ctx: &PipelineContext) -> bool {
+        match &stage.condition {
+            None => true,
+            Some(StageCondition::Never) => false,
+            Some(StageCondition::RiskLevel(required)) => &ctx.agent_context.risk_level == required,
+            Some(StageCondition::PreviousOutput {
+                stage: prev_stage,
+                field,
+                equals,
+            }) => ctx
+                .stage_outputs
+                .get(prev_stage)
+                .and_then(|output| output.data.get(field))
+                .map(|v| v == equals)
+                .unwrap_or(false),
+        }
+    }
+}
+
+impl Pipeline for LinearPipeline {
+    async fn execute(&self, ctx: &mut PipelineContext) -> error::Result<PipelineResult> {
+        for stage in &self.stages {
+            if !self.should_run_stage(stage, ctx) {
+                continue;
+            }
+
+            ctx.current_stage = Some(stage.name.clone());
+
+            match self
+                .runner
+                .run_stage(&stage.agent_role, &ctx.agent_context)
+                .await
+            {
+                Ok(output) => {
+                    ctx.agent_context.previous_output = output.data.clone();
+                    ctx.stage_outputs.insert(stage.name.clone(), output);
+                }
+                Err(e) => {
+                    if stage.optional {
+                        continue;
+                    }
+                    ctx.current_stage = None;
+                    return Ok(PipelineResult {
+                        status: PipelineStatus::Error,
+                        stage_outputs: ctx.stage_outputs.clone(),
+                        events: ctx.events.clone(),
+                        budget: BudgetSummary::default(),
+                        pr_url: None,
+                        branch: None,
+                        error: Some(e.to_string()),
+                        outcome_context: None,
+                    });
+                }
+            }
+        }
+
+        ctx.current_stage = None;
+        Ok(PipelineResult {
+            status: PipelineStatus::Committed,
+            stage_outputs: ctx.stage_outputs.clone(),
+            events: ctx.events.clone(),
+            budget: BudgetSummary::default(),
+            pr_url: None,
+            branch: None,
+            error: None,
+            outcome_context: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -517,5 +631,220 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         // outcome_context should be skipped when None
         assert!(!json.contains("outcome_context"));
+    }
+
+    // -----------------------------------------------------------------------
+    // LinearPipeline tests
+    // -----------------------------------------------------------------------
+
+    use crate::agent::{AgentMetadata, AgentOutput};
+    use crate::error;
+    use std::collections::HashSet;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    fn test_output() -> AgentOutput {
+        AgentOutput {
+            data: serde_json::json!({"result": "ok"}),
+            metadata: AgentMetadata {
+                agent: "mock".into(),
+                model: "mock-model".into(),
+                tokens: 10,
+                cost: 0.001,
+                latency_ms: 50,
+            },
+            parse_error: false,
+        }
+    }
+
+    struct MockRunner {
+        fail_roles: HashSet<String>,
+    }
+
+    impl StageRunner for MockRunner {
+        fn run_stage<'a>(
+            &'a self,
+            role: &'a str,
+            _ctx: &'a crate::agent::AgentContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = error::Result<AgentOutput>> + Send + 'a>>
+        {
+            if self.fail_roles.contains(role) {
+                Box::pin(async move {
+                    Err(error::Error::Agent {
+                        agent: role.to_string(),
+                        reason: "mock failure".into(),
+                    })
+                })
+            } else {
+                Box::pin(async { Ok(test_output()) })
+            }
+        }
+    }
+
+    fn mock_runner(fail_roles: &[&str]) -> Arc<MockRunner> {
+        Arc::new(MockRunner {
+            fail_roles: fail_roles.iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    fn stage(
+        name: &str,
+        role: &str,
+        optional: bool,
+        condition: Option<StageCondition>,
+    ) -> PipelineStage {
+        PipelineStage {
+            name: name.into(),
+            agent_role: role.into(),
+            optional,
+            condition,
+        }
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_empty_stages_returns_committed() {
+        let pipeline = LinearPipeline::new(vec![], mock_runner(&[]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        let result = pipeline.execute(&mut ctx).await.unwrap();
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(result.stage_outputs.is_empty());
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_runs_single_stage() {
+        let stages = vec![stage("plan", "planner", false, None)];
+        let pipeline = LinearPipeline::new(stages, mock_runner(&[]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        let result = pipeline.execute(&mut ctx).await.unwrap();
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(result.stage_outputs.contains_key("plan"));
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_runs_multiple_stages_in_order() {
+        let stages = vec![
+            stage("plan", "planner", false, None),
+            stage("implement", "implementer", false, None),
+        ];
+        let pipeline = LinearPipeline::new(stages, mock_runner(&[]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        let result = pipeline.execute(&mut ctx).await.unwrap();
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(result.stage_outputs.contains_key("plan"));
+        assert!(result.stage_outputs.contains_key("implement"));
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_required_stage_failure_returns_error() {
+        let stages = vec![stage("plan", "planner", false, None)];
+        let pipeline = LinearPipeline::new(stages, mock_runner(&["planner"]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        let result = pipeline.execute(&mut ctx).await.unwrap();
+        assert_eq!(result.status, PipelineStatus::Error);
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_optional_stage_failure_continues() {
+        let stages = vec![
+            stage("plan", "planner", true, None), // optional, will fail
+            stage("implement", "implementer", false, None), // required, succeeds
+        ];
+        let pipeline = LinearPipeline::new(stages, mock_runner(&["planner"]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        let result = pipeline.execute(&mut ctx).await.unwrap();
+        assert_eq!(result.status, PipelineStatus::Committed);
+        // optional stage skipped, required stage ran
+        assert!(!result.stage_outputs.contains_key("plan"));
+        assert!(result.stage_outputs.contains_key("implement"));
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_never_condition_skips_stage() {
+        let stages = vec![stage("plan", "planner", false, Some(StageCondition::Never))];
+        // runner would fail if called, but Never condition means it won't be
+        let pipeline = LinearPipeline::new(stages, mock_runner(&["planner"]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        let result = pipeline.execute(&mut ctx).await.unwrap();
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(result.stage_outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_risk_condition_matches() {
+        let stages = vec![stage(
+            "security",
+            "security",
+            false,
+            Some(StageCondition::RiskLevel("high".into())),
+        )];
+        let pipeline = LinearPipeline::new(stages, mock_runner(&[]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        // default risk is "low", so stage should be skipped
+        let result = pipeline.execute(&mut ctx).await.unwrap();
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(!result.stage_outputs.contains_key("security"));
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_risk_condition_matches_high() {
+        let stages = vec![stage(
+            "security",
+            "security",
+            false,
+            Some(StageCondition::RiskLevel("high".into())),
+        )];
+        let pipeline = LinearPipeline::new(stages, mock_runner(&[]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        ctx.agent_context.risk_level = "high".into();
+        let result = pipeline.execute(&mut ctx).await.unwrap();
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(result.stage_outputs.contains_key("security"));
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_previous_output_condition() {
+        let stages = vec![
+            stage("plan", "planner", false, None),
+            stage(
+                "extra",
+                "extra-agent",
+                false,
+                Some(StageCondition::PreviousOutput {
+                    stage: "plan".into(),
+                    field: "result".into(),
+                    equals: serde_json::json!("ok"),
+                }),
+            ),
+        ];
+        let pipeline = LinearPipeline::new(stages, mock_runner(&[]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        let result = pipeline.execute(&mut ctx).await.unwrap();
+        // plan output is {"result": "ok"}, so extra stage should run
+        assert_eq!(result.status, PipelineStatus::Committed);
+        assert!(result.stage_outputs.contains_key("extra"));
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_updates_previous_output_in_context() {
+        let stages = vec![
+            stage("plan", "planner", false, None),
+            stage("implement", "implementer", false, None),
+        ];
+        let pipeline = LinearPipeline::new(stages, mock_runner(&[]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        pipeline.execute(&mut ctx).await.unwrap();
+        // After execution, previous_output should be set from last stage
+        assert_ne!(ctx.agent_context.previous_output, serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn linear_pipeline_current_stage_cleared_after_run() {
+        let stages = vec![stage("plan", "planner", false, None)];
+        let pipeline = LinearPipeline::new(stages, mock_runner(&[]));
+        let mut ctx = PipelineContext::new(test_agent_context());
+        pipeline.execute(&mut ctx).await.unwrap();
+        assert!(ctx.current_stage.is_none());
     }
 }

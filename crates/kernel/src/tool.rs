@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -6,6 +7,24 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// Tool trait — callable unit offered to an agent
+// ---------------------------------------------------------------------------
+
+/// A tool that an agent can invoke.
+///
+/// Implementations encapsulate the logic for a specific capability
+/// (e.g. reading a file, running a command, querying a database).
+/// The framework calls `definition()` to advertise the tool to an LLM
+/// and `call()` to execute it.
+pub trait Tool: Send + Sync {
+    /// The tool's definition, advertised to the LLM.
+    fn definition(&self) -> &ToolDefinition;
+
+    /// Execute the tool with the given call arguments.
+    fn call(&self, call: ToolCall) -> impl Future<Output = Result<ToolCallResult>> + Send;
+}
 
 // ---------------------------------------------------------------------------
 // ToolPolicy — what an org is allowed to execute
@@ -463,5 +482,76 @@ mod tests {
         assert!(parsed.is_error);
         assert_eq!(parsed.tool_call_id, "call_2");
         assert!(parsed.content.contains("exit code 1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool trait tests
+    // -----------------------------------------------------------------------
+
+    /// Minimal Tool implementation for testing the trait contract.
+    struct EchoTool {
+        def: ToolDefinition,
+    }
+
+    impl Tool for EchoTool {
+        fn definition(&self) -> &ToolDefinition {
+            &self.def
+        }
+
+        async fn call(&self, call: ToolCall) -> Result<ToolCallResult> {
+            Ok(ToolCallResult {
+                tool_call_id: call.id,
+                content: format!("echo: {}", call.input),
+                is_error: false,
+            })
+        }
+    }
+
+    fn echo_tool() -> EchoTool {
+        EchoTool {
+            def: ToolDefinition {
+                name: "echo".into(),
+                description: "Echoes the input back".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"}
+                    }
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn tool_trait_definition_name() {
+        let tool = echo_tool();
+        assert_eq!(tool.definition().name, "echo");
+        assert_eq!(tool.definition().description, "Echoes the input back");
+    }
+
+    #[tokio::test]
+    async fn tool_trait_call_returns_ok() {
+        let tool = echo_tool();
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "echo".into(),
+            input: serde_json::json!("hello world"),
+        };
+        let result = tool.call(call).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.tool_call_id, "c1");
+        assert!(result.content.contains("echo:"));
+    }
+
+    #[tokio::test]
+    async fn tool_trait_call_id_propagated() {
+        let tool = echo_tool();
+        let call = ToolCall {
+            id: "unique-id-42".into(),
+            name: "echo".into(),
+            input: serde_json::Value::Null,
+        };
+        let result = tool.call(call).await.unwrap();
+        assert_eq!(result.tool_call_id, "unique-id-42");
     }
 }
