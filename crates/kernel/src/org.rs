@@ -209,9 +209,107 @@ impl Task {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Org trait — what an org can do
+// ---------------------------------------------------------------------------
+
+/// Defines the capabilities of an organisational unit.
+///
+/// An `Org` owns a configuration, can create budget trackers for tasks,
+/// and exposes its identity. Concrete orgs implement this trait on top
+/// of a loaded `OrgConfig`.
+pub trait Org: Send + Sync {
+    /// The org's human-readable name.
+    fn name(&self) -> &str;
+
+    /// Access the org's full configuration.
+    fn config(&self) -> &OrgConfig;
+
+    /// Create a new [`BudgetTracker`] sized to this org's per-task limits.
+    fn budget_tracker(&self) -> BudgetTracker {
+        Task::budget_tracker(&self.config().limits)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GlitchlabOrg — default Org backed by OrgConfig
+// ---------------------------------------------------------------------------
+
+/// Default org implementation for GLITCHLAB, backed by an [`OrgConfig`].
+pub struct GlitchlabOrg {
+    config: OrgConfig,
+}
+
+impl GlitchlabOrg {
+    /// Create a new `GlitchlabOrg` from a loaded configuration.
+    pub fn new(config: OrgConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl Org for GlitchlabOrg {
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    fn config(&self) -> &OrgConfig {
+        &self.config
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governance::{BoundaryEnforcer, ZephyrPolicy};
+
+    fn test_org_config() -> OrgConfig {
+        OrgConfig {
+            name: "test-org".into(),
+            agents: std::collections::HashMap::new(),
+            tools: ToolPolicy::new(vec!["cargo".into()], vec![]),
+            pipeline: vec![],
+            governance: ZephyrPolicy {
+                boundaries: BoundaryEnforcer::new(vec![]),
+                autonomy: 0.5,
+            },
+            routing: std::collections::HashMap::new(),
+            limits: LimitsConfig::default(),
+            intervention: InterventionConfig::default(),
+        }
+    }
+
+    #[test]
+    fn glitchlab_org_name() {
+        let org = GlitchlabOrg::new(test_org_config());
+        assert_eq!(org.name(), "test-org");
+    }
+
+    #[test]
+    fn glitchlab_org_config_accessible() {
+        let org = GlitchlabOrg::new(test_org_config());
+        assert_eq!(org.config().limits.max_fix_attempts, 4);
+        assert!(org.config().agents.is_empty());
+    }
+
+    #[test]
+    fn glitchlab_org_budget_tracker() {
+        let org = GlitchlabOrg::new(test_org_config());
+        let tracker = org.budget_tracker();
+        assert!(!tracker.exceeded());
+        assert_eq!(tracker.max_tokens, 150_000);
+        assert!((tracker.max_dollars - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn org_trait_default_budget_tracker_from_limits() {
+        let mut config = test_org_config();
+        config.limits.max_tokens_per_task = 50_000;
+        config.limits.max_dollars_per_task = 5.0;
+        let org = GlitchlabOrg::new(config);
+        let tracker = org.budget_tracker();
+        assert_eq!(tracker.max_tokens, 50_000);
+        assert!((tracker.max_dollars - 5.0).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn limits_config_default() {
