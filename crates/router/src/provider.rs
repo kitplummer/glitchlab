@@ -35,9 +35,9 @@ pub trait Provider: Send + Sync {
 
     /// Complete with tool definitions available.
     ///
-    /// Default implementation ignores tools and delegates to `complete()`.
-    /// Provider implementations override this in Phase 1 to marshal tool
-    /// definitions into provider-specific request formats.
+    /// Implementations must marshal `tools` into the provider-specific request
+    /// format and return either text content or tool calls in the response.
+    /// There is no default — every provider must provide its own implementation.
     fn complete_with_tools(
         &self,
         model: &str,
@@ -46,10 +46,7 @@ pub trait Provider: Send + Sync {
         max_tokens: u32,
         tools: &[ToolDefinition],
         response_format: Option<&serde_json::Value>,
-    ) -> ProviderFuture<'_> {
-        let _ = tools;
-        self.complete(model, messages, temperature, max_tokens, response_format)
-    }
+    ) -> ProviderFuture<'_>;
 
     /// Returns `true` if the provider supports native tool use (i.e., it can
     /// parse tool definitions and return tool calls in its responses).
@@ -175,9 +172,56 @@ mod tests {
             ) -> ProviderFuture<'_> {
                 unimplemented!()
             }
+
+            fn complete_with_tools(
+                &self,
+                _model: &str,
+                _messages: &[Message],
+                _temperature: f32,
+                _max_tokens: u32,
+                _tools: &[ToolDefinition],
+                _response_format: Option<&serde_json::Value>,
+            ) -> ProviderFuture<'_> {
+                unimplemented!()
+            }
         }
 
         let provider = MockProvider;
         assert!(!provider.supports_native_tool_use());
+    }
+
+    /// Verify that `complete_with_tools` is a required method on the `Provider`
+    /// trait: a provider may implement it independently of `complete()`.
+    #[test]
+    fn complete_with_tools_is_required_method() {
+        // A minimal provider that satisfies the full trait contract.
+        struct MinimalProvider;
+        impl Provider for MinimalProvider {
+            fn complete(
+                &self,
+                _model: &str,
+                _messages: &[Message],
+                _temperature: f32,
+                _max_tokens: u32,
+                _response_format: Option<&serde_json::Value>,
+            ) -> ProviderFuture<'_> {
+                unimplemented!()
+            }
+
+            fn complete_with_tools(
+                &self,
+                _model: &str,
+                _messages: &[Message],
+                _temperature: f32,
+                _max_tokens: u32,
+                _tools: &[ToolDefinition],
+                _response_format: Option<&serde_json::Value>,
+            ) -> ProviderFuture<'_> {
+                unimplemented!()
+            }
+        }
+
+        // The type must compile — that is sufficient to prove the trait contract.
+        let _: &dyn Provider = &MinimalProvider;
     }
 }
