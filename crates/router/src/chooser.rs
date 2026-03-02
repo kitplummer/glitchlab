@@ -532,6 +532,23 @@ mod tests {
         assert_eq!(result, "fallback/model");
     }
 
+    /// Verify all three core variants exist and produce expected Debug strings.
+    #[test]
+    fn model_tier_variants_and_debug() {
+        // Each variant can be constructed and round-trips through Debug.
+        assert_eq!(format!("{:?}", ModelTier::Economy), "Economy");
+        assert_eq!(format!("{:?}", ModelTier::Standard), "Standard");
+        assert_eq!(format!("{:?}", ModelTier::Premium), "Premium");
+        // Display (human-readable lowercase) for the three required variants.
+        assert_eq!(ModelTier::Economy.to_string(), "economy");
+        assert_eq!(ModelTier::Standard.to_string(), "standard");
+        assert_eq!(ModelTier::Premium.to_string(), "premium");
+        // Copy semantics: assigning moves a copy, original is still usable.
+        let t = ModelTier::Standard;
+        let u = t;
+        assert_eq!(t, u);
+    }
+
     #[test]
     fn model_tier_ordering() {
         assert!(ModelTier::Economy < ModelTier::Standard);
