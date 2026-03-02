@@ -86,7 +86,7 @@ pipeline:
   short_circuit_enabled: true
   use_claude_code_implementer: true
   claude_code_model: sonnet
-  claude_code_budget_usd: 1.00
+  claude_code_budget_usd: 2.00
 
 review:
   enabled: true

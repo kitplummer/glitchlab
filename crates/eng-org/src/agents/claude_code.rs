@@ -307,6 +307,46 @@ impl Agent for ClaudeCodeImplementer {
             });
         }
 
+        // Claude Code hit its per-invocation budget limit. is_error is false
+        // but the result text is empty. Check the worktree for partial work.
+        if result.subtype == "error_max_budget_usd" {
+            warn!(
+                cost = result.total_cost_usd,
+                turns = result.num_turns,
+                "claude code hit budget limit, checking worktree for partial changes"
+            );
+            let data = match detect_changes_from_worktree(working_dir).await {
+                Some(detected) => {
+                    info!(
+                        files_changed = detected["files_changed"]
+                            .as_array()
+                            .map(|a| a.len())
+                            .unwrap_or(0),
+                        "recovered partial changes from worktree after budget exhaustion"
+                    );
+                    detected
+                }
+                None => serde_json::json!({
+                    "files_changed": [],
+                    "tests_added": [],
+                    "tests_passing": false,
+                    "commit_message": "chore: no changes produced",
+                    "summary": "Claude Code budget exhausted with no file changes",
+                    "stuck": true,
+                    "stuck_reason": "budget_exhausted",
+                }),
+            };
+            let parse_error = !data
+                .get("tests_passing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            return Ok(AgentOutput {
+                data,
+                metadata,
+                parse_error,
+            });
+        }
+
         // Parse the implementer's final JSON from the result text.
         // If the result text is empty (Claude exhausted turns doing tool calls
         // without a final text response), fall back to detecting changes from
