@@ -38,6 +38,8 @@ pub struct Bead {
     pub labels: Vec<String>,
     #[serde(default)]
     pub assignee: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// A dependency edge between two beads.
@@ -419,6 +421,7 @@ mod tests {
             external_ref: Some("https://example.com".into()),
             labels: vec!["label1".into()],
             assignee: None,
+            created_at: None,
         };
         let json = serde_json::to_string(&bead).unwrap();
         let parsed: Bead = serde_json::from_str(&json).unwrap();
@@ -492,6 +495,14 @@ mod tests {
         assert_eq!(bead.dependencies[0].dep_type, "parent-child");
         assert_eq!(bead.dependencies[1].target_id, "gl-1e0.1");
         assert_eq!(bead.dependencies[1].dep_type, "blocks");
+        assert_eq!(bead.created_at.as_deref(), Some("2026-02-23T22:20:42Z"));
+    }
+
+    #[test]
+    fn bead_created_at_defaults_to_none() {
+        let json = r#"{"id": "t1", "title": "No date"}"#;
+        let bead: Bead = serde_json::from_str(json).unwrap();
+        assert!(bead.created_at.is_none());
     }
 
     // -----------------------------------------------------------------------

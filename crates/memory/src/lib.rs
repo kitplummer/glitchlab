@@ -1,5 +1,6 @@
 pub mod beads;
 pub mod composite;
+pub mod dedup;
 #[cfg(feature = "dolt")]
 pub mod dolt;
 pub mod error;

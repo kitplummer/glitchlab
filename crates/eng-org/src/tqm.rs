@@ -53,6 +53,12 @@ pub struct TQMConfig {
     /// Priority for generated remediation tasks (lower = higher priority).
     #[serde(default = "default_remediation_priority")]
     pub remediation_priority: u32,
+    /// Maximum number of open TQM remediation beads before throttling.
+    #[serde(default = "default_max_open_remediation")]
+    pub max_open_remediation: usize,
+    /// Maximum new remediation tasks created per batch run.
+    #[serde(default = "default_max_new_per_run")]
+    pub max_new_per_run: usize,
 }
 
 fn default_decomposition_loop() -> u32 {
@@ -85,6 +91,12 @@ fn default_remediation_enabled() -> bool {
 fn default_remediation_priority() -> u32 {
     5
 }
+fn default_max_open_remediation() -> usize {
+    10
+}
+fn default_max_new_per_run() -> usize {
+    3
+}
 
 impl Default for TQMConfig {
     fn default() -> Self {
@@ -99,6 +111,8 @@ impl Default for TQMConfig {
             provider_failure_threshold: default_provider_failures(),
             remediation_enabled: true,
             remediation_priority: default_remediation_priority(),
+            max_open_remediation: default_max_open_remediation(),
+            max_new_per_run: default_max_new_per_run(),
         }
     }
 }
@@ -653,6 +667,7 @@ fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::ta
         remediation_depth: 0,
         is_remediation: true,
         files_hint: None,
+        created_at: None,
     })
 }
 
@@ -689,12 +704,33 @@ pub fn generate_remediation_tasks(
 ///
 /// Returns an empty vec if `config.remediation_enabled` is false.
 /// Skips patterns whose kind already has a pending/in-progress remediation task.
+///
+/// `open_tqm_bead_count` is the number of currently open TQM remediation beads
+/// (across all runs). The function applies two caps:
+/// 1. Global cap: `config.max_open_remediation - open_tqm_bead_count`
+/// 2. Per-run cap: `config.max_new_per_run`
 pub fn generate_deduplicated_remediation_tasks(
     patterns: &[DetectedPattern],
     config: &TQMConfig,
     queue: &crate::taskqueue::TaskQueue,
+    open_tqm_bead_count: usize,
 ) -> Vec<crate::taskqueue::Task> {
     if !config.remediation_enabled {
+        return Vec::new();
+    }
+
+    let remaining_capacity = config
+        .max_open_remediation
+        .saturating_sub(open_tqm_bead_count);
+    let effective_limit = remaining_capacity.min(config.max_new_per_run);
+
+    if effective_limit == 0 {
+        tracing::info!(
+            open_tqm_bead_count,
+            max_open = config.max_open_remediation,
+            max_per_run = config.max_new_per_run,
+            "TQM remediation throttled — cap reached"
+        );
         return Vec::new();
     }
 
@@ -713,6 +749,7 @@ pub fn generate_deduplicated_remediation_tasks(
     filtered
         .iter()
         .filter_map(|p| pattern_to_task(p, config.remediation_priority))
+        .take(effective_limit)
         .collect()
 }
 
@@ -1301,7 +1338,7 @@ mod tests {
         };
         let queue = crate::taskqueue::TaskQueue::from_tasks(vec![]);
         let patterns = vec![make_pattern(PatternKind::StuckAgents, vec!["t1".into()])];
-        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue);
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue, 0);
         assert!(tasks.is_empty());
     }
 
@@ -1326,6 +1363,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: true,
             files_hint: None,
+            created_at: None,
         };
         let queue = crate::taskqueue::TaskQueue::from_tasks(vec![existing]);
 
@@ -1333,7 +1371,7 @@ mod tests {
             make_pattern(PatternKind::StuckAgents, vec!["t1".into()]),
             make_pattern(PatternKind::TestFlakiness, vec!["t2".into()]),
         ];
-        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue);
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue, 0);
         // StuckAgents is deduplicated, only TestFlakiness remains.
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].id.starts_with("gl-tqm-test-flaky-"));
@@ -1351,8 +1389,94 @@ mod tests {
             make_pattern(PatternKind::StuckAgents, vec!["t1".into()]),
             make_pattern(PatternKind::TestFlakiness, vec!["t2".into()]),
         ];
-        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue);
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue, 0);
         assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn dedup_throttled_by_global_cap() {
+        let config = TQMConfig {
+            remediation_enabled: true,
+            max_open_remediation: 10,
+            max_new_per_run: 5,
+            ..TQMConfig::default()
+        };
+        let queue = crate::taskqueue::TaskQueue::from_tasks(vec![]);
+        let patterns = vec![
+            make_pattern(PatternKind::StuckAgents, vec!["t1".into()]),
+            make_pattern(PatternKind::TestFlakiness, vec!["t2".into()]),
+        ];
+        // Already 10 open TQM beads → 0 remaining capacity
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue, 10);
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn dedup_throttled_by_per_run_cap() {
+        let config = TQMConfig {
+            remediation_enabled: true,
+            max_open_remediation: 20,
+            max_new_per_run: 1,
+            ..TQMConfig::default()
+        };
+        let queue = crate::taskqueue::TaskQueue::from_tasks(vec![]);
+        let patterns = vec![
+            make_pattern(PatternKind::StuckAgents, vec!["t1".into()]),
+            make_pattern(PatternKind::TestFlakiness, vec!["t2".into()]),
+        ];
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue, 0);
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn dedup_global_cap_partially_limits() {
+        let config = TQMConfig {
+            remediation_enabled: true,
+            max_open_remediation: 10,
+            max_new_per_run: 5,
+            ..TQMConfig::default()
+        };
+        let queue = crate::taskqueue::TaskQueue::from_tasks(vec![]);
+        let patterns = vec![
+            make_pattern(PatternKind::StuckAgents, vec!["t1".into()]),
+            make_pattern(PatternKind::TestFlakiness, vec!["t2".into()]),
+            make_pattern(PatternKind::ScopeCreep, vec!["t3".into()]),
+        ];
+        // 9 open → remaining capacity = 1
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue, 9);
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn dedup_zero_open_no_throttle() {
+        let config = TQMConfig {
+            remediation_enabled: true,
+            max_open_remediation: 10,
+            max_new_per_run: 10,
+            ..TQMConfig::default()
+        };
+        let queue = crate::taskqueue::TaskQueue::from_tasks(vec![]);
+        let patterns = vec![
+            make_pattern(PatternKind::StuckAgents, vec!["t1".into()]),
+            make_pattern(PatternKind::TestFlakiness, vec!["t2".into()]),
+        ];
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue, 0);
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn dedup_over_capacity_returns_empty() {
+        let config = TQMConfig {
+            remediation_enabled: true,
+            max_open_remediation: 5,
+            max_new_per_run: 10,
+            ..TQMConfig::default()
+        };
+        let queue = crate::taskqueue::TaskQueue::from_tasks(vec![]);
+        let patterns = vec![make_pattern(PatternKind::StuckAgents, vec!["t1".into()])];
+        // Already over cap (15 open > max 5)
+        let tasks = generate_deduplicated_remediation_tasks(&patterns, &config, &queue, 15);
+        assert!(tasks.is_empty());
     }
 
     // -----------------------------------------------------------------------
