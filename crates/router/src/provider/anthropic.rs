@@ -66,7 +66,7 @@ impl AnthropicProvider {
         let latency_ms = start.elapsed().as_millis() as u64;
         let status = resp.status().as_u16();
 
-        if status == 429 || status == 529 {
+        if status == 429 || status == 503 || status == 529 {
             return Err(ProviderError::RateLimited {
                 retry_after_ms: resp
                     .headers()
@@ -74,7 +74,11 @@ impl AnthropicProvider {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok())
                     .map(|s| s * 1000)
-                    .or(if status == 529 { Some(5000) } else { None }),
+                    .or(if status == 503 || status == 529 {
+                        Some(5000)
+                    } else {
+                        None
+                    }),
             });
         }
 
@@ -372,6 +376,7 @@ mod tests {
         let status_line = match status {
             200 => "200 OK",
             429 => "429 Too Many Requests",
+            503 => "503 Service Unavailable",
             529 => "529 Overloaded",
             _ => "500 Internal Server Error",
         };
@@ -486,6 +491,27 @@ mod tests {
     #[tokio::test]
     async fn complete_overloaded_529() {
         let url = mock_server(529, "{}".into()).await;
+        let provider = AnthropicProvider::with_base_url("test-key".into(), url);
+        let result = provider
+            .complete(
+                "claude-sonnet-4-20250514",
+                &test_messages(),
+                0.2,
+                4096,
+                None,
+            )
+            .await;
+        match result {
+            Err(ProviderError::RateLimited { retry_after_ms }) => {
+                assert_eq!(retry_after_ms, Some(5000));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_service_unavailable_503() {
+        let url = mock_server(503, "{}".into()).await;
         let provider = AnthropicProvider::with_base_url("test-key".into(), url);
         let result = provider
             .complete(

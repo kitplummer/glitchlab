@@ -702,11 +702,16 @@ impl Orchestrator {
         // --- Task loop ---
         loop {
             // --- Check budget ---
-            let per_task_dollars = self.config.limits.max_dollars_per_task;
-            if !budget.can_afford(per_task_dollars) {
+            // Use half the per-task max as the exhaustion threshold. The max is a
+            // ceiling, not a cost estimate — most tasks cost less, so we should
+            // attempt another task whenever there's a reasonable chance of completing it.
+            let per_task_max = self.config.limits.max_dollars_per_task;
+            let exhaustion_threshold = per_task_max * 0.5;
+            if !budget.can_afford(exhaustion_threshold) {
                 info!(
                     remaining = budget.remaining_dollars(),
-                    per_task = per_task_dollars,
+                    threshold = exhaustion_threshold,
+                    per_task_max = per_task_max,
                     "budget exhausted"
                 );
                 result.cease_reason = CeaseReason::BudgetExhausted;
@@ -2574,6 +2579,28 @@ mod tests {
     }
 
     #[test]
+    fn budget_exhaustion_threshold_should_attempt() {
+        // $5.00 total, spent $3.50 → $1.50 remaining.
+        // With max_dollars_per_task = $2.00, threshold = $1.00.
+        // $1.50 >= $1.00 → should attempt another task.
+        let mut budget = CumulativeBudget::new(5.0);
+        budget.record("task-1", 3.50, 30000, "PrCreated");
+        let threshold = 2.0 * 0.5; // 50% of per-task max
+        assert!(budget.can_afford(threshold));
+    }
+
+    #[test]
+    fn budget_exhaustion_threshold_should_stop() {
+        // $5.00 total, spent $4.10 → $0.90 remaining.
+        // With max_dollars_per_task = $2.00, threshold = $1.00.
+        // $0.90 < $1.00 → should stop.
+        let mut budget = CumulativeBudget::new(5.0);
+        budget.record("task-1", 4.10, 40000, "PrCreated");
+        let threshold = 2.0 * 0.5;
+        assert!(!budget.can_afford(threshold));
+    }
+
+    #[test]
     fn budget_remaining_never_negative() {
         let mut budget = CumulativeBudget::new(5.0);
         budget.record("task-1", 10.0, 100000, "PrCreated");
@@ -3039,12 +3066,9 @@ mod tests {
             pending_task("b3", "third"),
         ];
         let mut queue = TaskQueue::from_tasks(tasks);
-        // Total budget $90, per-task $50. After 1 task (even if it fails with
-        // $0 cost), the budget check requires $50 remaining.
-        // With $90 total and $50 per task, can afford at most 1 task fully.
-        // But since setup failures cost $0, the budget isn't consumed.
-        // Use a smaller total budget to trigger exhaustion.
-        let mut budget = CumulativeBudget::new(40.0); // less than $50 per task
+        // Exhaustion threshold = 50% of per-task max = $25.
+        // Use a total budget below $25 so the first budget check fails immediately.
+        let mut budget = CumulativeBudget::new(20.0);
         let params = OrchestratorParams {
             repo_path: dir.path().to_path_buf(),
             base_branch: "main".into(),
