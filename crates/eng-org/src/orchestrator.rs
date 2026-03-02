@@ -1402,6 +1402,7 @@ impl Orchestrator {
             },
             PipelineStatus::ImplementationFailed
             | PipelineStatus::TestsFailed
+            | PipelineStatus::BudgetExceeded
             | PipelineStatus::BoundaryViolation
             | PipelineStatus::PlanFailed => OutcomeRouting {
                 task_status: TaskStatus::Failed,

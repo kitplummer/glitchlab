@@ -45,6 +45,9 @@ pub struct TQMConfig {
     /// Number of setup/provider errors before flagging.
     #[serde(default = "default_provider_failures")]
     pub provider_failure_threshold: u32,
+    /// Number of per-task budget exhaustions before flagging.
+    #[serde(default = "default_task_budget_exhaustion")]
+    pub task_budget_exhaustion_threshold: u32,
 
     // -- Remediation task generation --
     /// Whether to generate remediation tasks from detected patterns.
@@ -85,6 +88,9 @@ fn default_budget_pressure() -> f64 {
 fn default_provider_failures() -> u32 {
     3
 }
+fn default_task_budget_exhaustion() -> u32 {
+    2
+}
 fn default_remediation_enabled() -> bool {
     true
 }
@@ -109,6 +115,7 @@ impl Default for TQMConfig {
             architect_rejection_rate_threshold: default_architect_rejection(),
             budget_pressure_threshold: default_budget_pressure(),
             provider_failure_threshold: default_provider_failures(),
+            task_budget_exhaustion_threshold: default_task_budget_exhaustion(),
             remediation_enabled: true,
             remediation_priority: default_remediation_priority(),
             max_open_remediation: default_max_open_remediation(),
@@ -143,6 +150,8 @@ pub enum PatternKind {
     ProviderFailures,
     /// A task hit a boundary/protected-path violation.
     BoundaryViolation,
+    /// Individual tasks exhausted their per-task budget.
+    TaskBudgetExhaustion,
 }
 
 /// A pattern detected by the TQM analyzer.
@@ -207,6 +216,7 @@ pub fn analyze(result: &OrchestratorResult, config: &TQMConfig) -> Vec<DetectedP
     check_budget_pressure(result, config, &mut patterns);
     check_provider_failures(result, config, &mut patterns);
     check_boundary_violations(result, config, &mut patterns);
+    check_task_budget_exhaustion(result, config, &mut patterns);
 
     patterns
 }
@@ -244,6 +254,7 @@ pub fn analyze_incremental(
     check_budget_pressure(result, config, &mut patterns);
     check_provider_failures(result, config, &mut patterns);
     check_boundary_violations(result, config, &mut patterns);
+    check_task_budget_exhaustion(result, config, &mut patterns);
 
     // Filter out patterns whose kind was already detected in a previous call.
     patterns.retain(|p| !already_detected.contains(&p.kind));
@@ -525,6 +536,39 @@ fn check_provider_failures(
     }
 }
 
+/// Check for per-task budget exhaustion.
+fn check_task_budget_exhaustion(
+    result: &OrchestratorResult,
+    config: &TQMConfig,
+    patterns: &mut Vec<DetectedPattern>,
+) {
+    use glitchlab_kernel::outcome::ObstacleKind;
+
+    let mut affected = Vec::new();
+    for run in &result.run_results {
+        if let Some(ref ctx) = run.outcome_context
+            && matches!(ctx.obstacle, ObstacleKind::BudgetExhaustion { .. })
+        {
+            affected.push(run.task_id.clone());
+        }
+    }
+
+    let count = affected.len() as u32;
+    if count >= config.task_budget_exhaustion_threshold {
+        patterns.push(DetectedPattern {
+            kind: PatternKind::TaskBudgetExhaustion,
+            description: format!(
+                "{count} task(s) exhausted their per-task budget (threshold: {})",
+                config.task_budget_exhaustion_threshold
+            ),
+            occurrences: count,
+            threshold: config.task_budget_exhaustion_threshold as f64,
+            severity: "warning".into(),
+            affected_tasks: affected,
+        });
+    }
+}
+
 /// Check for boundary/protected-path violations.
 ///
 /// Fires on the first occurrence — no threshold configuration needed.
@@ -573,6 +617,7 @@ pub(crate) fn kind_slug(kind: PatternKind) -> &'static str {
         PatternKind::BudgetPressure => "budget",
         PatternKind::ProviderFailures => "provider",
         PatternKind::BoundaryViolation => "boundary",
+        PatternKind::TaskBudgetExhaustion => "task-budget",
     }
 }
 
@@ -642,6 +687,10 @@ fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::ta
         PatternKind::BoundaryViolation => {
             let ids = pattern.affected_tasks.join(", ");
             format!("TQM: Investigate boundary violations for tasks: {ids}")
+        }
+        PatternKind::TaskBudgetExhaustion => {
+            let ids = pattern.affected_tasks.join(", ");
+            format!("TQM: Upsize or decompose budget-exhausting tasks: {ids}")
         }
         // Advisory-only patterns — not actionable.
         PatternKind::BudgetPressure | PatternKind::ProviderFailures => return None,
@@ -1069,6 +1118,80 @@ mod tests {
     }
 
     #[test]
+    fn task_budget_exhaustion_below_threshold() {
+        let mut result = empty_result();
+        result.tasks_attempted = 1;
+        result.run_results = vec![run_result_with_context(
+            "t1",
+            "BudgetExceeded",
+            ObstacleKind::BudgetExhaustion {
+                dollars_spent: 1.08,
+                tokens_used: 120_000,
+                dollars_budget: 2.00,
+                tokens_budget: 150_000,
+            },
+        )];
+        let patterns = analyze(&result, &TQMConfig::default());
+        assert!(
+            !patterns
+                .iter()
+                .any(|p| p.kind == PatternKind::TaskBudgetExhaustion)
+        );
+    }
+
+    #[test]
+    fn task_budget_exhaustion_at_threshold() {
+        let mut result = empty_result();
+        result.tasks_attempted = 2;
+        result.run_results = vec![
+            run_result_with_context(
+                "t1",
+                "BudgetExceeded",
+                ObstacleKind::BudgetExhaustion {
+                    dollars_spent: 1.08,
+                    tokens_used: 120_000,
+                    dollars_budget: 2.00,
+                    tokens_budget: 150_000,
+                },
+            ),
+            run_result_with_context(
+                "t2",
+                "BudgetExceeded",
+                ObstacleKind::BudgetExhaustion {
+                    dollars_spent: 0.95,
+                    tokens_used: 100_000,
+                    dollars_budget: 1.00,
+                    tokens_budget: 120_000,
+                },
+            ),
+        ];
+        let patterns = analyze(&result, &TQMConfig::default());
+        let budget = patterns
+            .iter()
+            .find(|p| p.kind == PatternKind::TaskBudgetExhaustion);
+        assert!(budget.is_some());
+        let b = budget.unwrap();
+        assert_eq!(b.severity, "warning");
+        assert_eq!(b.occurrences, 2);
+        assert_eq!(b.affected_tasks.len(), 2);
+    }
+
+    #[test]
+    fn task_budget_exhaustion_generates_remediation() {
+        let pattern = DetectedPattern {
+            kind: PatternKind::TaskBudgetExhaustion,
+            description: "2 tasks exhausted budget".into(),
+            occurrences: 2,
+            threshold: 2.0,
+            severity: "warning".into(),
+            affected_tasks: vec!["t1".into(), "t2".into()],
+        };
+        let tasks = generate_remediation_tasks(&[pattern], &TQMConfig::default());
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].objective.contains("Upsize or decompose"));
+    }
+
+    #[test]
     fn multiple_simultaneous_patterns() {
         let mut result = empty_result();
         result.tasks_attempted = 6;
@@ -1101,6 +1224,7 @@ mod tests {
         assert!((config.architect_rejection_rate_threshold - 0.5).abs() < f64::EPSILON);
         assert!((config.budget_pressure_threshold - 0.9).abs() < f64::EPSILON);
         assert_eq!(config.provider_failure_threshold, 3);
+        assert_eq!(config.task_budget_exhaustion_threshold, 2);
         assert!(config.remediation_enabled);
         assert_eq!(config.remediation_priority, 5);
     }

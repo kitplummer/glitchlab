@@ -1351,6 +1351,47 @@ impl EngineeringPipeline {
                     .await;
             }
 
+            // Budget exhaustion — capture cost data in OutcomeContext so the
+            // planner and triage can learn from overspend history.
+            if reason == "budget_exhausted" {
+                let cost = impl_output.metadata.cost;
+                let tokens = impl_output.metadata.tokens;
+                let budget_summary = self.router.budget_summary().await;
+                return self
+                    .fail_with_context(
+                        ctx,
+                        PipelineStatus::BudgetExceeded,
+                        format!("implementer exhausted budget: ${cost:.2}"),
+                        Some(OutcomeContext {
+                            approach: impl_output.data["summary"]
+                                .as_str()
+                                .unwrap_or("direct implementation")
+                                .to_string(),
+                            obstacle: glitchlab_kernel::outcome::ObstacleKind::BudgetExhaustion {
+                                dollars_spent: cost,
+                                tokens_used: tokens,
+                                dollars_budget: budget_summary.dollars_remaining + cost,
+                                tokens_budget: budget_summary.tokens_remaining + tokens,
+                            },
+                            discoveries: impl_output.data["files_changed"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| {
+                                            v.as_str().map(|s| format!("partially modified: {s}"))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            recommendation: Some(
+                                "Upsize to L or decompose into smaller sub-tasks".into(),
+                            ),
+                            files_explored: vec![],
+                        }),
+                    )
+                    .await;
+            }
+
             // Pure parse error (LLM returned garbage) — try model escalation
             // before giving up. Stuck-loop failures are not retryable.
             if reason == "parse_error" {

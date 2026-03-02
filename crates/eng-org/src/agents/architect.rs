@@ -61,6 +61,14 @@ the implementation WILL fail. In this case, return verdict "needs_refinement" wi
 `suggested_changes` explaining that the protected paths must be excluded and the task
 decomposed or declared infeasible.
 
+## Budget overrun handling
+
+If the context includes a "Budget Overrun History" section, a previous attempt
+exhausted its budget. You MUST upsize:
+- Previous S → assign M
+- Previous M → assign L
+- Previous L → assign XL (forces decomposition)
+
 Rules:
 - verdict "already_done" means the planned work already exists in the codebase.
 - verdict "needs_refinement" means the plan has issues but isn't fundamentally wrong.

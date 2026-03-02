@@ -315,6 +315,22 @@ impl HistoryBackend for JsonlHistory {
                 if let Some(err) = &entry.error {
                     context.push_str(&format!(": {err}"));
                 }
+                // Append cost data so the planner can reason about budget sizing.
+                if entry.budget.estimated_cost > 0.0 {
+                    context.push_str(&format!(
+                        " [cost: ${:.2}, tokens: {}]",
+                        entry.budget.estimated_cost, entry.budget.total_tokens
+                    ));
+                }
+                // Flag budget exhaustion explicitly for planner visibility.
+                if let Some(ref oc) = entry.outcome_context
+                    && matches!(
+                        oc.obstacle,
+                        glitchlab_kernel::outcome::ObstacleKind::BudgetExhaustion { .. }
+                    )
+                {
+                    context.push_str(" ← BUDGET EXHAUSTED, needs upsize or decomposition");
+                }
                 context.push('\n');
             }
             Ok(context)
@@ -671,5 +687,49 @@ mod tests {
         assert_eq!(parsed.original_model, "claude-3-opus-20240229");
         assert_eq!(parsed.escalated_model, "gpt-4-turbo");
         assert_eq!(parsed.reason, "model lacked capability");
+    }
+
+    #[tokio::test]
+    async fn failure_context_includes_cost_data() {
+        let (_dir, history) = temp_history();
+        let mut entry = sample_entry("costly-task", "error");
+        entry.budget.estimated_cost = 1.08;
+        entry.budget.total_tokens = 120_000;
+        history.record(&entry).await.unwrap();
+
+        let ctx = history.failure_context(5).await.unwrap();
+        assert!(
+            ctx.contains("[cost: $1.08, tokens: 120000]"),
+            "expected cost data in: {ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_context_flags_budget_exhaustion() {
+        use glitchlab_kernel::outcome::{ObstacleKind, OutcomeContext};
+
+        let (_dir, history) = temp_history();
+        let mut entry = sample_entry("budget-task", "error");
+        entry.budget.estimated_cost = 1.08;
+        entry.budget.total_tokens = 120_000;
+        entry.outcome_context = Some(OutcomeContext {
+            approach: "direct implementation".into(),
+            obstacle: ObstacleKind::BudgetExhaustion {
+                dollars_spent: 1.08,
+                tokens_used: 120_000,
+                dollars_budget: 2.00,
+                tokens_budget: 150_000,
+            },
+            discoveries: vec![],
+            recommendation: None,
+            files_explored: vec![],
+        });
+        history.record(&entry).await.unwrap();
+
+        let ctx = history.failure_context(5).await.unwrap();
+        assert!(
+            ctx.contains("BUDGET EXHAUSTED, needs upsize or decomposition"),
+            "expected budget exhaustion annotation in: {ctx}"
+        );
     }
 }

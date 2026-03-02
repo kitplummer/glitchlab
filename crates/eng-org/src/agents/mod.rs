@@ -392,6 +392,16 @@ pub(crate) fn render_obstacle_kind(obstacle: &ObstacleKind) -> String {
         } => {
             format!("Schema mismatch ({model}): expected {expected_schema}, {validation_error}")
         }
+        ObstacleKind::BudgetExhaustion {
+            dollars_spent,
+            dollars_budget,
+            tokens_used,
+            tokens_budget,
+        } => {
+            format!(
+                "Budget exhausted: spent ${dollars_spent:.2} of ${dollars_budget:.2} ({tokens_used} of {tokens_budget} tokens)"
+            )
+        }
         ObstacleKind::Unknown { detail } => {
             format!("Unknown obstacle: {detail}")
         }
@@ -490,6 +500,30 @@ pub(crate) fn build_user_message(ctx: &AgentContext) -> String {
              Do NOT repeat the same approach — use a different strategy.\n\n",
         );
         msg.push_str(&render_previous_attempts(&attempts));
+    }
+
+    // Budget overrun history — extracted from previous attempts so triage
+    // can upsize tasks that previously exhausted their budget.
+    if let Some(attempts_val) = ctx.extra.get("previous_attempts")
+        && let Ok(attempts) = serde_json::from_value::<Vec<OutcomeContext>>(attempts_val.clone())
+    {
+        let overruns: Vec<_> = attempts
+            .iter()
+            .filter(|a| matches!(a.obstacle, ObstacleKind::BudgetExhaustion { .. }))
+            .collect();
+        if !overruns.is_empty() {
+            msg.push_str("\n\n## Budget Overrun History\n\n");
+            msg.push_str(
+                "Previous attempts exhausted their budget. Upsize at least one level.\n\n",
+            );
+            for (i, a) in overruns.iter().enumerate() {
+                msg.push_str(&format!(
+                    "- Attempt {}: {}\n",
+                    i + 1,
+                    render_obstacle_kind(&a.obstacle)
+                ));
+            }
+        }
     }
 
     // Task constraints.
@@ -912,6 +946,64 @@ mod tests {
     }
 
     #[test]
+    fn build_user_message_with_budget_overrun_history() {
+        let mut ctx = base_ctx();
+        let attempts = vec![OutcomeContext {
+            approach: "direct implementation".into(),
+            obstacle: ObstacleKind::BudgetExhaustion {
+                dollars_spent: 1.08,
+                tokens_used: 120_000,
+                dollars_budget: 2.00,
+                tokens_budget: 150_000,
+            },
+            discoveries: vec![],
+            recommendation: Some("Upsize to L".into()),
+            files_explored: vec![],
+        }];
+        ctx.extra.insert(
+            "previous_attempts".into(),
+            serde_json::to_value(&attempts).unwrap(),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(
+            msg.contains("## Budget Overrun History"),
+            "expected budget overrun section in: {msg}"
+        );
+        assert!(
+            msg.contains("Upsize at least one level"),
+            "expected upsize instruction in: {msg}"
+        );
+        assert!(
+            msg.contains("Budget exhausted: spent $1.08"),
+            "expected cost details in: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_user_message_no_budget_overrun_without_exhaustion() {
+        let mut ctx = base_ctx();
+        let attempts = vec![OutcomeContext {
+            approach: "tried it".into(),
+            obstacle: ObstacleKind::TestFailure {
+                attempts: 3,
+                last_error: "assert failed".into(),
+            },
+            discoveries: vec![],
+            recommendation: None,
+            files_explored: vec![],
+        }];
+        ctx.extra.insert(
+            "previous_attempts".into(),
+            serde_json::to_value(&attempts).unwrap(),
+        );
+        let msg = build_user_message(&ctx);
+        assert!(
+            !msg.contains("Budget Overrun History"),
+            "should not contain budget overrun section for non-budget failures"
+        );
+    }
+
+    #[test]
     fn render_obstacle_kind_all_variants() {
         let cases: Vec<(ObstacleKind, &str)> = vec![
             (
@@ -968,6 +1060,15 @@ mod tests {
                     validation_error: "missing field steps".into(),
                 },
                 "Schema mismatch (sonnet)",
+            ),
+            (
+                ObstacleKind::BudgetExhaustion {
+                    dollars_spent: 1.08,
+                    tokens_used: 120_000,
+                    dollars_budget: 2.00,
+                    tokens_budget: 150_000,
+                },
+                "Budget exhausted: spent $1.08 of $2.00",
             ),
             (
                 ObstacleKind::Unknown {

@@ -105,6 +105,14 @@ pub enum ObstacleKind {
         validation_error: String,
     },
 
+    /// The agent exhausted its per-task budget before completing.
+    BudgetExhaustion {
+        dollars_spent: f64,
+        tokens_used: u64,
+        dollars_budget: f64,
+        tokens_budget: u64,
+    },
+
     /// Catch-all for unclassified obstacles.
     Unknown { detail: String },
 }
@@ -314,6 +322,33 @@ mod tests {
                 assert_eq!(model, "claude-3");
                 assert_eq!(expected_schema, "TaskPlan");
                 assert_eq!(validation_error, "missing required field 'steps'");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn obstacle_budget_exhaustion_serde() {
+        let o = ObstacleKind::BudgetExhaustion {
+            dollars_spent: 1.08,
+            tokens_used: 120_000,
+            dollars_budget: 2.00,
+            tokens_budget: 150_000,
+        };
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(json.contains("\"kind\":\"budget_exhaustion\""));
+        let parsed: ObstacleKind = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ObstacleKind::BudgetExhaustion {
+                dollars_spent,
+                tokens_used,
+                dollars_budget,
+                tokens_budget,
+            } => {
+                assert!((dollars_spent - 1.08).abs() < f64::EPSILON);
+                assert_eq!(tokens_used, 120_000);
+                assert!((dollars_budget - 2.00).abs() < f64::EPSILON);
+                assert_eq!(tokens_budget, 150_000);
             }
             _ => panic!("wrong variant"),
         }
