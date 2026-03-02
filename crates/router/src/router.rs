@@ -122,6 +122,44 @@ impl Router {
         self.select_with_fallbacks(role, &[]).await
     }
 
+    /// Resolve role → model string for `complete` / `complete_with_tools`.
+    ///
+    /// When a `ModelChooser` is configured it is used **exclusively**: if the
+    /// chooser returns `None` an error is returned immediately (no static-map
+    /// fallback).  When no chooser is configured, the static routing map is
+    /// used as usual.
+    ///
+    /// Temporary per-role overrides still take the highest precedence in both
+    /// cases.
+    async fn resolve_model_for_completion(&self, role: &str) -> error::Result<String> {
+        // Overrides always win (highest precedence).
+        if let Some(model) = self.overrides.lock().await.get(role) {
+            return Ok(model.clone());
+        }
+
+        if let Some(ref chooser) = self.chooser {
+            let budget = self.budget.lock().await;
+            let remaining = budget.dollars_remaining();
+            let max_budget = budget.max_dollars;
+            drop(budget);
+
+            return chooser
+                .select(role, remaining, max_budget)
+                .map(|m| m.to_string())
+                .ok_or_else(|| {
+                    error::Error::Config(format!(
+                        "ModelChooser could not select a model for role `{role}`"
+                    ))
+                });
+        }
+
+        // No chooser: use static routing map.
+        self.routing
+            .get(role)
+            .cloned()
+            .ok_or_else(|| error::Error::Config(format!("no model configured for role `{role}`")))
+    }
+
     /// Resolve role → model string using the chooser (if present) or the
     /// static routing map as a fallback. If the chooser or static map
     /// don't have a match, try the `fallbacks` in order.
@@ -182,8 +220,8 @@ impl Router {
             budget.check()?;
         }
 
-        // Resolve role → model string (chooser-aware).
-        let model_string = self.resolve_model(role).await?;
+        // Resolve role → model string (chooser-exclusive when chooser is set).
+        let model_string = self.resolve_model_for_completion(role).await?;
 
         let (provider_name, model_id) = parse_model_string(&model_string);
 
@@ -294,8 +332,8 @@ impl Router {
             budget.check()?;
         }
 
-        // Resolve role → model string (chooser-aware).
-        let model_string = self.resolve_model(role).await?;
+        // Resolve role → model string (chooser-exclusive when chooser is set).
+        let model_string = self.resolve_model_for_completion(role).await?;
 
         let (provider_name, model_id) = parse_model_string(&model_string);
 
@@ -1462,5 +1500,72 @@ mod tests {
         // No chooser attached → escalation not possible.
         let escalated = router.escalate_model("planner").await;
         assert_eq!(escalated, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Chooser-exclusive model resolution tests for complete / complete_with_tools
+    // -----------------------------------------------------------------------
+
+    fn impossible_chooser() -> ModelChooser {
+        // A chooser that has an entry for "special_role" requiring a capability
+        // that no model in the pool provides — so select() always returns None.
+        let models = vec![ModelProfile {
+            model_string: "mock/cheap".into(),
+            input_cost_per_m: 0.1,
+            output_cost_per_m: 0.3,
+            tier: ModelTier::Economy,
+            capabilities: HashSet::new(), // no capabilities
+        }];
+        let roles = HashMap::from([(
+            "special_role".into(),
+            RolePreference {
+                min_tier: ModelTier::Economy,
+                required_capabilities: HashSet::from(["nonexistent_cap".into()]),
+            },
+        )]);
+        ModelChooser::new(models, roles, 0.5)
+    }
+
+    /// When a ModelChooser is configured but cannot find a model for the role,
+    /// `complete` must return an error and must NOT fall back to the static map.
+    #[tokio::test]
+    async fn complete_chooser_no_match_returns_error() {
+        // Static routing has a valid fallback, but the chooser is present and fails.
+        let routing = HashMap::from([("special_role".to_string(), "mock/static".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget).with_chooser(impossible_chooser());
+        router.register_provider("mock".into(), Arc::new(MockProvider::ok()));
+
+        let result = router
+            .complete("special_role", &test_messages(), 0.2, 4096, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "complete() should error when chooser is set but cannot select a model"
+        );
+    }
+
+    /// Same guarantee for `complete_with_tools`.
+    #[tokio::test]
+    async fn complete_with_tools_chooser_no_match_returns_error() {
+        let routing = HashMap::from([("special_role".to_string(), "mock/static".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let mut router = Router::new(routing, budget).with_chooser(impossible_chooser());
+        router.register_provider("mock".into(), Arc::new(MockToolProvider::with_tool_call()));
+
+        let result = router
+            .complete_with_tools(
+                "special_role",
+                &test_messages(),
+                0.2,
+                4096,
+                &test_tool_defs(),
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "complete_with_tools() should error when chooser is set but cannot select a model"
+        );
     }
 }
