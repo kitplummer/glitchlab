@@ -7152,12 +7152,12 @@ mod tests {
             result.error
         );
 
-        // Budget effective limit = M ceiling (120k) + planner overhead.
+        // Budget effective limit = M ceiling (160k) + planner overhead.
         // Short-circuit skips triage, so overhead is just the planner call.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 121_000,
-            "short-circuit should use ~M budget (120k + overhead), got remaining: {}",
+            summary.tokens_remaining <= 161_000,
+            "short-circuit should use ~M budget (160k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }
