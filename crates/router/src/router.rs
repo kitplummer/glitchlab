@@ -426,8 +426,7 @@ impl Router {
     /// and bump the call count.
     pub async fn record_external_cost(&self, cost: f64) {
         let mut budget = self.budget.lock().await;
-        budget.usage.estimated_cost += cost;
-        budget.usage.call_count += 1;
+        budget.record_llm_cost(cost);
     }
 
     /// Get a snapshot of the current budget state.

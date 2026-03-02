@@ -116,6 +116,17 @@ impl BudgetTracker {
         )
     }
 
+    /// Record a dollar cost from an external tool (e.g. Claude Code CLI)
+    /// that does not report token counts.
+    ///
+    /// Increments `estimated_cost` by `cost_usd` and bumps `call_count`.
+    /// Token fields (`prompt_tokens`, `completion_tokens`, `total_tokens`)
+    /// are left unchanged because the external tool does not expose them.
+    pub fn record_llm_cost(&mut self, cost_usd: f64) {
+        self.usage.estimated_cost += cost_usd;
+        self.usage.call_count += 1;
+    }
+
     /// Summary snapshot for history/reporting.
     pub fn summary(&self) -> BudgetSummary {
         BudgetSummary {
@@ -266,5 +277,48 @@ mod tests {
         let mut budget = BudgetTracker::new(10_000, 1.0);
         budget.record(0, 0, 2.0); // over-spend
         assert_eq!(budget.remaining_cost_percentage(), Some(0.0));
+    }
+
+    #[test]
+    fn record_llm_cost_accumulates_cost() {
+        let mut budget = BudgetTracker::new(10_000, 5.0);
+        budget.record_llm_cost(0.25);
+        assert!((budget.usage.estimated_cost - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_llm_cost_increments_call_count() {
+        let mut budget = BudgetTracker::new(10_000, 5.0);
+        budget.record_llm_cost(0.10);
+        assert_eq!(budget.usage.call_count, 1);
+        budget.record_llm_cost(0.05);
+        assert_eq!(budget.usage.call_count, 2);
+    }
+
+    #[test]
+    fn record_llm_cost_does_not_affect_tokens() {
+        let mut budget = BudgetTracker::new(10_000, 5.0);
+        budget.record_llm_cost(0.42);
+        assert_eq!(budget.usage.prompt_tokens, 0);
+        assert_eq!(budget.usage.completion_tokens, 0);
+        assert_eq!(budget.usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn record_llm_cost_multiple_calls_accumulate() {
+        let mut budget = BudgetTracker::new(10_000, 5.0);
+        budget.record_llm_cost(0.10);
+        budget.record_llm_cost(0.20);
+        budget.record_llm_cost(0.30);
+        assert!((budget.usage.estimated_cost - 0.60).abs() < 1e-10);
+        assert_eq!(budget.usage.call_count, 3);
+    }
+
+    #[test]
+    fn record_llm_cost_triggers_exceeded_when_over_limit() {
+        let mut budget = BudgetTracker::new(10_000, 1.0);
+        budget.record_llm_cost(1.50);
+        assert!(budget.exceeded());
+        assert!(budget.check().is_err());
     }
 }
