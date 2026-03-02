@@ -55,10 +55,11 @@ Output schema (valid JSON only, no markdown, no commentary):
 Rules:
 - Review ALL beads provided. Every bead must have an entry in "actions".
 - "close" means the bead's work already exists in the codebase.
-- "reprioritize" means the priority should change (provide new_priority 0-100).
-- "flag_stale" means the bead has been superseded or is no longer relevant.
+- "reprioritize" means the priority should change (provide new_priority 0-4, where 0=critical, 1=high, 2=normal, 3=low, 4=backlog).
+- "flag_stale" means the bead has been superseded or is no longer relevant. Flag beads open >14 days with no progress as stale.
 - "flag_misaligned" means the bead doesn't match its ADR requirements.
 - "no_action" means the bead is fine as-is.
+- Flag beads whose work overlaps significantly with another open bead as candidates for close or consolidation.
 - Set confidence 0.0-1.0 for each action. Higher = more certain.
 - Produce valid JSON only."#;
 

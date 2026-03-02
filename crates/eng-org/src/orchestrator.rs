@@ -524,6 +524,17 @@ pub(crate) struct BacklogReviewResult {
     pub(crate) skipped: bool,
 }
 
+/// Structured output from `apply_review_verdicts`.
+#[derive(Debug, Default)]
+pub(crate) struct ReviewActions {
+    /// Number of actions actually applied to the task queue.
+    pub(crate) applied_count: usize,
+    /// Bead IDs that should be closed in the beads backend.
+    pub(crate) beads_to_close: Vec<String>,
+    /// Bead IDs that should be reprioritized: `(id, new_priority)`.
+    pub(crate) beads_to_reprioritize: Vec<(String, i32)>,
+}
+
 impl BacklogReviewResult {
     fn skipped() -> Self {
         Self {
@@ -673,6 +684,20 @@ impl Orchestrator {
 
         // --- ADR watch state ---
         let mut adr_watch_state = AdrWatchState::new();
+
+        // --- TQM bead count for throttling ---
+        // Count open TQM remediation beads once at start. Track newly-created
+        // count during the run so the running total stays accurate.
+        let initial_tqm_bead_count = {
+            let client = glitchlab_memory::beads::BeadsClient::new(&params.repo_path, None);
+            match client.list_parsed().await {
+                Ok(beads) => {
+                    glitchlab_memory::dedup::count_open_with_label(&beads, "tqm:remediation")
+                }
+                Err(_) => 0,
+            }
+        };
+        let mut tqm_beads_created_this_run: usize = 0;
 
         // --- Task loop ---
         loop {
@@ -912,6 +937,7 @@ impl Orchestrator {
                                 count: circuit_tasks.len(),
                                 task_ids: ids,
                             });
+                            tqm_beads_created_this_run += circuit_tasks.len();
                             Self::persist_tasks_as_beads(&params.repo_path, &circuit_tasks).await;
                             queue.inject_tasks(circuit_tasks);
                         } else {
@@ -921,6 +947,7 @@ impl Orchestrator {
                                     &new_patterns,
                                     &self.config.tqm,
                                     queue,
+                                    initial_tqm_bead_count + tqm_beads_created_this_run,
                                 );
                             if !fallback_tasks.is_empty() {
                                 let ids: Vec<String> =
@@ -934,6 +961,7 @@ impl Orchestrator {
                                     count: fallback_tasks.len(),
                                     task_ids: ids,
                                 });
+                                tqm_beads_created_this_run += fallback_tasks.len();
                                 Self::persist_tasks_as_beads(&params.repo_path, &fallback_tasks)
                                     .await;
                                 queue.inject_tasks(fallback_tasks);
@@ -945,6 +973,7 @@ impl Orchestrator {
                             &new_patterns,
                             &self.config.tqm,
                             queue,
+                            initial_tqm_bead_count + tqm_beads_created_this_run,
                         );
                         if !tasks.is_empty() {
                             let ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
@@ -957,6 +986,7 @@ impl Orchestrator {
                                 count: tasks.len(),
                                 task_ids: ids,
                             });
+                            tqm_beads_created_this_run += tasks.len();
                             Self::persist_tasks_as_beads(&params.repo_path, &tasks).await;
                             queue.inject_tasks(tasks);
                         }
@@ -1522,6 +1552,7 @@ impl Orchestrator {
                     remediation_depth: 1,
                     is_remediation: true,
                     files_hint: None,
+                    created_at: None,
                 })
             })
             .collect()
@@ -1648,6 +1679,7 @@ impl Orchestrator {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint,
+                created_at: None,
             });
         }
 
@@ -1749,11 +1781,26 @@ impl Orchestrator {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
 
-        let actions_applied = Self::apply_review_verdicts(queue, &output.data, &self.config.review);
+        let review_actions = Self::apply_review_verdicts(queue, &output.data, &self.config.review);
+
+        // Persist close/reprioritize actions to the beads backend.
+        let client = glitchlab_memory::beads::BeadsClient::new(repo_path, None);
+        for bead_id in &review_actions.beads_to_close {
+            if let Err(e) = client.close_bead(bead_id).await {
+                warn!(bead_id = %bead_id, error = %e, "failed to close bead from review");
+            }
+        }
+        for (bead_id, new_priority) in &review_actions.beads_to_reprioritize {
+            // bd doesn't have a "set priority" command, so we update status with
+            // a note. In practice, the queue change is sufficient.
+            let _ = client
+                .update_status(bead_id, &format!("reprioritized:{new_priority}"))
+                .await;
+        }
 
         let result = BacklogReviewResult {
             beads_reviewed,
-            actions_applied,
+            actions_applied: review_actions.applied_count,
             cost,
             skipped: false,
         };
@@ -1761,6 +1808,8 @@ impl Orchestrator {
         info!(
             beads_reviewed = result.beads_reviewed,
             actions_applied = result.actions_applied,
+            beads_closed = review_actions.beads_to_close.len(),
+            beads_reprioritized = review_actions.beads_to_reprioritize.len(),
             cost = result.cost,
             "backlog review complete"
         );
@@ -2131,6 +2180,7 @@ impl Orchestrator {
                     remediation_depth: 0,
                     is_remediation: false,
                     files_hint,
+                    created_at: None,
                 };
                 queue.inject_tasks(vec![task]);
                 created += 1;
@@ -2142,9 +2192,12 @@ impl Orchestrator {
 
     /// Persist tasks as beads so they survive across batch runs.
     ///
-    /// Non-fatal: logs a warning if any bead creation fails.
+    /// Deduplicates against existing beads before creating. Non-fatal: logs a
+    /// warning if any bead creation fails.
     async fn persist_tasks_as_beads(repo_path: &Path, tasks: &[crate::taskqueue::Task]) {
         let client = glitchlab_memory::beads::BeadsClient::new(repo_path, None);
+        let existing_beads = client.list_parsed().await.unwrap_or_default();
+
         for task in tasks {
             let mut title = task
                 .objective
@@ -2156,13 +2209,41 @@ impl Orchestrator {
                 title.truncate(197);
                 title.push_str("...");
             }
+
+            // Dedup check
+            match glitchlab_memory::dedup::check_duplicate(&title, &existing_beads, 0.8) {
+                glitchlab_memory::dedup::DedupVerdict::ExactDuplicate { existing_id } => {
+                    info!(
+                        task_id = %task.id,
+                        existing_id = %existing_id,
+                        "skipping bead creation — exact duplicate"
+                    );
+                    continue;
+                }
+                glitchlab_memory::dedup::DedupVerdict::NearDuplicate {
+                    existing_id,
+                    similarity,
+                } => {
+                    info!(
+                        task_id = %task.id,
+                        existing_id = %existing_id,
+                        similarity,
+                        "skipping bead creation — near duplicate"
+                    );
+                    continue;
+                }
+                glitchlab_memory::dedup::DedupVerdict::Unique => {}
+            }
+
+            let labels =
+                glitchlab_memory::dedup::normalize_labels(&["tqm:remediation".to_string()]);
             let req = glitchlab_memory::beads::BeadCreateRequest {
                 id: task.id.clone(),
                 title,
                 description: task.objective.clone(),
                 issue_type: "task".to_string(),
                 priority: (task.priority).min(4) as i32,
-                labels: vec!["tqm:remediation".to_string()],
+                labels,
             };
             if let Err(e) = client.create_bead_detailed(&req).await {
                 warn!(task_id = %task.id, error = %e, "failed to persist remediation task as bead");
@@ -2172,7 +2253,8 @@ impl Orchestrator {
 
     /// Persist ADR-decomposed beads using the decomposer's JSON output.
     ///
-    /// Non-fatal: logs warnings on failure.
+    /// Deduplicates against existing beads and normalizes labels. Non-fatal:
+    /// logs warnings on failure.
     async fn persist_adr_beads_from_output(
         repo_path: &Path,
         output_data: &serde_json::Value,
@@ -2180,6 +2262,7 @@ impl Orchestrator {
         max_beads: usize,
     ) {
         let client = glitchlab_memory::beads::BeadsClient::new(repo_path, None);
+        let existing_beads = client.list_parsed().await.unwrap_or_default();
         let beads = output_data
             .get("beads")
             .and_then(|v| v.as_array())
@@ -2209,6 +2292,31 @@ impl Orchestrator {
 
             let task_id = format!("{}-{adr_stem}-{id_suffix}", crate::config::BEAD_ID_PREFIX);
 
+            // Dedup check
+            match glitchlab_memory::dedup::check_duplicate(title, &existing_beads, 0.8) {
+                glitchlab_memory::dedup::DedupVerdict::ExactDuplicate { existing_id } => {
+                    info!(
+                        task_id = %task_id,
+                        existing_id = %existing_id,
+                        "skipping ADR bead creation — exact duplicate"
+                    );
+                    continue;
+                }
+                glitchlab_memory::dedup::DedupVerdict::NearDuplicate {
+                    existing_id,
+                    similarity,
+                } => {
+                    info!(
+                        task_id = %task_id,
+                        existing_id = %existing_id,
+                        similarity,
+                        "skipping ADR bead creation — near duplicate"
+                    );
+                    continue;
+                }
+                glitchlab_memory::dedup::DedupVerdict::Unique => {}
+            }
+
             let mut labels = vec![format!("adr:{adr_filename}")];
             if let Some(arr) = bead_value.get("labels").and_then(|v| v.as_array()) {
                 for l in arr {
@@ -2217,6 +2325,7 @@ impl Orchestrator {
                     }
                 }
             }
+            let labels = glitchlab_memory::dedup::normalize_labels(&labels);
 
             let req = glitchlab_memory::beads::BeadCreateRequest {
                 id: task_id.clone(),
@@ -2294,6 +2403,7 @@ impl Orchestrator {
             remediation_depth: 0,
             is_remediation: true,
             files_hint: Some(vec!["crates/eng-org/src/agents/claude_code.rs".into()]),
+            created_at: None,
         };
 
         queue.inject_tasks(vec![diag_task.clone()]);
@@ -2303,19 +2413,20 @@ impl Orchestrator {
 
     /// Apply review verdicts to the task queue, respecting confidence and config gates.
     ///
-    /// Returns the number of actions actually applied.
+    /// Returns structured actions including bead IDs to close/reprioritize.
     fn apply_review_verdicts(
         queue: &mut TaskQueue,
         review_output: &serde_json::Value,
         review_config: &crate::config::ReviewConfig,
-    ) -> usize {
+    ) -> ReviewActions {
+        let mut result = ReviewActions::default();
+
         let actions = match review_output.get("actions").and_then(|v| v.as_array()) {
             Some(a) => a,
-            None => return 0,
+            None => return result,
         };
 
         let threshold = review_config.confidence_threshold;
-        let mut applied = 0;
 
         for action in actions {
             let bead_id = match action.get("bead_id").and_then(|v| v.as_str()) {
@@ -2348,7 +2459,8 @@ impl Orchestrator {
                     if review_config.auto_close {
                         info!(bead_id, confidence, reason, "auto-closing bead");
                         queue.update_status(bead_id, TaskStatus::Skipped);
-                        applied += 1;
+                        result.applied_count += 1;
+                        result.beads_to_close.push(bead_id.to_string());
                     } else {
                         info!(
                             bead_id,
@@ -2366,7 +2478,10 @@ impl Orchestrator {
                                 confidence, new_priority, reason, "auto-reprioritizing bead"
                             );
                             queue.set_priority(bead_id, new_priority as u32);
-                            applied += 1;
+                            result.applied_count += 1;
+                            result
+                                .beads_to_reprioritize
+                                .push((bead_id.to_string(), new_priority as i32));
                         }
                     } else {
                         info!(
@@ -2394,7 +2509,7 @@ impl Orchestrator {
             }
         }
 
-        applied
+        result
     }
 }
 
@@ -2673,6 +2788,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(0.10); // less than per-task $0.50
@@ -2712,6 +2828,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "b".into(),
@@ -2726,6 +2843,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
         ];
         let mut queue = TaskQueue::from_tasks(tasks);
@@ -2804,6 +2922,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }
     }
 
@@ -3787,6 +3906,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -3826,6 +3946,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -3877,6 +3998,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -4399,6 +4521,7 @@ mod tests {
             remediation_depth: 1,
             is_remediation: true,
             files_hint: None,
+            created_at: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         let next = queue.pick_next().unwrap();
@@ -4489,6 +4612,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: Some(vec!["src/main.rs".into(), "src/lib.rs".into()]),
+            created_at: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(100.0);
@@ -4532,6 +4656,7 @@ mod tests {
             remediation_depth: 1,
             is_remediation: true,
             files_hint: None,
+            created_at: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         // Repair budget = 0 (fraction 0.0), so all remediation tasks should be skipped.
@@ -4614,6 +4739,7 @@ mod tests {
             confidence_threshold: 0.8,
             auto_close: true,
             auto_reprioritize: true,
+            stale_threshold_days: 14,
         }
     }
 
@@ -4632,6 +4758,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "gl-1e0.5".into(),
@@ -4646,6 +4773,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
         ])
     }
@@ -4665,8 +4793,9 @@ mod tests {
         });
 
         let config = sample_review_config();
-        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
-        assert_eq!(applied, 1);
+        let actions = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(actions.applied_count, 1);
+        assert_eq!(actions.beads_to_close, vec!["gl-1e0.1"]);
         let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.1").unwrap();
         assert_eq!(task.status, TaskStatus::Skipped);
     }
@@ -4686,8 +4815,9 @@ mod tests {
         });
 
         let config = sample_review_config();
-        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
-        assert_eq!(applied, 0);
+        let actions = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(actions.applied_count, 0);
+        assert!(actions.beads_to_close.is_empty());
         let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.1").unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
     }
@@ -4708,8 +4838,9 @@ mod tests {
         });
 
         let config = sample_review_config();
-        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
-        assert_eq!(applied, 1);
+        let actions = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(actions.applied_count, 1);
+        assert_eq!(actions.beads_to_reprioritize, vec![("gl-1e0.5".into(), 10)]);
         let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.5").unwrap();
         assert_eq!(task.priority, 10);
     }
@@ -4730,8 +4861,9 @@ mod tests {
 
         let mut config = sample_review_config();
         config.auto_close = false;
-        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
-        assert_eq!(applied, 0);
+        let actions = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(actions.applied_count, 0);
+        assert!(actions.beads_to_close.is_empty());
         // Task should remain pending.
         let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.1").unwrap();
         assert_eq!(task.status, TaskStatus::Pending);
@@ -4754,8 +4886,9 @@ mod tests {
 
         let mut config = sample_review_config();
         config.auto_reprioritize = false;
-        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
-        assert_eq!(applied, 0);
+        let actions = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(actions.applied_count, 0);
+        assert!(actions.beads_to_reprioritize.is_empty());
         let task = queue.tasks().iter().find(|t| t.id == "gl-1e0.5").unwrap();
         assert_eq!(task.priority, 75); // unchanged
     }
@@ -4765,8 +4898,8 @@ mod tests {
         let mut queue = sample_queue();
         let review_output = serde_json::json!({"summary": "nothing"});
         let config = sample_review_config();
-        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
-        assert_eq!(applied, 0);
+        let actions = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(actions.applied_count, 0);
     }
 
     #[test]
@@ -4790,8 +4923,9 @@ mod tests {
         });
 
         let config = sample_review_config();
-        let applied = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
-        assert_eq!(applied, 1);
+        let actions = Orchestrator::apply_review_verdicts(&mut queue, &review_output, &config);
+        assert_eq!(actions.applied_count, 1);
+        assert_eq!(actions.beads_to_close, vec!["gl-1e0.1"]);
     }
 
     // -----------------------------------------------------------------------
@@ -5092,6 +5226,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(100.0);
@@ -5351,6 +5486,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         };
         let mut queue = TaskQueue::from_tasks(vec![existing]);
         let data = serde_json::json!({
