@@ -111,7 +111,7 @@ fn default_claude_code_model() -> String {
 }
 
 fn default_claude_code_budget() -> f64 {
-    0.50
+    1.00
 }
 
 impl Default for PipelineConfig {
@@ -490,7 +490,9 @@ impl Default for EngConfig {
                 // Maximum number of tokens allowed for a single task (L ceiling — triage sizes down).
                 max_tokens_per_task: 200_000,
                 // Maximum dollar cost allowed for a single task. (Range: 0.10-10.00)
-                max_dollars_per_task: 0.50,
+                // Raised to $1.00 to accommodate Claude Code's 200K-token context
+                // window and more expensive model tiers.
+                max_dollars_per_task: 1.00,
                 // When true, the orchestrator will pause and wait for human approval after generating a plan.
                 require_plan_review: true,
                 // When true, the orchestrator will pause and wait for human approval after creating a PR.
@@ -881,7 +883,7 @@ mod tests {
         let config = EngConfig::default();
         assert_eq!(config.limits.max_fix_attempts, 2);
         assert_eq!(config.limits.max_tokens_per_task, 200_000);
-        assert!((config.limits.max_dollars_per_task - 0.50).abs() < f64::EPSILON);
+        assert!((config.limits.max_dollars_per_task - 1.00).abs() < f64::EPSILON);
         assert!(config.intervention.pause_after_plan);
         assert!(config.intervention.pause_before_pr);
         assert!(!config.intervention.review_pr_diff);
@@ -1900,7 +1902,30 @@ base_url: http://localhost:8080
         let config = PipelineConfig::default();
         assert!(!config.use_claude_code_implementer);
         assert_eq!(config.claude_code_model, "sonnet");
-        assert!((config.claude_code_budget_usd - 0.50).abs() < f64::EPSILON);
+        assert!((config.claude_code_budget_usd - 1.00).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pipeline_budget_gate_accommodates_claude_code_cost() {
+        // Claude Code uses 200K-token context with expensive models; the default
+        // per-task dollar ceiling and the Claude Code per-invocation budget must
+        // both be ≥ $1.00 to avoid premature budget exhaustion.
+        let config = EngConfig::default();
+        assert!(
+            config.limits.max_dollars_per_task >= 1.00,
+            "max_dollars_per_task ({}) must be >= $1.00 to accommodate Claude Code",
+            config.limits.max_dollars_per_task
+        );
+        assert!(
+            config.pipeline.claude_code_budget_usd >= 1.00,
+            "claude_code_budget_usd ({}) must be >= $1.00 to accommodate Claude Code",
+            config.pipeline.claude_code_budget_usd
+        );
+        // The pipeline budget should not exceed the per-task ceiling.
+        assert!(
+            config.pipeline.claude_code_budget_usd <= config.limits.max_dollars_per_task,
+            "claude_code_budget_usd should not exceed max_dollars_per_task"
+        );
     }
 
     #[test]
