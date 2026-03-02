@@ -1798,6 +1798,30 @@ impl EngineeringPipeline {
         let commit_sha = match workspace.commit(commit_msg).await {
             Ok(Some(sha)) => sha,
             Ok(None) => {
+                // If the implementer reported tests passing but produced no diff,
+                // the work was already done — not a failure.
+                let tests_ok = impl_output
+                    .data
+                    .get("tests_passing")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if tests_ok {
+                    info!(
+                        task_id,
+                        "empty commit with tests passing — work already done"
+                    );
+                    let budget = self.router.budget_summary().await;
+                    return PipelineResult {
+                        status: PipelineStatus::AlreadyDone,
+                        stage_outputs: ctx.stage_outputs,
+                        events: ctx.events,
+                        budget,
+                        error: None,
+                        outcome_context: None,
+                        pr_url: None,
+                        branch: None,
+                    };
+                }
                 return self
                     .fail(
                         ctx,
@@ -4816,6 +4840,51 @@ mod tests {
                 .unwrap()
                 .contains("security review blocked")
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_empty_commit_tests_passing_is_already_done() {
+        // When the implementer reports tests_passing: true but produces no diff,
+        // the pipeline should return AlreadyDone instead of ImplementationFailed.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed (incorrectly, work is already done)
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "not done", "evidence": [], "architectural_notes": "", "suggested_changes": [], "task_size": "S"}"#,
+            ),
+            // 3. Implementer — no tool calls, just reports success with no changes
+            final_response(
+                r#"{"files_changed": [], "tests_added": [], "commit_message": "chore: no-op", "summary": "already implemented", "tests_passing": true}"#,
+            ),
+        ];
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-empty-already-done",
+                "Add greet function",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::AlreadyDone);
+        assert!(result.error.is_none());
     }
 
     #[tokio::test]
