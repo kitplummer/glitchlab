@@ -62,15 +62,13 @@ FIRST, assess complexity honestly:
 - "medium": 2-3 files, requires design decisions (new module, cross-file refactor)
 - "large": 4+ files, architectural change, touches multiple modules
 
-DO NOT DECOMPOSE when estimated_complexity is "trivial" or "small".
-These tasks fit in a single implementer pass. Decomposing them wastes tokens on
-sub-task overhead (workspace setup, context assembly) that exceeds the work itself.
+You MUST decompose when ANY of these conditions is true:
+- The task would touch 2+ files
+- The task requires 3+ steps
+- Any single target file exceeds 150 lines
 
-You MUST decompose ONLY when ALL of these conditions are true:
-- estimated_complexity is "medium" or "large"
-- The task would touch 4+ files AND require 5+ steps,
-  OR the total lines across affected files exceeds 500
-- No single implementer pass could complete it within 9 tool turns
+DO NOT DECOMPOSE when the task is trivial: exactly 1 file, fewer than 150 lines,
+1-2 mechanical edits. Sub-task overhead would exceed the work itself.
 
 When decomposing, set `estimated_complexity` to "medium" or "large" and add a `decomposition` array:
 
@@ -95,9 +93,9 @@ When decomposing, set `estimated_complexity` to "medium" or "large" and add a `d
 }
 
 Each sub-task MUST:
-- Touch at most 1-2 files
-- Require at most 2-3 edits
-- Be completable within ~9 tool turns
+- Touch exactly 1 file (or 1 implementation file + its test file)
+- Require exactly 1-2 edits
+- Be completable within ~5 tool turns
 - Include specific file paths and line-range hints (e.g. "lines 200-250")
 - Include `files_likely_affected` listing the exact files it will touch
 
@@ -229,8 +227,8 @@ mod tests {
             "prompt should mention read_hint for steps"
         );
         assert!(
-            SYSTEM_PROMPT.contains("total lines across affected files exceeds 500"),
-            "decomposition conditions should include line count"
+            SYSTEM_PROMPT.contains("150 lines"),
+            "decomposition conditions should reference 150-line threshold"
         );
     }
 
@@ -251,6 +249,38 @@ mod tests {
         assert!(
             SYSTEM_PROMPT.contains("Ensure all strings are correctly escaped for JSON."),
             "prompt should contain string escaping instructions"
+        );
+    }
+
+    #[test]
+    fn system_prompt_has_aggressive_decomposition_thresholds() {
+        assert!(
+            SYSTEM_PROMPT.contains("150 lines"),
+            "prompt should mention 150-line file size threshold for decomposition"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("2+ files"),
+            "prompt should trigger decomposition on 2+ files"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("3+ steps"),
+            "prompt should trigger decomposition on 3+ steps"
+        );
+    }
+
+    #[test]
+    fn system_prompt_has_focused_subtask_constraints() {
+        assert!(
+            SYSTEM_PROMPT.contains("exactly 1 file"),
+            "sub-tasks should touch exactly 1 file"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("1-2 edits"),
+            "sub-tasks should require 1-2 edits"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("~5 tool turns"),
+            "sub-tasks should be completable within ~5 tool turns"
         );
     }
 }
