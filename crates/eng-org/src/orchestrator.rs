@@ -1032,6 +1032,16 @@ impl Orchestrator {
             let routing = Self::route_outcome(&pipeline_result);
             queue.update_status(&task_id, routing.task_status.clone());
 
+            // Close the bead in the beads backend when the task is done.
+            // This prevents "already done" tasks from being re-attempted in
+            // future runs.
+            if routing.task_status == TaskStatus::Completed {
+                let client = glitchlab_memory::beads::BeadsClient::new(&params.repo_path, None);
+                if let Err(e) = client.close_bead(&task_id).await {
+                    warn!(task_id = %task_id, error = %e, "failed to close bead after completion");
+                }
+            }
+
             match routing.counter {
                 OutcomeCounter::Succeeded => {
                     result.tasks_succeeded += 1;
