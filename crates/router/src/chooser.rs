@@ -268,6 +268,50 @@ impl ModelChooser {
     pub fn fallback_for_role(&self) -> Option<&str> {
         self.models.first().map(|m| m.model_string.as_str())
     }
+
+    /// Select the cheapest eligible model satisfying explicit per-call constraints.
+    ///
+    /// Unlike [`select`], this method does **not** apply budget-pressure tier
+    /// downgrade. Instead it enforces a hard cost ceiling and an explicit
+    /// tool-use requirement on top of the role's static preferences.
+    ///
+    /// # Parameters
+    /// - `role`: role name used to look up a [`RolePreference`] (defaults to
+    ///   Economy tier / no capabilities when unknown).
+    /// - `tool_use_required`: when `true`, only models that include
+    ///   `"tool_use"` in their capabilities set are eligible.
+    /// - `max_cost_per_token`: hard ceiling in dollars per token, computed as
+    ///   `(input_cost_per_m + output_cost_per_m) / 1_000_000`.  Pass a large
+    ///   value (e.g. `f64::MAX`) to disable the filter.
+    ///
+    /// Returns `None` if no model satisfies all constraints.
+    pub fn select_model(
+        &self,
+        role: &str,
+        tool_use_required: bool,
+        max_cost_per_token: f64,
+    ) -> Option<&str> {
+        let pref = self.role_preferences.get(role).cloned().unwrap_or_default();
+
+        // Models are pre-sorted by combined cost ascending; first match wins.
+        self.models
+            .iter()
+            .filter(|m| {
+                // Role's minimum tier.
+                m.tier >= pref.min_tier
+                    // All capabilities required by the role preference.
+                    && pref
+                        .required_capabilities
+                        .iter()
+                        .all(|cap| m.capabilities.contains(cap))
+                    // Explicit tool-use requirement from the call site.
+                    && (!tool_use_required || m.capabilities.contains("tool_use"))
+                    // Hard cost ceiling (convert per-million → per-token).
+                    && m.combined_cost() / 1_000_000.0 <= max_cost_per_token
+            })
+            .map(|m| m.model_string.as_str())
+            .next()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +699,149 @@ mod tests {
 
         // Test inequality - different capabilities
         assert_ne!(pref1, pref4);
+    }
+
+    // -----------------------------------------------------------------------
+    // select_model tests
+    // -----------------------------------------------------------------------
+
+    /// Large cost cap → behaves like select() with no pressure, returns cheapest eligible.
+    #[test]
+    fn select_model_large_cap_returns_cheapest_eligible() {
+        let chooser = test_chooser(0.7);
+        // Debugger: min_tier=Economy, requires tool_use. Large cap → picks cheapest.
+        let selected = chooser.select_model("debugger", true, 1.0);
+        assert_eq!(selected, Some("gemini/gemini-2.5-flash-lite"));
+    }
+
+    /// Cost cap excludes the premium model; the standard model survives.
+    #[test]
+    fn select_model_filters_by_cost_cap() {
+        let chooser = test_chooser(0.7);
+        // Standard combined = (0.15 + 0.60) / 1_000_000 = 7.5e-7
+        // Premium combined  = (3.0 + 15.0) / 1_000_000 = 1.8e-5
+        // Cap at 1e-6 → only Economy and Standard pass.
+        // Planner: min_tier=Standard → picks Standard (Flash).
+        let cap = 1e-6_f64;
+        let selected = chooser.select_model("planner", false, cap);
+        assert_eq!(selected, Some("gemini/gemini-2.5-flash"));
+    }
+
+    /// Strict cost cap excludes everything above Economy.
+    #[test]
+    fn select_model_strict_cap_excludes_standard_and_above() {
+        let chooser = test_chooser(0.7);
+        // Economy combined = (0.075 + 0.30) / 1_000_000 = 3.75e-7
+        // Cap at 4e-7 → only Economy passes.
+        // Unknown role (economy default) → picks Economy.
+        let cap = 4e-7_f64;
+        let selected = chooser.select_model("unknown_role", false, cap);
+        assert_eq!(selected, Some("gemini/gemini-2.5-flash-lite"));
+    }
+
+    /// Zero cost cap excludes all non-free models.
+    #[test]
+    fn select_model_zero_cap_returns_none() {
+        let chooser = test_chooser(0.7);
+        let selected = chooser.select_model("debugger", false, 0.0);
+        assert_eq!(selected, None);
+    }
+
+    /// tool_use_required=true filters out models without the capability.
+    #[test]
+    fn select_model_tool_use_required_filters_incapable_models() {
+        let no_tool_model = ModelProfile {
+            model_string: "local/no-tools".into(),
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            tier: ModelTier::Economy,
+            capabilities: HashSet::from(["code".into()]),
+        };
+        let roles = HashMap::from([(
+            "agent".into(),
+            RolePreference {
+                min_tier: ModelTier::Economy,
+                required_capabilities: HashSet::new(),
+            },
+        )]);
+        let chooser = ModelChooser::new(vec![no_tool_model, economy_model()], roles, 0.5);
+        // tool_use_required=true → skip "local/no-tools" → pick economy_model
+        let selected = chooser.select_model("agent", true, 1.0);
+        assert_eq!(selected, Some("gemini/gemini-2.5-flash-lite"));
+    }
+
+    /// tool_use_required=false does not exclude models lacking the capability.
+    #[test]
+    fn select_model_tool_use_not_required_includes_all_capable_models() {
+        let no_tool_model = ModelProfile {
+            model_string: "local/no-tools".into(),
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            tier: ModelTier::Economy,
+            capabilities: HashSet::from(["code".into()]),
+        };
+        let roles = HashMap::from([(
+            "agent".into(),
+            RolePreference {
+                min_tier: ModelTier::Economy,
+                required_capabilities: HashSet::new(),
+            },
+        )]);
+        let chooser = ModelChooser::new(vec![no_tool_model, economy_model()], roles, 0.5);
+        // tool_use_required=false → "local/no-tools" (free) is cheapest → selected
+        let selected = chooser.select_model("agent", false, 1.0);
+        assert_eq!(selected, Some("local/no-tools"));
+    }
+
+    /// No model satisfies all constraints → returns None.
+    #[test]
+    fn select_model_no_eligible_returns_none() {
+        let roles = HashMap::from([(
+            "special".into(),
+            RolePreference {
+                min_tier: ModelTier::Economy,
+                required_capabilities: HashSet::from(["nonexistent_cap".into()]),
+            },
+        )]);
+        let chooser = ModelChooser::new(test_models(), roles, 0.5);
+        let selected = chooser.select_model("special", false, 1.0);
+        assert_eq!(selected, None);
+    }
+
+    /// Role's min_tier is still respected even when the cost cap would allow cheaper.
+    #[test]
+    fn select_model_respects_role_min_tier() {
+        let chooser = test_chooser(0.7);
+        // Planner: min_tier=Standard → Economy skipped even though it's cheapest.
+        let cap = 1.0; // large cap: all models pass cost filter
+        let selected = chooser.select_model("planner", false, cap);
+        assert_eq!(selected, Some("gemini/gemini-2.5-flash"));
+    }
+
+    /// Role capabilities from RolePreference are intersected with tool_use_required.
+    #[test]
+    fn select_model_combines_role_caps_and_tool_use_required() {
+        // Build a pool where only premium has both vision AND tool_use.
+        // standard_model has tool_use but not vision.
+        let roles = HashMap::from([(
+            "vision_agent".into(),
+            RolePreference {
+                min_tier: ModelTier::Economy,
+                required_capabilities: HashSet::from(["vision".into()]),
+            },
+        )]);
+        let chooser = ModelChooser::new(test_models(), roles, 0.5);
+        // tool_use_required=true + role requires vision → only premium matches
+        let selected = chooser.select_model("vision_agent", true, 1.0);
+        assert_eq!(selected, Some("anthropic/claude-sonnet-4-20250514"));
+    }
+
+    /// Unknown role uses default preference (Economy, no caps) — similar to select().
+    #[test]
+    fn select_model_unknown_role_uses_defaults() {
+        let chooser = test_chooser(0.7);
+        let selected = chooser.select_model("unknown_role", false, 1.0);
+        assert_eq!(selected, Some("gemini/gemini-2.5-flash-lite"));
     }
 
     #[test]
