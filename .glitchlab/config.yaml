@@ -10,11 +10,13 @@ boundaries:
 
 limits:
   max_tool_turns: 12
-  max_tokens_per_task: 80000
-  max_dollars_per_task: 1.00
+  max_tokens_per_task: 200000
+  max_dollars_per_task: 2.00
   max_total_tasks: 200
   max_remediation_depth: 1
   repair_budget_fraction: 0.20
+  restart_intensity_max_failures: 15
+  restart_intensity_window_secs: 600
 
 routing:
   # Static fallbacks (Gemini-only)
@@ -82,7 +84,7 @@ pipeline:
   short_circuit_enabled: true
   use_claude_code_implementer: true
   claude_code_model: sonnet
-  claude_code_budget_usd: 0.50
+  claude_code_budget_usd: 1.00
 
 review:
   enabled: true

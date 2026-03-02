@@ -3929,7 +3929,7 @@ mod tests {
         let estimated = estimate_plan_tokens(dir.path(), &files, 3).await;
 
         // Budget gate uses config (default 80K) at 90% threshold = 72K.
-        let budget = 80_000usize; // matches default config max_tokens_per_task
+        let budget = 80_000usize; // estimation test budget (lower than config default to validate gate)
         let threshold = budget * 90 / 100;
         assert!(
             estimated > threshold,
@@ -4418,6 +4418,7 @@ mod tests {
         let mut config = EngConfig::default();
         config.intervention.pause_after_plan = false;
         config.intervention.pause_before_pr = false;
+        config.limits.max_tokens_per_task = 80_000; // low budget to trigger gate
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
@@ -4579,6 +4580,7 @@ mod tests {
         let mut config = EngConfig::default();
         config.intervention.pause_after_plan = false;
         config.intervention.pause_before_pr = false;
+        config.limits.max_tokens_per_task = 80_000; // low budget to trigger pre-flight rejection
 
         let handler = Arc::new(AutoApproveHandler);
         let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
@@ -6951,13 +6953,13 @@ mod tests {
             result.error
         );
 
-        // Budget effective limit = S ceiling (20k) + planner/triage overhead.
+        // Budget effective limit = S ceiling (40k) + planner/triage overhead.
         // tokens_remaining = effective_limit - total_used. Since overhead is
         // added to the ceiling, implementer gets the full S budget.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 21_000,
-            "budget should be ~S (20k + overhead), got remaining: {}",
+            summary.tokens_remaining <= 41_000,
+            "budget should be ~S (40k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }
@@ -6996,11 +6998,11 @@ mod tests {
             result.error
         );
 
-        // Budget effective limit = L ceiling (120k) + planner/triage overhead.
+        // Budget effective limit = L ceiling (200k) + planner/triage overhead.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 121_000,
-            "budget should be ~L (120k + overhead), got remaining: {}",
+            summary.tokens_remaining <= 201_000,
+            "budget should be ~L (200k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }
@@ -7150,12 +7152,12 @@ mod tests {
             result.error
         );
 
-        // Budget effective limit = config max_tokens_per_task (80k) + planner overhead.
+        // Budget effective limit = M ceiling (120k) + planner overhead.
         // Short-circuit skips triage, so overhead is just the planner call.
         let summary = router.budget_summary().await;
         assert!(
-            summary.tokens_remaining <= 81_000,
-            "short-circuit should use ~M budget (80k + overhead), got remaining: {}",
+            summary.tokens_remaining <= 121_000,
+            "short-circuit should use ~M budget (120k + overhead), got remaining: {}",
             summary.tokens_remaining
         );
     }

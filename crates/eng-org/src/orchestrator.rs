@@ -709,12 +709,14 @@ impl Orchestrator {
             }
             adr_watch_state.tasks_since_last_scan += 1;
 
-            // --- Check max total tasks ---
-            if queue.len() > self.config.limits.max_total_tasks as usize {
+            // --- Check max total tasks (only count actionable tasks) ---
+            let actionable = queue.actionable_count();
+            if actionable > self.config.limits.max_total_tasks as usize {
                 warn!(
+                    actionable,
                     total = queue.len(),
                     max = self.config.limits.max_total_tasks,
-                    "task queue exceeded max_total_tasks, halting"
+                    "actionable task count exceeded max_total_tasks, halting"
                 );
                 result.cease_reason = CeaseReason::SystemicFailure;
                 break;
