@@ -64,6 +64,18 @@ impl BudgetTracker {
         (self.max_dollars - self.usage.estimated_cost).max(0.0)
     }
 
+    /// Fraction of the dollar budget still remaining (0.0 = exhausted, 1.0 = full).
+    ///
+    /// Returns `None` when `max_dollars` is zero (unlimited / unconfigured budget)
+    /// to avoid a division-by-zero and signal "no budget pressure" to callers.
+    pub fn remaining_cost_percentage(&self) -> Option<f64> {
+        if self.max_dollars == 0.0 {
+            None
+        } else {
+            Some((self.dollars_remaining() / self.max_dollars).clamp(0.0, 1.0))
+        }
+    }
+
     /// Check the budget and return an error if exceeded.
     /// Call this before every LLM invocation.
     pub fn check(&self) -> Result<()> {
@@ -220,5 +232,39 @@ mod tests {
         let s = budget.display_budget();
         assert!(s.contains("2250"), "should show total tokens used");
         assert!(s.contains("2 calls"), "should show plural call count");
+    }
+
+    #[test]
+    fn remaining_cost_percentage_full_budget() {
+        let budget = BudgetTracker::new(10_000, 10.0);
+        assert_eq!(budget.remaining_cost_percentage(), Some(1.0));
+    }
+
+    #[test]
+    fn remaining_cost_percentage_half_spent() {
+        let mut budget = BudgetTracker::new(10_000, 10.0);
+        budget.record(0, 0, 5.0);
+        let pct = budget.remaining_cost_percentage().unwrap();
+        assert!((pct - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn remaining_cost_percentage_exhausted() {
+        let mut budget = BudgetTracker::new(10_000, 10.0);
+        budget.record(0, 0, 10.0);
+        assert_eq!(budget.remaining_cost_percentage(), Some(0.0));
+    }
+
+    #[test]
+    fn remaining_cost_percentage_zero_max_returns_none() {
+        let budget = BudgetTracker::new(10_000, 0.0);
+        assert_eq!(budget.remaining_cost_percentage(), None);
+    }
+
+    #[test]
+    fn remaining_cost_percentage_clamps_at_zero() {
+        let mut budget = BudgetTracker::new(10_000, 1.0);
+        budget.record(0, 0, 2.0); // over-spend
+        assert_eq!(budget.remaining_cost_percentage(), Some(0.0));
     }
 }
