@@ -240,11 +240,18 @@ impl HistoryBackend for BeadsClient {
     }
 
     /// Beads is write-only for history; reads go through Dolt/JSONL.
+    ///
+    /// Returns [`MemoryError::Beads`] because history querying is not supported
+    /// by the Beads backend.
     fn query<'a>(
         &'a self,
         _query: &'a HistoryQuery,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<HistoryEntry>>> + Send + 'a>> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async {
+            Err(MemoryError::Beads(
+                "history querying is not supported by the Beads backend".into(),
+            ))
+        })
     }
 
     /// Stats not supported for Beads backend.
@@ -304,11 +311,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_returns_empty_by_design() {
+    async fn query_returns_error_not_supported() {
         let client = BeadsClient::new(Path::new("/tmp"), Some("nonexistent-bd-binary-xyz".into()));
         let query = HistoryQuery::default();
-        let results = client.query(&query).await.unwrap();
-        assert!(results.is_empty());
+        let result = client.query(&query).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, MemoryError::Beads(_)));
+        assert!(
+            err.to_string().contains("not supported"),
+            "error should mention 'not supported', got: {err}"
+        );
     }
 
     #[tokio::test]
