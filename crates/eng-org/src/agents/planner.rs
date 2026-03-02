@@ -2,11 +2,32 @@ use glitchlab_kernel::agent::{
     Agent, AgentContext, AgentMetadata, AgentOutput, Message, MessageContent, MessageRole,
 };
 use glitchlab_kernel::error;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use super::build_user_message;
 use super::json_response_format;
 use super::parse::parse_json_response;
 use crate::agents::RouterRef;
+
+/// A single sub-task produced by the planner when decomposing a large task.
+///
+/// The `files_likely_affected` field guides the orchestrator and implementer
+/// by pre-declaring which files this sub-task is expected to touch, enabling
+/// targeted context assembly without full repo scans.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DecompositionSubTask {
+    /// Unique identifier derived from the parent task ID (e.g. `gl-parent-part1`).
+    pub id: String,
+    /// Focused objective for this sub-task (1 file, 1-2 edits).
+    pub objective: String,
+    /// Files this sub-task is expected to modify or create.
+    #[serde(default)]
+    pub files_likely_affected: Vec<String>,
+    /// IDs of sub-tasks that must complete before this one can start.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
 
 const SYSTEM_PROMPT: &str = r#"You are Professor Zap, the planning engine inside GLITCHLAB.
 
@@ -182,6 +203,56 @@ mod tests {
     use super::*;
     use crate::agents::test_helpers::{mock_router_ref, test_agent_context};
     use glitchlab_kernel::agent::Agent;
+
+    // -----------------------------------------------------------------------
+    // DecompositionSubTask struct tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decomposition_sub_task_with_files() {
+        let json = r#"{"id":"gl-task-part1","objective":"Add field","files_likely_affected":["src/lib.rs"],"depends_on":[]}"#;
+        let sub: DecompositionSubTask = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.id, "gl-task-part1");
+        assert_eq!(sub.objective, "Add field");
+        assert_eq!(sub.files_likely_affected, vec!["src/lib.rs"]);
+        assert!(sub.depends_on.is_empty());
+    }
+
+    #[test]
+    fn decomposition_sub_task_files_defaults_to_empty() {
+        let json = r#"{"id":"gl-task-part2","objective":"Update tests"}"#;
+        let sub: DecompositionSubTask = serde_json::from_str(json).unwrap();
+        assert!(
+            sub.files_likely_affected.is_empty(),
+            "files_likely_affected should default to empty vec when absent"
+        );
+        assert!(sub.depends_on.is_empty());
+    }
+
+    #[test]
+    fn decomposition_sub_task_roundtrip() {
+        let sub = DecompositionSubTask {
+            id: "gl-task-part1".into(),
+            objective: "Implement feature".into(),
+            files_likely_affected: vec!["src/a.rs".into(), "src/b.rs".into()],
+            depends_on: vec!["gl-task-part0".into()],
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let deserialized: DecompositionSubTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.files_likely_affected,
+            sub.files_likely_affected
+        );
+        assert_eq!(deserialized.depends_on, sub.depends_on);
+    }
+
+    #[test]
+    fn system_prompt_sub_task_schema_has_files_likely_affected() {
+        assert!(
+            SYSTEM_PROMPT.contains("\"files_likely_affected\""),
+            "decomposition sub-task schema in SYSTEM_PROMPT must document files_likely_affected"
+        );
+    }
 
     #[test]
     fn role_and_persona() {
