@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod history;
 pub mod init;
 pub mod interactive;
+pub mod next;
 pub mod run;
 pub mod status;
 pub mod version;

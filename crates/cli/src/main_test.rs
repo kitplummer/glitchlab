@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used)]
 
-use clap::CommandFactory;
+use clap::{CommandFactory, Parser};
 
-use crate::Cli;
+use crate::{Cli, Commands};
 
 #[test]
 fn verify_app() {
@@ -19,4 +19,67 @@ fn test_long_version_format() {
         "Long version string format mismatch: {}",
         long_version
     );
+}
+
+#[test]
+fn test_next_subcommand_registered() {
+    let cmd = Cli::command();
+    let names: Vec<_> = cmd.get_subcommands().map(|c| c.get_name()).collect();
+    assert!(
+        names.contains(&"next"),
+        "next subcommand must be registered"
+    );
+}
+
+#[test]
+fn test_next_parses_repo_flag() {
+    let cli = Cli::try_parse_from(["glitchlab", "next", "--repo", "/tmp"]).unwrap();
+    match cli.command {
+        Commands::Next {
+            repo,
+            allow_core,
+            auto_approve,
+            test,
+            verbose,
+        } => {
+            assert_eq!(repo, std::path::PathBuf::from("/tmp"));
+            assert!(!allow_core);
+            assert!(!auto_approve);
+            assert!(test.is_none());
+            assert!(!verbose);
+        }
+        _ => panic!("expected Commands::Next"),
+    }
+}
+
+#[test]
+fn test_next_parses_all_flags() {
+    let cli = Cli::try_parse_from([
+        "glitchlab",
+        "next",
+        "--repo",
+        "/tmp",
+        "--allow-core",
+        "--auto-approve",
+        "--test",
+        "cargo test",
+        "--verbose",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Next {
+            repo,
+            allow_core,
+            auto_approve,
+            test,
+            verbose,
+        } => {
+            assert_eq!(repo, std::path::PathBuf::from("/tmp"));
+            assert!(allow_core);
+            assert!(auto_approve);
+            assert_eq!(test.as_deref(), Some("cargo test"));
+            assert!(verbose);
+        }
+        _ => panic!("expected Commands::Next"),
+    }
 }
