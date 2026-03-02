@@ -70,6 +70,9 @@ pub struct Task {
     /// likely affects. Used to pre-seed the implementer's context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_hint: Option<Vec<String>>,
+    /// When this task was created (parsed from bead `created_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn default_priority() -> u32 {
@@ -280,6 +283,18 @@ impl TaskQueue {
             .and_then(|t| t.outcome_context.as_ref())
     }
 
+    /// Return pending/deferred tasks older than `threshold`.
+    ///
+    /// Only considers tasks that have a `created_at` timestamp.
+    pub fn stale_tasks(&self, threshold: chrono::Duration) -> Vec<&Task> {
+        let cutoff = chrono::Utc::now() - threshold;
+        self.tasks
+            .iter()
+            .filter(|t| matches!(t.status, TaskStatus::Pending | TaskStatus::Deferred))
+            .filter(|t| t.created_at.map(|ts| ts < cutoff).unwrap_or(false))
+            .collect()
+    }
+
     /// Count of remaining actionable tasks (pending or deferred with satisfied deps).
     pub fn actionable_count(&self) -> usize {
         let completed_ids: std::collections::HashSet<&str> = self
@@ -354,6 +369,12 @@ fn bead_to_task(bead: Bead) -> Task {
 
     let pr_url = bead.external_ref.filter(|r| r.starts_with("http"));
 
+    let created_at = bead
+        .created_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
     Task {
         id: bead.id,
         objective,
@@ -367,6 +388,7 @@ fn bead_to_task(bead: Bead) -> Task {
         remediation_depth: 0,
         is_remediation: false,
         files_hint: None,
+        created_at,
     }
 }
 
@@ -393,6 +415,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "task-2".into(),
@@ -407,6 +430,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "task-3".into(),
@@ -421,6 +445,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
         ]
     }
@@ -477,6 +502,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "b".into(),
@@ -491,6 +517,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -654,6 +681,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         };
         let yaml = serde_yaml::to_string(&task).unwrap();
         let parsed: Task = serde_yaml::from_str(&yaml).unwrap();
@@ -680,6 +708,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "b".into(),
@@ -694,6 +723,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "c".into(),
@@ -708,6 +738,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -735,6 +766,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         queue.inject_tasks(new_tasks);
         assert_eq!(queue.tasks().len(), 4);
@@ -762,6 +794,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         queue.inject_tasks(dupe);
         // Should NOT have grown — duplicate was skipped.
@@ -793,6 +826,7 @@ mod tests {
             external_ref: Some("https://github.com/org/repo/pull/42".into()),
             labels: vec!["backend".into()],
             assignee: Some("alice".into()),
+            created_at: None,
         }
     }
 
@@ -828,6 +862,7 @@ mod tests {
             external_ref: None,
             labels: vec![],
             assignee: None,
+            created_at: None,
         };
         let task = bead_to_task(bead);
         assert_eq!(task.objective, "Title only");
@@ -856,6 +891,7 @@ mod tests {
                 external_ref: None,
                 labels: vec![],
                 assignee: None,
+                created_at: None,
             };
             let task = bead_to_task(bead);
             assert_eq!(task.status, expected, "status mapping for '{bead_status}'");
@@ -876,6 +912,7 @@ mod tests {
             external_ref: None,
             labels: vec![],
             assignee: None,
+            created_at: None,
         };
         let task = bead_to_task(bead);
         assert_eq!(task.priority, 100);
@@ -892,6 +929,7 @@ mod tests {
             external_ref: None,
             labels: vec![],
             assignee: None,
+            created_at: None,
         };
         let task_neg = bead_to_task(bead_neg);
         assert_eq!(task_neg.priority, 0);
@@ -910,12 +948,165 @@ mod tests {
             external_ref: Some("JIRA-1234".into()),
             labels: vec![],
             assignee: None,
+            created_at: None,
         };
         let task = bead_to_task(bead);
         assert!(
             task.pr_url.is_none(),
             "non-URL external_ref should not become pr_url"
         );
+    }
+
+    #[test]
+    fn bead_to_task_parses_created_at() {
+        let bead = Bead {
+            id: "c".into(),
+            title: "C".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: 2,
+            issue_type: "task".into(),
+            dependencies: vec![],
+            external_ref: None,
+            labels: vec![],
+            assignee: None,
+            created_at: Some("2026-02-23T22:20:42Z".into()),
+        };
+        let task = bead_to_task(bead);
+        assert!(task.created_at.is_some());
+        assert_eq!(
+            task.created_at.unwrap().to_rfc3339(),
+            "2026-02-23T22:20:42+00:00"
+        );
+    }
+
+    #[test]
+    fn bead_to_task_invalid_created_at() {
+        let bead = Bead {
+            id: "d".into(),
+            title: "D".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: 2,
+            issue_type: "task".into(),
+            dependencies: vec![],
+            external_ref: None,
+            labels: vec![],
+            assignee: None,
+            created_at: Some("not-a-date".into()),
+        };
+        let task = bead_to_task(bead);
+        assert!(task.created_at.is_none());
+    }
+
+    #[test]
+    fn stale_tasks_returns_old_pending() {
+        use chrono::{Duration, Utc};
+        let old = Utc::now() - Duration::days(20);
+        let recent = Utc::now() - Duration::days(1);
+        let queue = TaskQueue::from_tasks(vec![
+            Task {
+                id: "old-1".into(),
+                objective: "old task".into(),
+                priority: 50,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
+                files_hint: None,
+                created_at: Some(old),
+            },
+            Task {
+                id: "new-1".into(),
+                objective: "new task".into(),
+                priority: 50,
+                status: TaskStatus::Pending,
+                depends_on: vec![],
+                decomposition_depth: 0,
+                error: None,
+                pr_url: None,
+                outcome_context: None,
+                remediation_depth: 0,
+                is_remediation: false,
+                files_hint: None,
+                created_at: Some(recent),
+            },
+        ]);
+        let stale = queue.stale_tasks(Duration::days(14));
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, "old-1");
+    }
+
+    #[test]
+    fn stale_tasks_ignores_completed() {
+        use chrono::{Duration, Utc};
+        let old = Utc::now() - Duration::days(20);
+        let queue = TaskQueue::from_tasks(vec![Task {
+            id: "done-1".into(),
+            objective: "done task".into(),
+            priority: 50,
+            status: TaskStatus::Completed,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: None,
+            created_at: Some(old),
+        }]);
+        let stale = queue.stale_tasks(Duration::days(14));
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn stale_tasks_ignores_no_timestamp() {
+        use chrono::Duration;
+        let queue = TaskQueue::from_tasks(vec![Task {
+            id: "no-ts".into(),
+            objective: "no timestamp".into(),
+            priority: 50,
+            status: TaskStatus::Pending,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: None,
+            created_at: None,
+        }]);
+        let stale = queue.stale_tasks(Duration::days(14));
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn stale_tasks_includes_deferred() {
+        use chrono::{Duration, Utc};
+        let old = Utc::now() - Duration::days(30);
+        let queue = TaskQueue::from_tasks(vec![Task {
+            id: "deferred-old".into(),
+            objective: "old deferred".into(),
+            priority: 50,
+            status: TaskStatus::Deferred,
+            depends_on: vec![],
+            decomposition_depth: 0,
+            error: None,
+            pr_url: None,
+            outcome_context: None,
+            remediation_depth: 0,
+            is_remediation: false,
+            files_hint: None,
+            created_at: Some(old),
+        }]);
+        let stale = queue.stale_tasks(Duration::days(14));
+        assert_eq!(stale.len(), 1);
     }
 
     #[test]
@@ -999,6 +1190,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "p1".into(),
@@ -1013,6 +1205,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1036,6 +1229,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert_eq!(queue.actionable_count(), 1);
@@ -1056,6 +1250,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         let s = queue.summary();
@@ -1112,6 +1307,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("outcome_context"));
@@ -1167,6 +1363,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: Task = serde_json::from_str(&json).unwrap();
@@ -1201,6 +1398,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
+            created_at: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("files_hint"));
@@ -1226,6 +1424,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         };
         let json = serde_json::to_string(&task).unwrap();
         // None should be omitted (skip_serializing_if).
@@ -1259,6 +1458,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1279,6 +1479,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1299,6 +1500,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1319,6 +1521,7 @@ mod tests {
             remediation_depth: 0,
             is_remediation: false,
             files_hint: None,
+            created_at: None,
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1344,6 +1547,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "fix-1".into(),
@@ -1358,6 +1562,7 @@ mod tests {
                 remediation_depth: 1,
                 is_remediation: true,
                 files_hint: None,
+                created_at: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1390,6 +1595,7 @@ mod tests {
                 remediation_depth: 0,
                 is_remediation: false,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "fix-blocked".into(),
@@ -1404,6 +1610,7 @@ mod tests {
                 remediation_depth: 1,
                 is_remediation: true,
                 files_hint: None,
+                created_at: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1452,6 +1659,7 @@ mod tests {
                 remediation_depth: 1,
                 is_remediation: true,
                 files_hint: None,
+                created_at: None,
             },
             Task {
                 id: "fix-high".into(),
@@ -1466,6 +1674,7 @@ mod tests {
                 remediation_depth: 1,
                 is_remediation: true,
                 files_hint: None,
+                created_at: None,
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);

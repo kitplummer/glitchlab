@@ -143,10 +143,17 @@ pub struct ReviewConfig {
     /// When false (default), reprioritize verdicts are logged but not applied.
     #[serde(default)]
     pub auto_reprioritize: bool,
+    /// Number of days before a bead is considered stale.
+    #[serde(default = "default_stale_threshold_days")]
+    pub stale_threshold_days: u64,
 }
 
 fn default_confidence_threshold() -> f64 {
     0.8
+}
+
+fn default_stale_threshold_days() -> u64 {
+    14
 }
 
 impl Default for ReviewConfig {
@@ -156,6 +163,7 @@ impl Default for ReviewConfig {
             confidence_threshold: default_confidence_threshold(),
             auto_close: false,
             auto_reprioritize: false,
+            stale_threshold_days: default_stale_threshold_days(),
         }
     }
 }
@@ -1810,6 +1818,7 @@ base_url: http://localhost:8080
             confidence_threshold: 0.9,
             auto_close: true,
             auto_reprioritize: false,
+            stale_threshold_days: 14,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed: ReviewConfig = serde_yaml::from_str(&yaml).unwrap();
