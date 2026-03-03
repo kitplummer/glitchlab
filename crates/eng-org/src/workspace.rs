@@ -132,6 +132,25 @@ impl Workspace {
         .map_err(|e| Error::Workspace(format!("failed to push: {e}")))
     }
 
+    /// Fetch latest base and rebase the task branch on top.
+    /// Returns Ok(()) on success or if no remote is configured.
+    /// Returns Err only when rebase fails due to actual conflicts.
+    pub async fn rebase_on_base(&self, base_branch: &str) -> Result<()> {
+        if let Err(e) = self.git_wt(&["fetch", "origin", base_branch]).await {
+            warn!(base_branch, error = %e, "fetch failed, skipping rebase (no remote?)");
+            return Ok(());
+        }
+
+        if let Err(e) = self
+            .git_wt(&["rebase", &format!("origin/{base_branch}")])
+            .await
+        {
+            let _ = self.git_wt(&["rebase", "--abort"]).await;
+            return Err(Error::Workspace(format!("rebase conflict: {e}")));
+        }
+        Ok(())
+    }
+
     /// Get diff --stat against a base branch.
     pub async fn diff_stat(&self, base: &str) -> Result<String> {
         self.git_wt_output(&["diff", "--stat", base]).await
@@ -530,6 +549,168 @@ mod tests {
         assert_eq!(
             fs::read(&full_test_file_path).await.unwrap(),
             increased_content
+        );
+
+        ws.cleanup().await.unwrap();
+    }
+
+    /// Helper: initialise a repo with a bare remote so fetch/push work.
+    /// Returns (repo_dir, bare_dir, base_branch).
+    fn init_repo_with_remote(dir: &Path) -> (PathBuf, PathBuf, String) {
+        let bare = dir.join("remote.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+
+        let repo = dir.join("repo");
+        std::process::Command::new("git")
+            .args(["clone"])
+            .arg(&bare)
+            .arg(&repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("README.md"), "# Test").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+
+        let output = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (repo, bare, base)
+    }
+
+    #[tokio::test]
+    async fn workspace_rebase_on_base_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _bare, base) = init_repo_with_remote(dir.path());
+
+        // Create worktree from base.
+        let mut ws = Workspace::new(&repo, "rebase-ok", ".worktrees");
+        ws.create(&base).await.unwrap();
+
+        // Add a commit on the worktree branch (touches a different file).
+        std::fs::write(ws.worktree_path().join("feature.txt"), "feature work").unwrap();
+        ws.commit("add feature").await.unwrap();
+
+        // Advance main in the repo (different file, no conflict).
+        std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "checkout", &base])
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("other.txt"), "main work").unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "add", "-A"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "commit",
+                "-m",
+                "advance main",
+            ])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "push"])
+            .output()
+            .unwrap();
+
+        // Rebase should succeed.
+        ws.rebase_on_base(&base).await.unwrap();
+
+        // Worktree should contain both files.
+        assert!(ws.worktree_path().join("feature.txt").exists());
+        assert!(ws.worktree_path().join("other.txt").exists());
+
+        ws.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_rebase_on_base_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _bare, base) = init_repo_with_remote(dir.path());
+
+        // Create worktree from base.
+        let mut ws = Workspace::new(&repo, "rebase-conflict", ".worktrees");
+        ws.create(&base).await.unwrap();
+
+        // Modify README.md in the worktree.
+        std::fs::write(ws.worktree_path().join("README.md"), "worktree change").unwrap();
+        ws.commit("worktree edit").await.unwrap();
+
+        // Modify the same file on main (conflict).
+        std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "checkout", &base])
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("README.md"), "main change").unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "add", "-A"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "commit",
+                "-m",
+                "conflict on main",
+            ])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "push"])
+            .output()
+            .unwrap();
+
+        // Rebase should fail with conflict.
+        let err = ws.rebase_on_base(&base).await.unwrap_err();
+        assert!(err.to_string().contains("rebase conflict"));
+
+        // Worktree should be clean (rebase --abort ran).
+        let status_output = std::process::Command::new("git")
+            .args([
+                "-C",
+                &ws.worktree_path().to_string_lossy(),
+                "status",
+                "--porcelain",
+            ])
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status_output.stdout);
+        assert!(
+            status.trim().is_empty(),
+            "worktree should be clean after abort, got: {status}"
         );
 
         ws.cleanup().await.unwrap();

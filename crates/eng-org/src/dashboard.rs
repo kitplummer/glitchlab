@@ -563,6 +563,18 @@ mod tests {
     }
 
     #[test]
+    fn budget_threshold_zero_total_is_noop() {
+        let (emitter, buf) = DashboardEmitter::in_memory();
+        emitter.check_budget_threshold(5.0, 0.0);
+        emitter.check_budget_threshold(5.0, -1.0);
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.is_empty(),
+            "should not emit when total budget is <= 0"
+        );
+    }
+
+    #[test]
     fn all_event_variants_serialize() {
         let events = vec![
             DashboardEvent::RunStarted {

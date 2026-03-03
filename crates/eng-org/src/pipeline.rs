@@ -1509,7 +1509,11 @@ impl EngineeringPipeline {
                     self.router.clear_model_override("implementer").await;
 
                     match retry_output {
-                        Ok(output) if !output.parse_error => {
+                        Ok(output)
+                            if !output.parse_error
+                                && output.data.get("stuck").and_then(|v| v.as_bool())
+                                    != Some(true) =>
+                        {
                             info!(task_id, escalated_model, "model escalation retry succeeded");
                             // Replace the original output and continue the pipeline.
                             impl_output = output;
@@ -2116,6 +2120,31 @@ impl EngineeringPipeline {
             _ => {
                 // "merge" or any other value — continue to push + PR
             }
+        }
+
+        // --- Stage 14b: Rebase on latest base ---
+        ctx.current_stage = Some("rebase".into());
+        if let Err(e) = workspace.rebase_on_base(base_branch).await {
+            warn!(task_id, error = %e, "rebase failed — merge conflict");
+            let budget = self.router.budget_summary().await;
+            return PipelineResult {
+                status: PipelineStatus::Retryable,
+                stage_outputs: ctx.stage_outputs,
+                events: ctx.events,
+                budget,
+                pr_url: None,
+                branch: Some(workspace.branch_name().into()),
+                error: Some(format!("rebase conflict: {e}")),
+                outcome_context: Some(OutcomeContext {
+                    approach: "implementation completed but conflicts with latest main".into(),
+                    obstacle: glitchlab_kernel::outcome::ObstacleKind::MergeConflict {
+                        description: e.to_string(),
+                    },
+                    discoveries: vec![],
+                    recommendation: None,
+                    files_explored: vec![],
+                }),
+            };
         }
 
         // --- Stage 15: Push + PR ---
@@ -7983,6 +8012,451 @@ mod tests {
         assert!(
             matches!(verdict, "accept" | "conditional" | "escalate"),
             "ciso risk_verdict should be accept|conditional|escalate, got: {verdict:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Rebase conflict path
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_rebase_conflict_returns_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let mock_ops = MockExternalOps::default();
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Ok("https://github.com/test/pr/1".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        // Push a conflicting change to origin/main from a separate clone,
+        // so the local repo's main is BEHIND origin/main.  The implementer
+        // will write src/new.rs via tool call, so we push src/new.rs with
+        // different content to origin — guaranteeing a rebase conflict.
+        let clone_dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["clone", &_remote.path().display().to_string(), "."])
+            .current_dir(clone_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(clone_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(clone_dir.path())
+            .output()
+            .unwrap();
+        std::fs::create_dir_all(clone_dir.path().join("src")).unwrap();
+        std::fs::write(
+            clone_dir.path().join("src/new.rs"),
+            "// conflicting main version\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(clone_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "conflict on main"])
+            .current_dir(clone_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push"])
+            .current_dir(clone_dir.path())
+            .output()
+            .unwrap();
+
+        let result = pipeline
+            .run(
+                "test-rebase-conflict",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::Retryable,
+            "expected Retryable on rebase conflict, got {:?}: {:?}",
+            result.status,
+            result.error
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("rebase conflict"),
+            "error should mention rebase conflict: {:?}",
+            result.error
+        );
+        let oc = result
+            .outcome_context
+            .expect("rebase conflict should produce OutcomeContext");
+        assert!(matches!(
+            oc.obstacle,
+            glitchlab_kernel::outcome::ObstacleKind::MergeConflict { .. }
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // PR already exists but view_existing_pr also fails
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_pr_exists_view_fails_returns_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base_branch, _remote) = init_test_repo_with_remote(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+
+        let mock_ops = MockExternalOps::default();
+        // create_pr fails with "already exists"
+        mock_ops
+            .create_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Err("a pull request already exists for this branch".into()));
+        // view_existing_pr ALSO fails
+        mock_ops
+            .view_pr_results
+            .lock()
+            .unwrap()
+            .push_back(Err("gh pr view failed".into()));
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
+
+        let result = pipeline
+            .run(
+                "test-pr-view-fail",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::Committed,
+            "should fall back to Committed when both PR create and view fail"
+        );
+        assert!(result.pr_url.is_none());
+        assert!(result.error.is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // Budget exhaustion path
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_budget_exhaustion_has_outcome_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — trivial task (short-circuit eligible)
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "edit", "files": ["src/lib.rs"], "action": "modify"}], "files_likely_affected": ["src/lib.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Implementer — budget exhausted
+            final_response(
+                r#"{"stuck": true, "stuck_reason": "budget_exhausted", "files_changed": ["src/lib.rs"], "summary": "ran out of budget mid-implementation"}"#,
+            ),
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 2;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-budget",
+                "Edit lib.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::BudgetExceeded);
+        let oc = result
+            .outcome_context
+            .expect("budget exhaustion should produce OutcomeContext");
+        assert!(
+            matches!(
+                oc.obstacle,
+                glitchlab_kernel::outcome::ObstacleKind::BudgetExhaustion { .. }
+            ),
+            "expected BudgetExhaustion, got {:?}",
+            oc.obstacle
+        );
+        assert!(oc.recommendation.is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // Parse error path (model escalation)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_parse_error_has_outcome_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — trivial task
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "edit", "files": ["src/lib.rs"], "action": "modify"}], "files_likely_affected": ["src/lib.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Implementer — parse error
+            final_response(
+                r#"{"stuck": true, "stuck_reason": "parse_error", "files_changed": [], "summary": "could not parse response"}"#,
+            ),
+            // 3. Escalated implementer — also fails (parse error again)
+            final_response(
+                r#"{"stuck": true, "stuck_reason": "parse_error", "files_changed": [], "summary": "still garbage"}"#,
+            ),
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 2;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-parse-err",
+                "Edit lib.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::ParseError);
+        let oc = result
+            .outcome_context
+            .expect("parse error should produce OutcomeContext");
+        assert!(
+            matches!(
+                oc.obstacle,
+                glitchlab_kernel::outcome::ObstacleKind::ParseFailure { .. }
+            ),
+            "expected ParseFailure, got {:?}",
+            oc.obstacle
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Claude Code implementer error path
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_claude_code_error_has_outcome_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — trivial task (short-circuit eligible)
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "edit", "files": ["src/lib.rs"], "action": "modify"}], "files_likely_affected": ["src/lib.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // No implementer response needed — CC binary will fail.
+        ];
+
+        let router = sequential_router_ref(responses);
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 2;
+        // Enable Claude Code implementer — will fail because binary doesn't exist.
+        config.pipeline.use_claude_code_implementer = true;
+        config.pipeline.claude_code_model = "test-model".into();
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-cc-error",
+                "Edit lib.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::ImplementationFailed);
+        let oc = result
+            .outcome_context
+            .expect("claude code error should produce OutcomeContext");
+        assert!(
+            matches!(
+                oc.obstacle,
+                glitchlab_kernel::outcome::ObstacleKind::ModelLimitation { .. }
+            ),
+            "expected ModelLimitation, got {:?}",
+            oc.obstacle
+        );
+        assert!(oc.recommendation.is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // Parse error with model escalation path
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pipeline_parse_error_with_escalation_retry() {
+        use glitchlab_router::chooser::{ModelChooser, ModelProfile, ModelTier, RolePreference};
+        use std::collections::HashSet;
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let responses = vec![
+            // 1. Planner — trivial task
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "edit", "files": ["src/lib.rs"], "action": "modify"}], "files_likely_affected": ["src/lib.rs"], "requires_core_change": false, "risk_level": "low", "risk_notes": "", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Implementer — parse error (triggers escalation)
+            final_response(
+                r#"{"stuck": true, "stuck_reason": "parse_error", "files_changed": [], "summary": "garbage"}"#,
+            ),
+            // 3. Escalated implementer — also fails
+            final_response(
+                r#"{"stuck": true, "stuck_reason": "parse_error", "files_changed": [], "summary": "still garbage"}"#,
+            ),
+        ];
+
+        // Build a router with a ModelChooser that enables escalation.
+        let models = vec![
+            ModelProfile {
+                model_string: "seq/test".into(),
+                input_cost_per_m: 0.1,
+                output_cost_per_m: 0.3,
+                tier: ModelTier::Economy,
+                capabilities: HashSet::from(["tool_use".into(), "code".into()]),
+            },
+            ModelProfile {
+                model_string: "seq/premium".into(),
+                input_cost_per_m: 10.0,
+                output_cost_per_m: 30.0,
+                tier: ModelTier::Premium,
+                capabilities: HashSet::from(["tool_use".into(), "code".into()]),
+            },
+        ];
+        let roles = HashMap::from([(
+            "implementer".to_string(),
+            RolePreference {
+                min_tier: ModelTier::Economy,
+                required_capabilities: HashSet::from(["tool_use".into()]),
+            },
+        )]);
+        let chooser = ModelChooser::new(models, roles, 0.7);
+
+        let routing = HashMap::from([
+            ("planner".to_string(), "seq/test".to_string()),
+            ("implementer".to_string(), "seq/test".to_string()),
+            ("debugger".to_string(), "seq/test".to_string()),
+            ("security".to_string(), "seq/test".to_string()),
+            ("release".to_string(), "seq/test".to_string()),
+            ("archivist".to_string(), "seq/test".to_string()),
+            ("architect_triage".to_string(), "seq/test".to_string()),
+            ("architect_review".to_string(), "seq/test".to_string()),
+            ("ops_diagnosis".to_string(), "seq/test".to_string()),
+            ("ciso".to_string(), "seq/test".to_string()),
+            ("backlog_review".to_string(), "seq/test".to_string()),
+        ]);
+        let budget = glitchlab_kernel::budget::BudgetTracker::new(1_000_000, 100.0);
+        let mut router = glitchlab_router::Router::new(routing, budget);
+        router.register_provider(
+            "seq".into(),
+            Arc::new(crate::agents::test_helpers::SequentialMockProvider::new(
+                responses,
+            )),
+        );
+        let router = Arc::new(router.with_chooser(chooser));
+
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = true;
+        config.pipeline.short_circuit_max_files = 2;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-parse-escalate",
+                "Edit lib.rs",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
+            .await;
+
+        assert_eq!(result.status, PipelineStatus::ParseError);
+        let oc = result
+            .outcome_context
+            .expect("escalation failure should produce OutcomeContext");
+        assert!(
+            matches!(
+                oc.obstacle,
+                glitchlab_kernel::outcome::ObstacleKind::ParseFailure { .. }
+            ),
+            "expected ParseFailure, got {:?}",
+            oc.obstacle
         );
     }
 }

@@ -552,6 +552,31 @@ mod tests {
     }
 
     #[test]
+    fn audit_entry_partial_eq_by_id() {
+        let e1 = AuditEntry::new(
+            "action-a",
+            "agent",
+            PermissionKind::ReadFile,
+            BlastRadius::Local,
+            true,
+        );
+        let mut e2 = e1.clone();
+        // Same id → equal, even if other fields differ.
+        e2.action = "action-b".into();
+        assert_eq!(e1, e2);
+
+        // Different id → not equal.
+        let e3 = AuditEntry::new(
+            "action-a",
+            "agent",
+            PermissionKind::ReadFile,
+            BlastRadius::Local,
+            true,
+        );
+        assert_ne!(e1, e3);
+    }
+
+    #[test]
     fn audit_entry_denied_action() {
         let entry = AuditEntry::new(
             "modify secrets",

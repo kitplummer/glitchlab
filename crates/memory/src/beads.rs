@@ -833,6 +833,39 @@ mod tests {
         assert_eq!(lines[14], "--silent");
     }
 
+    #[tokio::test]
+    async fn link_uses_correct_bd_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, args_file) = mock_bd_capture(dir.path(), "ok");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let result = client.link("gl-parent", "gl-child").await.unwrap();
+        assert_eq!(result, "ok");
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert_eq!(lines[0], "link");
+        assert_eq!(lines[1], "gl-parent");
+        assert_eq!(lines[2], "gl-child");
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_returns_raw_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, args_file) = mock_bd_capture(dir.path(), "task-1 open\ntask-2 closed");
+
+        let client = BeadsClient::new(dir.path(), Some(script.to_string_lossy().into()));
+        let result = client.list().await.unwrap();
+        assert!(result.contains("task-1 open"));
+        assert!(result.contains("task-2 closed"));
+
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert_eq!(lines[0], "list");
+        assert_eq!(lines.len(), 1);
+    }
+
     #[test]
     fn bead_create_request_serde_roundtrip() {
         let req = BeadCreateRequest {

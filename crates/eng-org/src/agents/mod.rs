@@ -402,6 +402,9 @@ pub(crate) fn render_obstacle_kind(obstacle: &ObstacleKind) -> String {
                 "Budget exhausted: spent ${dollars_spent:.2} of ${dollars_budget:.2} ({tokens_used} of {tokens_budget} tokens)"
             )
         }
+        ObstacleKind::MergeConflict { description } => {
+            format!("Merge conflict: {description}")
+        }
         ObstacleKind::Unknown { detail } => {
             format!("Unknown obstacle: {detail}")
         }
@@ -1081,6 +1084,12 @@ mod tests {
                     tokens_budget: 150_000,
                 },
                 "Budget exhausted: spent $1.08 of $2.00",
+            ),
+            (
+                ObstacleKind::MergeConflict {
+                    description: "README.md conflicts".into(),
+                },
+                "Merge conflict: README.md conflicts",
             ),
             (
                 ObstacleKind::Unknown {

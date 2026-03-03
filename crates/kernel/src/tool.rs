@@ -461,6 +461,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_timeout_produces_error() {
+        let dir = std::env::temp_dir();
+        let policy = ToolPolicy::new(vec!["sleep".into()], vec![]);
+        let executor = ToolExecutor::new(policy, dir, Duration::from_millis(50));
+        let result = executor.execute("sleep 10").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_captures_stderr() {
         let dir = std::env::temp_dir();
         let policy = ToolPolicy::new(vec!["sh".into()], vec![]);

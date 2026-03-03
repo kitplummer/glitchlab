@@ -113,6 +113,9 @@ pub enum ObstacleKind {
         tokens_budget: u64,
     },
 
+    /// The task branch conflicts with the latest base branch.
+    MergeConflict { description: String },
+
     /// Catch-all for unclassified obstacles.
     Unknown { detail: String },
 }
@@ -349,6 +352,22 @@ mod tests {
                 assert_eq!(tokens_used, 120_000);
                 assert!((dollars_budget - 2.00).abs() < f64::EPSILON);
                 assert_eq!(tokens_budget, 150_000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn obstacle_merge_conflict_serde() {
+        let o = ObstacleKind::MergeConflict {
+            description: "conflicting changes in src/lib.rs".into(),
+        };
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(json.contains("\"kind\":\"merge_conflict\""));
+        let parsed: ObstacleKind = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ObstacleKind::MergeConflict { description } => {
+                assert_eq!(description, "conflicting changes in src/lib.rs");
             }
             _ => panic!("wrong variant"),
         }

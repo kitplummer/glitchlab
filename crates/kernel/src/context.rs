@@ -446,6 +446,35 @@ mod tests {
     }
 
     #[test]
+    fn truncate_to_tokens_no_newlines() {
+        let text = "x".repeat(1000);
+        let result = truncate_to_tokens(&text, 5); // ~20 chars max
+        assert!(result.contains("[... truncated]"));
+        assert!(!result.contains('\n') || result.ends_with("[... truncated]"));
+    }
+
+    #[test]
+    fn assembly_truncates_system_prompt() {
+        // Budget tight enough that the system prompt must be truncated.
+        let assembler = ContextAssembler::new(200);
+        let segments = vec![ContextSegment::new(
+            SegmentKind::SystemPrompt,
+            "word ".repeat(500), // ~2500 chars = ~625 tokens, exceeds 200
+            0,
+        )];
+        let result = assembler.assemble(&segments);
+        assert_eq!(result.included.len(), 1);
+        assert_eq!(result.included[0], SegmentKind::SystemPrompt);
+        // The system prompt should be truncated, not dropped.
+        assert!(
+            result.messages[0]
+                .content
+                .text()
+                .contains("[... truncated]")
+        );
+    }
+
+    #[test]
     fn empty_segments_assembly() {
         let assembler = ContextAssembler::new(100_000);
         let result = assembler.assemble(&[]);

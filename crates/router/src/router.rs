@@ -1603,4 +1603,30 @@ mod tests {
             "complete_with_tools() should error when chooser is set but cannot select a model"
         );
     }
+
+    #[tokio::test]
+    async fn select_with_fallbacks_uses_fallback_role() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test-model".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget);
+
+        // Primary role missing, fallback exists.
+        let model = router
+            .select_with_fallbacks("missing_role", &["planner".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(model, "mock/test-model");
+    }
+
+    #[tokio::test]
+    async fn select_with_fallbacks_errors_when_all_miss() {
+        let routing = HashMap::from([("planner".to_string(), "mock/test-model".to_string())]);
+        let budget = BudgetTracker::new(100_000, 10.0);
+        let router = Router::new(routing, budget);
+
+        let result = router
+            .select_with_fallbacks("missing", &["also_missing".to_string()])
+            .await;
+        assert!(result.is_err());
+    }
 }
