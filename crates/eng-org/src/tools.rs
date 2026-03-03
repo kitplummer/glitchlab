@@ -214,6 +214,15 @@ impl ToolDispatcher {
 
     /// Execute a tool call and return the result. Never panics.
     pub async fn dispatch(&self, call: &ToolCall) -> ToolCallResult {
+        // Check tool-level permission before any execution.
+        if let Err(reason) = self.executor.check_tool(&call.name) {
+            return ToolCallResult {
+                tool_call_id: call.id.clone(),
+                content: format!("tool not permitted: {reason}"),
+                is_error: true,
+            };
+        }
+
         let result = match call.name.as_str() {
             "read_file" => self.handle_read_file(&call.input).await,
             "write_file" => self.handle_write_file(&call.input).await,
@@ -890,6 +899,72 @@ mod tests {
     }
 
     // -- read_file cache --
+
+    // -- tool permission (permitted_tools) --
+
+    #[tokio::test]
+    async fn dispatch_rejected_by_tool_permission() {
+        let dir = TempDir::new().unwrap();
+        // Only read_file is permitted; write_file is not.
+        let policy = ToolPolicy::new(vec![], vec![])
+            .with_permitted_tools(vec!["read_file".into(), "list_files".into()]);
+        let dispatcher = ToolDispatcher::new(
+            dir.path().to_path_buf(),
+            policy,
+            vec![],
+            Duration::from_secs(10),
+        );
+        let call = make_call("write_file", json!({"path": "x.txt", "content": "data"}));
+        let result = dispatcher.dispatch(&call).await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("not permitted"),
+            "expected 'not permitted' in: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_allowed_by_tool_permission() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        // read_file IS permitted.
+        let policy = ToolPolicy::new(vec![], vec![]).with_permitted_tools(vec!["read_file".into()]);
+        let dispatcher = ToolDispatcher::new(
+            dir.path().to_path_buf(),
+            policy,
+            vec![],
+            Duration::from_secs(10),
+        );
+        let call = make_call("read_file", json!({"path": "hello.txt"}));
+        let result = dispatcher.dispatch(&call).await;
+        assert!(
+            !result.is_error,
+            "permitted tool should succeed: {}",
+            result.content
+        );
+        assert_eq!(result.content, "hello");
+    }
+
+    #[tokio::test]
+    async fn dispatch_empty_permitted_allows_all_tools() {
+        let dir = TempDir::new().unwrap();
+        // Empty permitted_tools = all tools allowed (backward compat).
+        let policy = ToolPolicy::new(vec!["echo".into()], vec![]);
+        let dispatcher = ToolDispatcher::new(
+            dir.path().to_path_buf(),
+            policy,
+            vec![],
+            Duration::from_secs(10),
+        );
+        let call = make_call("run_command", json!({"command": "echo hi"}));
+        let result = dispatcher.dispatch(&call).await;
+        assert!(
+            !result.is_error,
+            "all tools should be allowed when list empty: {}",
+            result.content
+        );
+    }
 
     #[tokio::test]
     async fn read_file_cache_returns_cached_on_second_read() {

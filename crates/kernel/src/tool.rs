@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -6,6 +7,24 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// Tool trait — callable unit offered to an agent
+// ---------------------------------------------------------------------------
+
+/// A tool that an agent can invoke.
+///
+/// Implementations encapsulate the logic for a specific capability
+/// (e.g. reading a file, running a command, querying a database).
+/// The framework calls `definition()` to advertise the tool to an LLM
+/// and `call()` to execute it.
+pub trait Tool: Send + Sync {
+    /// The tool's definition, advertised to the LLM.
+    fn definition(&self) -> &ToolDefinition;
+
+    /// Execute the tool with the given call arguments.
+    fn call(&self, call: ToolCall) -> impl Future<Output = Result<ToolCallResult>> + Send;
+}
 
 // ---------------------------------------------------------------------------
 // ToolPolicy — what an org is allowed to execute
@@ -21,11 +40,50 @@ pub struct ToolPolicy {
     /// Patterns that are always blocked, regardless of the allowlist.
     /// Checked first — a blocked command is never allowed.
     pub blocked: Vec<String>,
+
+    /// Tool names this policy permits the agent to invoke.
+    ///
+    /// When empty, all tool names are permitted (backward-compatible default).
+    /// When non-empty, only the listed tool names may be dispatched; any other
+    /// tool call is rejected with a `ToolViolation` before execution begins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permitted_tools: Vec<String>,
 }
 
 impl ToolPolicy {
     pub fn new(allowed: Vec<String>, blocked: Vec<String>) -> Self {
-        Self { allowed, blocked }
+        Self {
+            allowed,
+            blocked,
+            permitted_tools: Vec::new(),
+        }
+    }
+
+    /// Builder: restrict which tool names this policy permits.
+    ///
+    /// Replaces any previously set list. An empty list means *all* tools are
+    /// permitted (the default). Pass a non-empty list to restrict the agent.
+    pub fn with_permitted_tools(mut self, tools: Vec<String>) -> Self {
+        self.permitted_tools = tools;
+        self
+    }
+
+    /// Check whether invoking a tool by `name` is permitted under this policy.
+    ///
+    /// Returns `Ok(())` if the tool is permitted, or `Err(reason)` if it is not.
+    /// When `permitted_tools` is empty every tool name is allowed (open default).
+    pub fn check_tool(&self, name: &str) -> std::result::Result<(), String> {
+        if self.permitted_tools.is_empty() {
+            return Ok(());
+        }
+        if self.permitted_tools.iter().any(|t| t == name) {
+            Ok(())
+        } else {
+            Err(format!(
+                "tool `{name}` is not permitted; allowed tools: [{}]",
+                self.permitted_tools.join(", ")
+            ))
+        }
     }
 
     /// Check whether a command is permitted under this policy.
@@ -198,6 +256,14 @@ impl ToolExecutor {
     /// The working directory all commands execute in.
     pub fn working_dir(&self) -> &Path {
         &self.working_dir
+    }
+
+    /// Check whether a tool name is permitted under this executor's policy.
+    ///
+    /// Delegates to [`ToolPolicy::check_tool`]. Call this before dispatching
+    /// any tool invocation to enforce per-agent tool permissions.
+    pub fn check_tool(&self, tool_name: &str) -> std::result::Result<(), String> {
+        self.policy.check_tool(tool_name)
     }
 
     /// Execute a shell command if it passes policy checks.
@@ -403,6 +469,70 @@ mod tests {
         assert!(result.stderr.contains("err"));
     }
 
+    // -- check_tool (permitted_tools) --
+
+    #[test]
+    fn check_tool_empty_permitted_allows_all() {
+        // When permitted_tools is empty, all tool names are allowed.
+        let policy = ToolPolicy::new(vec![], vec![]);
+        assert!(policy.check_tool("read_file").is_ok());
+        assert!(policy.check_tool("write_file").is_ok());
+        assert!(policy.check_tool("run_command").is_ok());
+        assert!(policy.check_tool("list_files").is_ok());
+        assert!(policy.check_tool("edit_file").is_ok());
+    }
+
+    #[test]
+    fn check_tool_permitted_list_allows_listed_tools() {
+        let policy = ToolPolicy::new(vec![], vec![])
+            .with_permitted_tools(vec!["read_file".into(), "list_files".into()]);
+        assert!(policy.check_tool("read_file").is_ok());
+        assert!(policy.check_tool("list_files").is_ok());
+    }
+
+    #[test]
+    fn check_tool_permitted_list_rejects_unlisted_tools() {
+        let policy = ToolPolicy::new(vec![], vec![]).with_permitted_tools(vec!["read_file".into()]);
+        let result = policy.check_tool("write_file");
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("write_file"),
+            "error should name the rejected tool: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_tool_permitted_list_rejects_run_command_when_not_listed() {
+        let policy = ToolPolicy::new(vec!["cargo".into()], vec![])
+            .with_permitted_tools(vec!["read_file".into()]);
+        // Even though cargo is in the command allowlist, run_command itself
+        // is not in permitted_tools.
+        let result = policy.check_tool("run_command");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn with_permitted_tools_builder_returns_self() {
+        let policy = ToolPolicy::new(vec!["cargo".into()], vec!["rm".into()])
+            .with_permitted_tools(vec!["read_file".into(), "run_command".into()]);
+        // Original command policy is unchanged.
+        assert!(policy.check("cargo test").is_ok());
+        assert!(policy.check("rm -rf /").is_err());
+        // Tool permission check works.
+        assert!(policy.check_tool("read_file").is_ok());
+        assert!(policy.check_tool("write_file").is_err());
+    }
+
+    #[test]
+    fn executor_check_tool_delegates_to_policy() {
+        let policy = ToolPolicy::new(vec![], vec![]).with_permitted_tools(vec!["read_file".into()]);
+        let executor = ToolExecutor::new(policy, PathBuf::from("/tmp"), Duration::from_secs(10));
+        assert!(executor.check_tool("read_file").is_ok());
+        assert!(executor.check_tool("write_file").is_err());
+        assert!(executor.check_tool("edit_file").is_err());
+    }
+
     #[test]
     fn tool_definition_serde_roundtrip() {
         let def = ToolDefinition {
@@ -463,5 +593,76 @@ mod tests {
         assert!(parsed.is_error);
         assert_eq!(parsed.tool_call_id, "call_2");
         assert!(parsed.content.contains("exit code 1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool trait tests
+    // -----------------------------------------------------------------------
+
+    /// Minimal Tool implementation for testing the trait contract.
+    struct EchoTool {
+        def: ToolDefinition,
+    }
+
+    impl Tool for EchoTool {
+        fn definition(&self) -> &ToolDefinition {
+            &self.def
+        }
+
+        async fn call(&self, call: ToolCall) -> Result<ToolCallResult> {
+            Ok(ToolCallResult {
+                tool_call_id: call.id,
+                content: format!("echo: {}", call.input),
+                is_error: false,
+            })
+        }
+    }
+
+    fn echo_tool() -> EchoTool {
+        EchoTool {
+            def: ToolDefinition {
+                name: "echo".into(),
+                description: "Echoes the input back".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"}
+                    }
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn tool_trait_definition_name() {
+        let tool = echo_tool();
+        assert_eq!(tool.definition().name, "echo");
+        assert_eq!(tool.definition().description, "Echoes the input back");
+    }
+
+    #[tokio::test]
+    async fn tool_trait_call_returns_ok() {
+        let tool = echo_tool();
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "echo".into(),
+            input: serde_json::json!("hello world"),
+        };
+        let result = tool.call(call).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.tool_call_id, "c1");
+        assert!(result.content.contains("echo:"));
+    }
+
+    #[tokio::test]
+    async fn tool_trait_call_id_propagated() {
+        let tool = echo_tool();
+        let call = ToolCall {
+            id: "unique-id-42".into(),
+            name: "echo".into(),
+            input: serde_json::Value::Null,
+        };
+        let result = tool.call(call).await.unwrap();
+        assert_eq!(result.tool_call_id, "unique-id-42");
     }
 }

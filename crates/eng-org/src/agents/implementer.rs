@@ -28,13 +28,6 @@ fn system_prompt(max_turns: u32, has_file_context: bool) -> String {
 
 You receive a plan and implement it by making changes and verifying them.
 
-## Budget
-
-You have a STRICT maximum of {max_turns} tool-call turns.
-Each turn costs ~3-5K tokens. Budget is tight — do not explore.
-Each turn may include MULTIPLE tool calls — batch aggressively to stay within budget.
-Reserve 2 turns for final verification. You WILL be terminated if you exceed budget.
-
 ## Context hierarchy (IMPORTANT — read this before making ANY tool call)
 
 Your context is assembled in priority order. Use the HIGHEST priority source available:
@@ -47,6 +40,17 @@ Your context is assembled in priority order. Use the HIGHEST priority source ava
 3. **Codebase Overview** (in user message) — Architecture context.
 4. **Tools** (below) — LOWEST PRIORITY. Only call tools for information NOT already
    provided above.{file_context_rule}
+
+## Budget
+
+You have a STRICT maximum of {max_turns} tool-call turns.
+Each turn costs ~3-5K tokens. Budget is tight — do not explore.
+Each turn may include MULTIPLE tool calls — batch aggressively to stay within budget.
+Reserve 2 turns for final verification. You WILL be terminated if you exceed budget.
+
+**Exploration is prohibited.** Every `list_files` or `read_file` call for information
+already in your context burns irreplaceable budget. Always check the Context hierarchy
+above before calling any tool.
 
 ## Available tools
 
@@ -389,6 +393,31 @@ mod tests {
         assert!(
             prompt.contains("tests_passing"),
             "prompt schema should include tests_passing"
+        );
+    }
+
+    #[test]
+    fn system_prompt_hierarchy_precedes_budget() {
+        let prompt = system_prompt(10, false);
+        let hierarchy_pos = prompt
+            .find("## Context hierarchy")
+            .expect("prompt must have Context hierarchy section");
+        let budget_pos = prompt
+            .find("## Budget")
+            .expect("prompt must have Budget section");
+        assert!(
+            hierarchy_pos < budget_pos,
+            "Context hierarchy section should appear before Budget section so the \
+             model checks available context before considering how many turns it has"
+        );
+    }
+
+    #[test]
+    fn system_prompt_budget_references_no_exploration() {
+        let prompt = system_prompt(10, false);
+        assert!(
+            prompt.contains("Exploration is prohibited"),
+            "budget section should explicitly prohibit exploration"
         );
     }
 

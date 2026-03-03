@@ -578,6 +578,18 @@ pub(crate) mod test_helpers {
                 })
             })
         }
+
+        fn complete_with_tools(
+            &self,
+            model: &str,
+            messages: &[Message],
+            temperature: f32,
+            max_tokens: u32,
+            _tools: &[glitchlab_kernel::tool::ToolDefinition],
+            response_format: Option<&serde_json::Value>,
+        ) -> ProviderFuture<'_> {
+            self.complete(model, messages, temperature, max_tokens, response_format)
+        }
     }
 
     /// Mock provider that returns pre-scripted responses in sequence.

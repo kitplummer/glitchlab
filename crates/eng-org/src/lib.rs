@@ -3,6 +3,7 @@ pub mod config;
 pub mod dashboard;
 pub mod eval;
 pub mod indexer;
+pub mod input_validation;
 pub mod orchestrator;
 pub mod pipeline;
 pub mod policy;

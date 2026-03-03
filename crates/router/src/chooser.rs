@@ -10,10 +10,9 @@ use serde::{Deserialize, Serialize};
 /// Model quality/cost tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ModelTier {
-    Economy,      // Flash Lite, Haiku, local
-    Standard,     // Flash, GPT-4o-mini
-    StandardPlus, // Pro, Sonnet — better structured output than Standard
-    Premium,      // Opus, GPT-4o
+    Economy,  // Flash Lite, Haiku, local
+    Standard, // Flash, GPT-4o-mini, Sonnet
+    Premium,  // Opus, GPT-4o
 }
 
 impl ModelTier {
@@ -22,7 +21,6 @@ impl ModelTier {
         match s.to_lowercase().as_str() {
             "economy" => Some(Self::Economy),
             "standard" => Some(Self::Standard),
-            "standard_plus" => Some(Self::StandardPlus),
             "premium" => Some(Self::Premium),
             _ => None,
         }
@@ -31,8 +29,7 @@ impl ModelTier {
     /// Downgrade a tier by one level. Economy stays Economy.
     fn downgrade(self) -> Self {
         match self {
-            Self::Premium => Self::StandardPlus,
-            Self::StandardPlus => Self::Standard,
+            Self::Premium => Self::Standard,
             Self::Standard => Self::Economy,
             Self::Economy => Self::Economy,
         }
@@ -44,7 +41,6 @@ impl fmt::Display for ModelTier {
         let s = match self {
             Self::Economy => "economy",
             Self::Standard => "standard",
-            Self::StandardPlus => "standard_plus",
             Self::Premium => "premium",
         };
         write!(f, "{}", s)
@@ -552,8 +548,7 @@ mod tests {
     #[test]
     fn model_tier_ordering() {
         assert!(ModelTier::Economy < ModelTier::Standard);
-        assert!(ModelTier::Standard < ModelTier::StandardPlus);
-        assert!(ModelTier::StandardPlus < ModelTier::Premium);
+        assert!(ModelTier::Standard < ModelTier::Premium);
         assert!(ModelTier::Economy < ModelTier::Premium);
     }
 
@@ -568,20 +563,18 @@ mod tests {
             Some(ModelTier::Standard)
         );
         assert_eq!(
-            ModelTier::from_str_loose("standard_plus"),
-            Some(ModelTier::StandardPlus)
-        );
-        assert_eq!(
             ModelTier::from_str_loose("Premium"),
             Some(ModelTier::Premium)
         );
         assert_eq!(ModelTier::from_str_loose("invalid"), None);
+        // StandardPlus no longer exists — must return None
+        assert_eq!(ModelTier::from_str_loose("standard_plus"), None);
     }
 
     #[test]
     fn model_tier_downgrade() {
-        assert_eq!(ModelTier::Premium.downgrade(), ModelTier::StandardPlus);
-        assert_eq!(ModelTier::StandardPlus.downgrade(), ModelTier::Standard);
+        // Premium downgrades directly to Standard (no intermediate tier)
+        assert_eq!(ModelTier::Premium.downgrade(), ModelTier::Standard);
         assert_eq!(ModelTier::Standard.downgrade(), ModelTier::Economy);
         assert_eq!(ModelTier::Economy.downgrade(), ModelTier::Economy);
     }
@@ -681,7 +674,6 @@ mod tests {
     fn model_tier_display() {
         assert_eq!(ModelTier::Economy.to_string(), "economy");
         assert_eq!(ModelTier::Standard.to_string(), "standard");
-        assert_eq!(ModelTier::StandardPlus.to_string(), "standard_plus");
         assert_eq!(ModelTier::Premium.to_string(), "premium");
     }
 
@@ -983,11 +975,17 @@ mod tests {
 
     #[test]
     fn model_tier_serializes() {
-        let tier = ModelTier::StandardPlus;
-        let json = serde_json::to_string(&tier).expect("serialize tier");
-        assert_eq!(json, "\"StandardPlus\"");
-        let restored: ModelTier = serde_json::from_str(&json).expect("deserialize tier");
-        assert_eq!(restored, ModelTier::StandardPlus);
+        // Verify all three tiers round-trip through JSON correctly.
+        for (tier, expected_json) in [
+            (ModelTier::Economy, "\"Economy\""),
+            (ModelTier::Standard, "\"Standard\""),
+            (ModelTier::Premium, "\"Premium\""),
+        ] {
+            let json = serde_json::to_string(&tier).expect("serialize tier");
+            assert_eq!(json, expected_json);
+            let restored: ModelTier = serde_json::from_str(&json).expect("deserialize tier");
+            assert_eq!(restored, tier);
+        }
     }
 
     #[test]
