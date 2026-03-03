@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use glitchlab_kernel::agent::{Agent, AgentContext, AgentMetadata, AgentOutput};
 use glitchlab_kernel::error;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::build_user_message;
@@ -42,6 +42,115 @@ struct ClaudeCodeResult {
     result: String,
     #[serde(default)]
     session_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Public output types
+// ---------------------------------------------------------------------------
+
+/// A single implementation step that the implementer may report in its output.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Step {
+    /// Human-readable description of the step.
+    #[serde(default)]
+    pub description: String,
+    /// Files relevant to this step.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// The implementer's final summary JSON (from the `result` field of the CLI envelope).
+///
+/// Fields mirror the JSON schema mandated in [`system_prompt`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Plan {
+    /// Paths of files that were created or modified.
+    #[serde(default)]
+    pub files_changed: Vec<String>,
+    /// Paths of test files that were added or updated.
+    #[serde(default)]
+    pub tests_added: Vec<String>,
+    /// Whether all tests passed after the implementation.
+    #[serde(default)]
+    pub tests_passing: bool,
+    /// Conventional commit message for the changes.
+    #[serde(default)]
+    pub commit_message: String,
+    /// Brief human-readable summary of what was done.
+    #[serde(default)]
+    pub summary: String,
+    /// Optional implementation steps (not always present).
+    #[serde(default)]
+    pub steps: Vec<Step>,
+}
+
+/// Cost and timing metadata extracted from the Claude CLI JSON envelope.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CostInfo {
+    /// Total cost in USD for the invocation.
+    pub total_cost_usd: f64,
+    /// Wall-clock time for the invocation in milliseconds.
+    pub duration_ms: u64,
+    /// Number of agentic turns consumed.
+    pub num_turns: u32,
+}
+
+/// Combined parsed output from `claude --print --output-format json`.
+///
+/// Holds both the implementer's structured summary ([`Plan`]) and the
+/// cost/timing metadata ([`CostInfo`]) extracted from the outer CLI envelope.
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeOutput {
+    /// Structured implementation summary from the implementer's final JSON.
+    pub plan: Plan,
+    /// Cost and timing metadata from the outer CLI JSON envelope.
+    pub cost: CostInfo,
+}
+
+// ---------------------------------------------------------------------------
+// Public parsing function
+// ---------------------------------------------------------------------------
+
+/// Parse the raw output of `claude --print --output-format json`.
+///
+/// The Claude CLI emits a single JSON object (the outer *envelope*) containing
+/// metadata fields and a `result` string.  The `result` string is itself the
+/// implementer's final JSON block (possibly wrapped in markdown fences or
+/// preceded by prose).
+///
+/// This function:
+/// 1. Deserializes the outer envelope to extract [`CostInfo`].
+/// 2. Calls [`parse_implementer_json`] to extract the inner JSON from
+///    `result`, handling markdown fences and surrounding prose.
+/// 3. Deserializes the inner JSON into a [`Plan`].
+///
+/// Returns an error if the outer envelope is not valid JSON or if no
+/// parseable implementer JSON can be extracted from the `result` field.
+pub fn parse_claude_code_output(raw: &str) -> error::Result<ClaudeCodeOutput> {
+    let envelope: ClaudeCodeResult =
+        serde_json::from_str(raw.trim()).map_err(|e| error::Error::Pipeline {
+            stage: "claude_code_parse".into(),
+            reason: format!("failed to parse claude CLI JSON envelope: {e}"),
+        })?;
+
+    let cost = CostInfo {
+        total_cost_usd: envelope.total_cost_usd,
+        duration_ms: envelope.duration_ms,
+        num_turns: envelope.num_turns,
+    };
+
+    let plan_value =
+        parse_implementer_json(&envelope.result).ok_or_else(|| error::Error::Pipeline {
+            stage: "claude_code_parse".into(),
+            reason: "failed to extract implementer JSON from result field".into(),
+        })?;
+
+    let plan: Plan = serde_json::from_value(plan_value).map_err(|e| error::Error::Pipeline {
+        stage: "claude_code_parse".into(),
+        reason: format!("failed to deserialize implementer plan: {e}"),
+    })?;
+
+    Ok(ClaudeCodeOutput { plan, cost })
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +999,127 @@ All tests pass."#;
         let result: ClaudeCodeResult = serde_json::from_str(json).unwrap();
         assert!(result.is_error);
         assert_eq!(result.result, "An error occurred");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests for parse_claude_code_output, ClaudeCodeOutput, Plan, Step, CostInfo
+    // ---------------------------------------------------------------------------
+
+    /// Helper: build a JSON envelope string with the given `result` field value.
+    fn make_envelope(result: &str, is_error: bool, subtype: &str) -> String {
+        let result_escaped = result.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            r#"{{"type":"result","subtype":"{subtype}","total_cost_usd":0.123,"duration_ms":4567,"is_error":{is_error},"num_turns":7,"result":"{result_escaped}","session_id":"s-001"}}"#
+        )
+    }
+
+    #[test]
+    fn parse_claude_code_output_valid() {
+        let inner = r#"{"files_changed":["src/lib.rs"],"tests_added":["src/lib.rs"],"tests_passing":true,"commit_message":"feat: add greet","summary":"Added greeting"}"#;
+        let raw = make_envelope(inner, false, "success");
+        let out = parse_claude_code_output(&raw).unwrap();
+        assert_eq!(out.plan.files_changed, vec!["src/lib.rs"]);
+        assert_eq!(out.plan.tests_added, vec!["src/lib.rs"]);
+        assert!(out.plan.tests_passing);
+        assert_eq!(out.plan.commit_message, "feat: add greet");
+        assert_eq!(out.plan.summary, "Added greeting");
+    }
+
+    #[test]
+    fn parse_claude_code_output_extracts_cost() {
+        let inner = r#"{"files_changed":[],"tests_added":[],"tests_passing":false,"commit_message":"chore: noop","summary":"nothing"}"#;
+        let raw = make_envelope(inner, false, "success");
+        let out = parse_claude_code_output(&raw).unwrap();
+        assert!((out.cost.total_cost_usd - 0.123).abs() < 1e-9);
+        assert_eq!(out.cost.duration_ms, 4567);
+        assert_eq!(out.cost.num_turns, 7);
+    }
+
+    #[test]
+    fn parse_claude_code_output_result_with_markdown_fences() {
+        // The implementer sometimes wraps its output in ```json ... ```
+        let inner_raw = "```json\n{\"files_changed\":[\"a.rs\"],\"tests_added\":[],\"tests_passing\":true,\"commit_message\":\"feat: a\",\"summary\":\"s\"}\n```";
+        // Build envelope manually so the result field contains the markdown-fenced JSON.
+        let raw = format!(
+            r#"{{"type":"result","subtype":"success","total_cost_usd":0.01,"duration_ms":100,"is_error":false,"num_turns":2,"result":{},"session_id":"x"}}"#,
+            serde_json::to_string(inner_raw).unwrap()
+        );
+        let out = parse_claude_code_output(&raw).unwrap();
+        assert_eq!(out.plan.files_changed, vec!["a.rs"]);
+        assert!(out.plan.tests_passing);
+    }
+
+    #[test]
+    fn parse_claude_code_output_result_with_surrounding_text() {
+        let inner_raw = "Here is the result:\n{\"files_changed\":[\"b.rs\"],\"tests_added\":[],\"tests_passing\":false,\"commit_message\":\"chore: x\",\"summary\":\"ok\"}";
+        let raw = format!(
+            r#"{{"type":"result","subtype":"success","total_cost_usd":0.02,"duration_ms":200,"is_error":false,"num_turns":3,"result":{},"session_id":"y"}}"#,
+            serde_json::to_string(inner_raw).unwrap()
+        );
+        let out = parse_claude_code_output(&raw).unwrap();
+        assert_eq!(out.plan.files_changed, vec!["b.rs"]);
+    }
+
+    #[test]
+    fn parse_claude_code_output_empty_result_is_error() {
+        let raw = make_envelope("", false, "success");
+        let err = parse_claude_code_output(&raw);
+        assert!(err.is_err(), "expected error for empty result field");
+    }
+
+    #[test]
+    fn parse_claude_code_output_malformed_envelope_is_error() {
+        let err = parse_claude_code_output("this is not json");
+        assert!(err.is_err(), "expected error for malformed envelope");
+    }
+
+    #[test]
+    fn parse_claude_code_output_malformed_inner_json_is_error() {
+        // Outer envelope is fine but the `result` field contains garbage.
+        let raw = make_envelope("not json at all", false, "success");
+        let err = parse_claude_code_output(&raw);
+        assert!(err.is_err(), "expected error for malformed inner JSON");
+    }
+
+    #[test]
+    fn plan_has_optional_steps() {
+        // Plan with steps field present
+        let json = r#"{"files_changed":[],"tests_added":[],"tests_passing":true,"commit_message":"c","summary":"s","steps":[{"description":"step one","files":["f.rs"]}]}"#;
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].description, "step one");
+        assert_eq!(plan.steps[0].files, vec!["f.rs"]);
+    }
+
+    #[test]
+    fn plan_steps_default_empty() {
+        // Plan without steps field — defaults to empty vec
+        let json = r#"{"files_changed":[],"tests_added":[],"tests_passing":false,"commit_message":"c","summary":"s"}"#;
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        assert!(plan.steps.is_empty());
+    }
+
+    #[test]
+    fn cost_info_serializes_roundtrip() {
+        let c = CostInfo {
+            total_cost_usd: 0.42,
+            duration_ms: 9999,
+            num_turns: 12,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: CostInfo = serde_json::from_str(&json).unwrap();
+        assert!((back.total_cost_usd - 0.42).abs() < 1e-9);
+        assert_eq!(back.duration_ms, 9999);
+        assert_eq!(back.num_turns, 12);
+    }
+
+    #[test]
+    fn step_defaults() {
+        // Step with only description
+        let json = r#"{"description":"do something"}"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.description, "do something");
+        assert!(step.files.is_empty());
     }
 
     fn test_context() -> AgentContext {
