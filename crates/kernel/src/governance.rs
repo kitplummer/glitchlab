@@ -149,6 +149,125 @@ impl ZephyrPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// PermissionKind — discrete action permissions
+// ---------------------------------------------------------------------------
+
+/// The kind of action a permission grants or denies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionKind {
+    /// Read files from the filesystem.
+    ReadFile,
+    /// Write or overwrite files on the filesystem.
+    WriteFile,
+    /// Execute a shell command or subprocess.
+    ExecuteCommand,
+    /// Make outbound network requests.
+    NetworkAccess,
+    /// Publish or deploy an artifact to an environment.
+    DeployArtifact,
+    /// Create, update, or rotate secrets and credentials.
+    ModifySecret,
+}
+
+// ---------------------------------------------------------------------------
+// BlastRadius — scope of potential impact
+// ---------------------------------------------------------------------------
+
+/// How broadly an action can affect the system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlastRadius {
+    /// Affects only local files or in-process state.
+    Local,
+    /// Affects the current repository.
+    Repo,
+    /// Affects a single deployed service.
+    Service,
+    /// Affects the entire engineering org.
+    Org,
+    /// Cross-org or production-wide impact.
+    Global,
+}
+
+// ---------------------------------------------------------------------------
+// CredentialPolicy — rules for credential handling
+// ---------------------------------------------------------------------------
+
+/// Policy governing how credentials may be created and used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialPolicy {
+    /// Which permission kinds are allowed under this policy.
+    pub allowed_kinds: Vec<PermissionKind>,
+    /// Maximum time-to-live for credentials, in seconds.
+    pub max_ttl_secs: u64,
+    /// Whether every credential use must produce an audit entry.
+    pub require_audit: bool,
+}
+
+impl Default for CredentialPolicy {
+    fn default() -> Self {
+        Self {
+            allowed_kinds: vec![PermissionKind::ReadFile],
+            max_ttl_secs: 3600,
+            require_audit: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AuditEntry — immutable record of a governed action
+// ---------------------------------------------------------------------------
+
+/// A single audit log entry recording an action subject to governance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    /// Unique identifier for this entry.
+    pub id: uuid::Uuid,
+    /// Human-readable description of the action.
+    pub action: String,
+    /// Identity of the agent or process that performed the action.
+    pub actor: String,
+    /// Wall-clock time when the action was recorded.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Which permission kind was exercised.
+    pub permission: PermissionKind,
+    /// Scope of potential impact.
+    pub blast_radius: BlastRadius,
+    /// Whether the action was ultimately approved.
+    pub approved: bool,
+}
+
+impl AuditEntry {
+    /// Create a new audit entry stamped with the current UTC time and a fresh UUID.
+    pub fn new(
+        action: impl Into<String>,
+        actor: impl Into<String>,
+        permission: PermissionKind,
+        blast_radius: BlastRadius,
+        approved: bool,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            action: action.into(),
+            actor: actor.into(),
+            timestamp: chrono::Utc::now(),
+            permission,
+            blast_radius,
+            approved,
+        }
+    }
+}
+
+impl PartialEq for AuditEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for AuditEntry {}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -258,5 +377,191 @@ mod tests {
         let json = serde_json::to_string(&enforcer).unwrap();
         let parsed: BoundaryEnforcer = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.protected_paths.len(), 1);
+    }
+
+    // --- PermissionKind tests ---
+
+    #[test]
+    fn permission_kind_variants_are_distinct() {
+        assert_ne!(PermissionKind::ReadFile, PermissionKind::WriteFile);
+        assert_ne!(
+            PermissionKind::ExecuteCommand,
+            PermissionKind::NetworkAccess
+        );
+        assert_ne!(PermissionKind::DeployArtifact, PermissionKind::ModifySecret);
+    }
+
+    #[test]
+    fn permission_kind_serde_roundtrip() {
+        let kinds = vec![
+            PermissionKind::ReadFile,
+            PermissionKind::WriteFile,
+            PermissionKind::ExecuteCommand,
+            PermissionKind::NetworkAccess,
+            PermissionKind::DeployArtifact,
+            PermissionKind::ModifySecret,
+        ];
+        for kind in &kinds {
+            let json = serde_json::to_string(kind).unwrap();
+            let parsed: PermissionKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, kind);
+        }
+    }
+
+    #[test]
+    fn permission_kind_clone_and_debug() {
+        let k = PermissionKind::WriteFile;
+        let cloned = k.clone();
+        assert_eq!(k, cloned);
+        assert!(!format!("{k:?}").is_empty());
+    }
+
+    // --- BlastRadius tests ---
+
+    #[test]
+    fn blast_radius_variants_are_distinct() {
+        assert_ne!(BlastRadius::Local, BlastRadius::Repo);
+        assert_ne!(BlastRadius::Service, BlastRadius::Org);
+        assert_ne!(BlastRadius::Org, BlastRadius::Global);
+    }
+
+    #[test]
+    fn blast_radius_serde_roundtrip() {
+        let radii = vec![
+            BlastRadius::Local,
+            BlastRadius::Repo,
+            BlastRadius::Service,
+            BlastRadius::Org,
+            BlastRadius::Global,
+        ];
+        for r in &radii {
+            let json = serde_json::to_string(r).unwrap();
+            let parsed: BlastRadius = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, r);
+        }
+    }
+
+    #[test]
+    fn blast_radius_clone_and_debug() {
+        let r = BlastRadius::Global;
+        let cloned = r.clone();
+        assert_eq!(r, cloned);
+        assert!(!format!("{r:?}").is_empty());
+    }
+
+    // --- CredentialPolicy tests ---
+
+    #[test]
+    fn credential_policy_default_fields() {
+        let policy = CredentialPolicy::default();
+        // Default should allow at least ReadFile and require audit
+        assert!(!policy.allowed_kinds.is_empty());
+        assert!(policy.require_audit);
+        assert!(policy.max_ttl_secs > 0);
+    }
+
+    #[test]
+    fn credential_policy_serde_roundtrip() {
+        let policy = CredentialPolicy {
+            allowed_kinds: vec![PermissionKind::ReadFile, PermissionKind::ExecuteCommand],
+            max_ttl_secs: 7200,
+            require_audit: false,
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let parsed: CredentialPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, policy);
+    }
+
+    #[test]
+    fn credential_policy_clone_and_debug() {
+        let policy = CredentialPolicy::default();
+        let cloned = policy.clone();
+        assert_eq!(policy, cloned);
+        assert!(!format!("{policy:?}").is_empty());
+    }
+
+    // --- AuditEntry tests ---
+
+    #[test]
+    fn audit_entry_new_populates_fields() {
+        let entry = AuditEntry::new(
+            "write config",
+            "planner-agent",
+            PermissionKind::WriteFile,
+            BlastRadius::Repo,
+            true,
+        );
+        assert_eq!(entry.action, "write config");
+        assert_eq!(entry.actor, "planner-agent");
+        assert_eq!(entry.permission, PermissionKind::WriteFile);
+        assert_eq!(entry.blast_radius, BlastRadius::Repo);
+        assert!(entry.approved);
+        assert!(entry.timestamp <= chrono::Utc::now());
+    }
+
+    #[test]
+    fn audit_entry_new_generates_unique_ids() {
+        let e1 = AuditEntry::new(
+            "a",
+            "agent",
+            PermissionKind::ReadFile,
+            BlastRadius::Local,
+            true,
+        );
+        let e2 = AuditEntry::new(
+            "b",
+            "agent",
+            PermissionKind::ReadFile,
+            BlastRadius::Local,
+            true,
+        );
+        assert_ne!(e1.id, e2.id);
+    }
+
+    #[test]
+    fn audit_entry_serde_roundtrip() {
+        let entry = AuditEntry::new(
+            "deploy",
+            "release-agent",
+            PermissionKind::DeployArtifact,
+            BlastRadius::Service,
+            false,
+        );
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: AuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, entry.id);
+        assert_eq!(parsed.action, entry.action);
+        assert_eq!(parsed.actor, entry.actor);
+        assert_eq!(parsed.permission, entry.permission);
+        assert_eq!(parsed.blast_radius, entry.blast_radius);
+        assert_eq!(parsed.approved, entry.approved);
+    }
+
+    #[test]
+    fn audit_entry_clone_and_debug() {
+        let entry = AuditEntry::new(
+            "x",
+            "y",
+            PermissionKind::NetworkAccess,
+            BlastRadius::Org,
+            true,
+        );
+        let cloned = entry.clone();
+        assert_eq!(entry.id, cloned.id);
+        assert!(!format!("{entry:?}").is_empty());
+    }
+
+    #[test]
+    fn audit_entry_denied_action() {
+        let entry = AuditEntry::new(
+            "modify secrets",
+            "unknown-agent",
+            PermissionKind::ModifySecret,
+            BlastRadius::Global,
+            false,
+        );
+        assert!(!entry.approved);
+        assert_eq!(entry.permission, PermissionKind::ModifySecret);
+        assert_eq!(entry.blast_radius, BlastRadius::Global);
     }
 }
