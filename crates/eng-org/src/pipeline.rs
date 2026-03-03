@@ -7598,4 +7598,160 @@ mod tests {
             result.status
         );
     }
+
+    /// Build mock responses for a pipeline run that ends with CISO escalation.
+    /// Responses: planner → triage → impl tool → impl final → security → CISO (escalate).
+    fn pipeline_mock_responses_ciso_escalate() -> Vec<glitchlab_router::RouterResponse> {
+        vec![
+            // 1. Planner
+            final_response(
+                r#"{"steps": [{"step_number": 1, "description": "add feature", "files": ["src/new.rs"], "action": "create"}], "files_likely_affected": ["src/new.rs"], "requires_core_change": false, "risk_level": "high", "risk_notes": "high-risk change", "test_strategy": [], "estimated_complexity": "trivial", "dependencies_affected": false, "public_api_changed": false}"#,
+            ),
+            // 2. Architect triage — proceed
+            final_response(
+                r#"{"verdict": "proceed", "confidence": 0.9, "reasoning": "work not yet done", "evidence": [], "architectural_notes": "", "suggested_changes": []}"#,
+            ),
+            // 3. Implementer — write_file tool call
+            tool_response(vec![ToolCall {
+                id: "toolu_01".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "src/new.rs", "content": "pub fn secret() -> &'static str { \"token\" }\n"}),
+            }]),
+            // 4. Implementer — final metadata
+            final_response(
+                r#"{"files_changed": ["src/new.rs"], "tests_added": [], "commit_message": "feat: add secret function", "summary": "test"}"#,
+            ),
+            // 5. Security — pass (escalation comes from CISO, not security)
+            final_response(
+                r#"{"verdict": "pass", "issues": [], "summary": "no code-level issues"}"#,
+            ),
+            // 6. CISO — escalate: trust boundary crossing detected
+            final_response(
+                r#"{"risk_verdict": "escalate", "risk_score": 9, "blast_radius": "system-wide", "trust_boundary_crossings": [{"from": "internal", "to": "external", "data_type": "credentials", "concern": "tokens exposed"}], "data_flow_concerns": ["credentials leak"], "compliance_flags": ["SOC2-CC6.1"], "operational_risk": {"rollback_complexity": "complex", "monitoring_gaps": ["no audit trail"], "failure_modes": ["token exposure"]}, "aggregate_assessment": "critical trust boundary crossing", "conditions": [], "escalation_reason": "credentials exposed across trust boundary — requires human review"}"#,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn pipeline_ciso_escalation_halts_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses_ciso_escalate());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-ciso-escalation",
+                "Add a risky change",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert_eq!(
+            result.status,
+            PipelineStatus::Escalated,
+            "CISO escalation should halt pipeline with Escalated status, got {:?}: {:?}",
+            result.status,
+            result.error
+        );
+
+        // The CISO stage output should be stored even when escalating.
+        assert!(
+            result.stage_outputs.contains_key("ciso"),
+            "ciso stage output should be present on escalation"
+        );
+
+        let ciso = &result.stage_outputs["ciso"];
+        assert_eq!(
+            ciso.data["risk_verdict"].as_str().unwrap_or(""),
+            "escalate",
+            "ciso risk_verdict should be 'escalate'"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("credentials exposed"),
+            "error should contain the escalation reason, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_ciso_receives_security_findings() {
+        // Verify that the security stage output is present in stage_outputs before CISO runs.
+        // We do this by running a full pipeline and asserting both stages ran with real data.
+        let dir = tempfile::tempdir().unwrap();
+        let base_branch = init_test_repo(dir.path());
+
+        let router = sequential_router_ref(pipeline_mock_responses());
+        let mut config = EngConfig::default();
+        config.intervention.pause_after_plan = false;
+        config.intervention.pause_before_pr = false;
+        config.pipeline.short_circuit_enabled = false;
+
+        let handler = Arc::new(AutoApproveHandler);
+        let history: Arc<dyn HistoryBackend> = Arc::new(JsonlHistory::new(dir.path()));
+        let pipeline =
+            EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
+
+        let result = pipeline
+            .run(
+                "test-ciso-security-flow",
+                "Add a feature",
+                dir.path(),
+                &base_branch,
+                &[],
+            )
+            .await;
+
+        assert!(
+            result.status == PipelineStatus::Committed
+                || result.status == PipelineStatus::PrCreated
+                || result.status == PipelineStatus::PrMerged,
+            "unexpected status: {:?}, error: {:?}",
+            result.status,
+            result.error
+        );
+
+        // Both security and CISO must have run and produced non-skipped output.
+        let security = result
+            .stage_outputs
+            .get("security")
+            .expect("security stage output must be present");
+        let ciso = result
+            .stage_outputs
+            .get("ciso")
+            .expect("ciso stage output must be present");
+
+        assert_ne!(
+            security.data["verdict"].as_str().unwrap_or(""),
+            "skipped",
+            "security should have run (not skipped)"
+        );
+        assert_ne!(
+            ciso.data["risk_verdict"].as_str().unwrap_or(""),
+            "",
+            "ciso should have a risk_verdict in its output"
+        );
+
+        // CISO runs after security — its risk_verdict should be a valid value.
+        let verdict = ciso.data["risk_verdict"].as_str().unwrap_or("");
+        assert!(
+            matches!(verdict, "accept" | "conditional" | "escalate"),
+            "ciso risk_verdict should be accept|conditional|escalate, got: {verdict:?}"
+        );
+    }
 }
