@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::budget::BudgetTracker;
 use crate::governance::ZephyrPolicy;
 use crate::pipeline::PipelineStage;
-use crate::tool::ToolPolicy;
+use crate::tool::{ToolDefinition, ToolPolicy};
 
 // ---------------------------------------------------------------------------
 // OrgConfig — deserialized org configuration
@@ -210,6 +210,87 @@ impl Task {
 }
 
 // ---------------------------------------------------------------------------
+// OrgTrait — marker trait for organizational structures
+// ---------------------------------------------------------------------------
+
+/// Marker trait for organizational structures.
+///
+/// Implemented by any type that encapsulates the six core properties of the
+/// corporation framework ADR: Agents, Tools, Leader, Pipeline, Governance,
+/// and Memory.
+pub trait OrgTrait: Send + Sync {}
+
+// ---------------------------------------------------------------------------
+// OrgStruct — runtime encapsulation of the six core ADR properties
+// ---------------------------------------------------------------------------
+
+/// Runtime org that encapsulates the six properties defined in the
+/// corporation framework ADR.
+///
+/// - **Agents** — agent configurations keyed by role
+/// - **Tools** — tool definitions available to agents
+/// - **Leader** — role identifier of the lead agent
+/// - **Pipeline** — ordered pipeline stage definitions
+/// - **Governance** — governance policy identifier
+/// - **Memory** — memory backend identifier
+///
+/// This is the resolved, operational form of `OrgConfig`.
+#[derive(Debug, Clone)]
+pub struct OrgStruct {
+    /// Unique org identifier.
+    pub id: String,
+
+    /// Org name (e.g. "engineering", "operations").
+    pub name: String,
+
+    /// Agent configurations keyed by role.
+    pub agents: HashMap<String, AgentConfig>,
+
+    /// Tool definitions available to agents in this org.
+    pub tools: Vec<ToolDefinition>,
+
+    /// Role identifier of the lead agent for this org.
+    pub leader: String,
+
+    /// Ordered pipeline stage definitions.
+    pub pipeline: Vec<PipelineStage>,
+
+    /// Governance policy identifier (references a `ZephyrPolicy` by id).
+    pub governance_policy_id: String,
+
+    /// Memory backend identifier (e.g. "jsonl", "dolt").
+    pub memory_backend_id: String,
+}
+
+impl OrgTrait for OrgStruct {}
+
+impl OrgStruct {
+    /// Construct a new `OrgStruct` with all six ADR properties.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: String,
+        name: String,
+        agents: HashMap<String, AgentConfig>,
+        tools: Vec<ToolDefinition>,
+        leader: String,
+        pipeline: Vec<PipelineStage>,
+        governance_policy_id: String,
+        memory_backend_id: String,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            agents,
+            tools,
+            leader,
+            pipeline,
+            governance_policy_id,
+            memory_backend_id,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Org trait — what an org can do
 // ---------------------------------------------------------------------------
 
@@ -379,5 +460,96 @@ mod tests {
         let parsed: Task = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.task_id, "t-1");
         assert_eq!(parsed.source, "github");
+    }
+
+    // --- Org struct / trait tests ---
+
+    #[test]
+    fn org_new_sets_all_fields() {
+        let org = OrgStruct::new(
+            "org-1".into(),
+            "Engineering".into(),
+            HashMap::new(),
+            vec![],
+            "planner".into(),
+            vec![],
+            "zephyr-v1".into(),
+            "jsonl".into(),
+        );
+        assert_eq!(org.id, "org-1");
+        assert_eq!(org.name, "Engineering");
+        assert!(org.agents.is_empty());
+        assert!(org.tools.is_empty());
+        assert_eq!(org.leader, "planner");
+        assert!(org.pipeline.is_empty());
+        assert_eq!(org.governance_policy_id, "zephyr-v1");
+        assert_eq!(org.memory_backend_id, "jsonl");
+    }
+
+    #[test]
+    fn org_implements_org_trait() {
+        fn assert_is_org<T: OrgTrait>(_: &T) {}
+        let org = OrgStruct::new(
+            "org-2".into(),
+            "Operations".into(),
+            HashMap::new(),
+            vec![],
+            "ops-lead".into(),
+            vec![],
+            "zephyr-v1".into(),
+            "dolt".into(),
+        );
+        assert_is_org(&org);
+    }
+
+    #[test]
+    fn org_new_with_agents_tools_and_pipeline() {
+        use crate::pipeline::PipelineStage;
+        use crate::tool::ToolDefinition;
+
+        let agent_cfg = AgentConfig {
+            role: "planner".into(),
+            persona: "Prof Zap".into(),
+            system_prompt: "You are a planner.".into(),
+            model: None,
+            max_tokens: 4096,
+            temperature: 0.2,
+        };
+        let tool = ToolDefinition {
+            name: "read_file".into(),
+            description: "Reads a file.".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let stage = PipelineStage {
+            name: "plan".into(),
+            agent_role: "planner".into(),
+            optional: false,
+            condition: None,
+        };
+        let mut agents = HashMap::new();
+        agents.insert("planner".to_string(), agent_cfg);
+
+        let org = OrgStruct::new(
+            "org-3".into(),
+            "Engineering".into(),
+            agents,
+            vec![tool],
+            "planner".into(),
+            vec![stage],
+            "zephyr-v1".into(),
+            "jsonl".into(),
+        );
+        assert_eq!(org.agents.len(), 1);
+        assert!(org.agents.contains_key("planner"));
+        assert_eq!(org.tools.len(), 1);
+        assert_eq!(org.tools[0].name, "read_file");
+        assert_eq!(org.pipeline.len(), 1);
+        assert_eq!(org.pipeline[0].name, "plan");
+    }
+
+    #[test]
+    fn org_struct_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OrgStruct>();
     }
 }
