@@ -375,6 +375,7 @@ impl EngineeringPipeline {
         repo_path: &Path,
         base_branch: &str,
         previous_attempts: &[OutcomeContext],
+        definition_of_done: Option<&str>,
     ) -> PipelineResult {
         self.run_with_depth(
             task_id,
@@ -383,6 +384,65 @@ impl EngineeringPipeline {
             base_branch,
             previous_attempts,
             0,
+            definition_of_done,
+        )
+        .await
+    }
+
+    /// Run the pipeline with a pre-validated objective.
+    ///
+    /// Production paths (CLI, orchestrator) should prefer this over [`run`]
+    /// so that untrusted input is sanitized before reaching agents.
+    pub async fn run_validated(
+        &self,
+        task_id: &str,
+        objective: &crate::input_validation::ValidatedObjective,
+        repo_path: &Path,
+        base_branch: &str,
+        previous_attempts: &[OutcomeContext],
+        definition_of_done: Option<&str>,
+    ) -> PipelineResult {
+        self.run_with_depth_validated(
+            task_id,
+            objective,
+            repo_path,
+            base_branch,
+            previous_attempts,
+            0,
+            definition_of_done,
+        )
+        .await
+    }
+
+    /// Run the pipeline with decomposition depth and a pre-validated objective.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_with_depth_validated(
+        &self,
+        task_id: &str,
+        objective: &crate::input_validation::ValidatedObjective,
+        repo_path: &Path,
+        base_branch: &str,
+        previous_attempts: &[OutcomeContext],
+        decomposition_depth: u32,
+        definition_of_done: Option<&str>,
+    ) -> PipelineResult {
+        if !objective.warnings().is_empty() {
+            warn!(
+                task_id,
+                tier = ?objective.tier(),
+                warning_count = objective.warnings().len(),
+                had_redactions = objective.had_redactions(),
+                "running pipeline with validated objective that had warnings"
+            );
+        }
+        self.run_with_depth(
+            task_id,
+            objective.text(),
+            repo_path,
+            base_branch,
+            previous_attempts,
+            decomposition_depth,
+            definition_of_done,
         )
         .await
     }
@@ -391,6 +451,7 @@ impl EngineeringPipeline {
     ///
     /// Sub-tasks (depth > 0) skip the planner — they already have a plan
     /// from the parent task and go straight to triage + implement.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_depth(
         &self,
         task_id: &str,
@@ -399,6 +460,7 @@ impl EngineeringPipeline {
         base_branch: &str,
         previous_attempts: &[OutcomeContext],
         decomposition_depth: u32,
+        definition_of_done: Option<&str>,
     ) -> PipelineResult {
         info!(task_id, decomposition_depth, "pipeline starting");
 
@@ -416,6 +478,7 @@ impl EngineeringPipeline {
                 &mut workspace,
                 previous_attempts,
                 decomposition_depth,
+                definition_of_done,
             ),
         )
         .await
@@ -468,6 +531,7 @@ impl EngineeringPipeline {
         workspace: &mut Workspace,
         previous_attempts: &[OutcomeContext],
         decomposition_depth: u32,
+        definition_of_done: Option<&str>,
     ) -> PipelineResult {
         let mut ctx = PipelineContext::new(AgentContext {
             task_id: task_id.into(),
@@ -526,6 +590,10 @@ impl EngineeringPipeline {
             for p in &self.config.boundaries.protected_paths {
                 enriched.push_str(&format!("- `{p}`\n"));
             }
+        }
+        if let Some(dod) = definition_of_done {
+            enriched.push_str("\n\n## Definition of Done\n\n");
+            enriched.push_str(dod);
         }
 
         ctx.agent_context.objective = enriched;
@@ -1578,55 +1646,104 @@ impl EngineeringPipeline {
 
                         fix_attempts += 1;
 
-                        // Invoke debugger.
-                        ctx.current_stage = Some("debug".into());
-                        ctx.agent_context.previous_output = serde_json::json!({
-                            "test_output": truncate(&test_output, 2000),
-                            "implementation": impl_output.data,
-                            "fix_attempt": fix_attempts,
-                        });
+                        if use_claude_code {
+                            // Re-invoke Claude Code with the test failure.
+                            // Claude Code operates on the same worktree and
+                            // has full context to diagnose and fix its own
+                            // mistakes — much more effective than a separate
+                            // lightweight debugger agent.
+                            ctx.current_stage = Some("debug_cc".into());
+                            let fix_prompt = format!(
+                                "The external test suite failed after your implementation.\n\n\
+                                 ## Test output (attempt {fix_attempts})\n\n\
+                                 ```\n{}\n```\n\n\
+                                 Fix the failing tests. Do NOT skip or delete tests. \
+                                 Run `cargo test` to verify your fix. \
+                                 Then run `cargo clippy -- -D warnings` and `cargo fmt --check`.\n\n\
+                                 Output the same JSON format as before.",
+                                truncate(&test_output, 4000),
+                            );
+                            let cc_fix_config = ClaudeCodeConfig {
+                                model: self.config.pipeline.claude_code_model.clone(),
+                                max_budget_usd: self.config.pipeline.claude_code_budget_usd * 0.5,
+                                max_turns: 20,
+                                claude_bin: "claude".into(),
+                            };
+                            let cc_fix = ClaudeCodeImplementer::new(cc_fix_config);
+                            let fix_ctx = {
+                                let mut fc = ctx.agent_context.clone();
+                                fc.objective = fix_prompt;
+                                fc
+                            };
+                            match cc_fix.execute(&fix_ctx).await {
+                                Ok(o) => {
+                                    self.router.record_external_cost(o.metadata.cost).await;
+                                    self.emit(&mut ctx, EventKind::DebugAttempt, o.data.clone());
+                                    ctx.stage_outputs
+                                        .insert(format!("debug_{fix_attempts}"), o.clone());
+                                    impl_output = o;
+                                }
+                                Err(e) => {
+                                    return self
+                                        .fail(
+                                            ctx,
+                                            PipelineStatus::TestsFailed,
+                                            format!("claude code fix attempt failed: {e}"),
+                                        )
+                                        .await;
+                                }
+                            }
+                        } else {
+                            // Native implementer path: use the DebuggerAgent.
+                            ctx.current_stage = Some("debug".into());
+                            ctx.agent_context.previous_output = serde_json::json!({
+                                "test_output": truncate(&test_output, 2000),
+                                "implementation": impl_output.data,
+                                "fix_attempt": fix_attempts,
+                            });
 
-                        let dbg_tool_policy = ToolPolicy::new(
-                            self.config.allowed_tools.clone(),
-                            self.config.blocked_patterns.clone(),
-                        );
-                        let dbg_dispatcher = ToolDispatcher::new(
-                            wt_path.clone(),
-                            dbg_tool_policy,
-                            self.config.boundaries.protected_paths.clone(),
-                            Duration::from_secs(120),
-                        );
-                        let debugger = DebuggerAgent::new(
-                            Arc::clone(&self.router),
-                            dbg_dispatcher,
-                            self.config.limits.max_tool_turns,
-                            self.config.limits.max_stuck_turns,
-                        );
-                        let debug_out = match debugger.execute(&ctx.agent_context).await {
-                            Ok(o) => o,
-                            Err(e) => {
+                            let dbg_tool_policy = ToolPolicy::new(
+                                self.config.allowed_tools.clone(),
+                                self.config.blocked_patterns.clone(),
+                            );
+                            let dbg_dispatcher = ToolDispatcher::new(
+                                wt_path.clone(),
+                                dbg_tool_policy,
+                                self.config.boundaries.protected_paths.clone(),
+                                Duration::from_secs(120),
+                            );
+                            let debugger = DebuggerAgent::new(
+                                Arc::clone(&self.router),
+                                dbg_dispatcher,
+                                self.config.limits.max_tool_turns,
+                                self.config.limits.max_stuck_turns,
+                            );
+                            let debug_out = match debugger.execute(&ctx.agent_context).await {
+                                Ok(o) => o,
+                                Err(e) => {
+                                    return self
+                                        .fail(
+                                            ctx,
+                                            PipelineStatus::TestsFailed,
+                                            format!("debugger failed: {e}"),
+                                        )
+                                        .await;
+                                }
+                            };
+
+                            self.emit(&mut ctx, EventKind::DebugAttempt, debug_out.data.clone());
+                            ctx.stage_outputs
+                                .insert(format!("debug_{fix_attempts}"), debug_out.clone());
+
+                            if !debug_out.data["should_retry"].as_bool().unwrap_or(true) {
                                 return self
                                     .fail(
                                         ctx,
                                         PipelineStatus::TestsFailed,
-                                        format!("debugger failed: {e}"),
+                                        "debugger recommends not retrying".into(),
                                     )
                                     .await;
                             }
-                        };
-
-                        self.emit(&mut ctx, EventKind::DebugAttempt, debug_out.data.clone());
-                        ctx.stage_outputs
-                            .insert(format!("debug_{fix_attempts}"), debug_out.clone());
-
-                        if !debug_out.data["should_retry"].as_bool().unwrap_or(true) {
-                            return self
-                                .fail(
-                                    ctx,
-                                    PipelineStatus::TestsFailed,
-                                    "debugger recommends not retrying".into(),
-                                )
-                                .await;
                         }
 
                         ctx.current_stage = Some("test".into());
@@ -3368,6 +3485,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &prev,
+                None,
             )
             .await;
 
@@ -3431,7 +3549,14 @@ mod tests {
             EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
-            .run("test-task-1", "Fix a bug", dir.path(), &base_branch, &[])
+            .run(
+                "test-task-1",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
             .await;
 
         // Pipeline runs through all stages. Push fails (no remote),
@@ -3518,6 +3643,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -3604,6 +3730,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -3662,6 +3789,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -3742,6 +3870,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4121,6 +4250,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4238,6 +4368,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4317,6 +4448,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4391,6 +4523,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4436,6 +4569,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4497,6 +4631,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4594,6 +4729,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4661,6 +4797,7 @@ mod tests {
                 &base_branch,
                 &[],
                 1,
+                None,
             )
             .await;
 
@@ -4735,6 +4872,7 @@ mod tests {
                 &base_branch,
                 &[],
                 1,
+                None,
             )
             .await;
 
@@ -4798,6 +4936,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4869,6 +5008,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4921,6 +5061,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -4970,6 +5111,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -5025,6 +5167,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -5071,6 +5214,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -5191,6 +5335,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -5299,6 +5444,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -5359,6 +5505,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -5388,7 +5535,14 @@ mod tests {
             EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
-            .run("timeout-task", "do stuff", dir.path(), &base_branch, &[])
+            .run(
+                "timeout-task",
+                "do stuff",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
             .await;
         assert!(
             result.status == PipelineStatus::TimedOut || result.status == PipelineStatus::Error,
@@ -5468,7 +5622,14 @@ mod tests {
             EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
 
         let result = pipeline
-            .run("test-full", "Fix a bug", dir.path(), &base_branch, &[])
+            .run(
+                "test-full",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
             .await;
 
         assert_eq!(result.status, PipelineStatus::PrMerged);
@@ -5500,7 +5661,14 @@ mod tests {
             EngineeringPipeline::new(router, config, handler, history, default_mock_ops());
 
         let result = pipeline
-            .run("test-push-fail", "Fix a bug", dir.path(), &base_branch, &[])
+            .run(
+                "test-push-fail",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
             .await;
 
         assert_eq!(result.status, PipelineStatus::Committed);
@@ -5532,7 +5700,14 @@ mod tests {
             EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
 
         let result = pipeline
-            .run("test-pr-fail", "Fix a bug", dir.path(), &base_branch, &[])
+            .run(
+                "test-pr-fail",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
             .await;
 
         assert_eq!(result.status, PipelineStatus::Committed);
@@ -5574,7 +5749,14 @@ mod tests {
             EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
 
         let result = pipeline
-            .run("test-pr-exists", "Fix a bug", dir.path(), &base_branch, &[])
+            .run(
+                "test-pr-exists",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
             .await;
 
         // Should succeed using the existing PR URL.
@@ -5623,6 +5805,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -5665,7 +5848,14 @@ mod tests {
             EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
 
         let result = pipeline
-            .run("test-bead-fail", "Fix a bug", dir.path(), &base_branch, &[])
+            .run(
+                "test-bead-fail",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
             .await;
 
         // Bead close failure is non-fatal — final status should still be PrMerged.
@@ -5724,7 +5914,14 @@ mod tests {
             EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
 
         let result = pipeline
-            .run("test-fmt-fail", "Fix a bug", dir.path(), &base_branch, &[])
+            .run(
+                "test-fmt-fail",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
             .await;
 
         // Fmt failure is best-effort — pipeline should still succeed.
@@ -5791,6 +5988,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -5836,7 +6034,14 @@ mod tests {
             EngineeringPipeline::new(router, config, handler, history, Arc::new(mock_ops));
 
         let result = pipeline
-            .run("test-pass-mock", "Fix a bug", dir.path(), &base_branch, &[])
+            .run(
+                "test-pass-mock",
+                "Fix a bug",
+                dir.path(),
+                &base_branch,
+                &[],
+                None,
+            )
             .await;
 
         assert!(
@@ -5923,6 +6128,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6014,6 +6220,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6109,6 +6316,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6166,6 +6374,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6218,6 +6427,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6267,6 +6477,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6313,6 +6524,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6474,6 +6686,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6526,6 +6739,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6574,6 +6788,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6829,6 +7044,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6902,6 +7118,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -6959,6 +7176,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7051,6 +7269,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7096,6 +7315,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7154,6 +7374,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7213,6 +7434,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7250,6 +7472,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7315,6 +7538,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7363,6 +7587,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7413,6 +7638,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7467,6 +7693,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7539,6 +7766,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7587,6 +7815,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7655,6 +7884,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 
@@ -7714,6 +7944,7 @@ mod tests {
                 dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
 

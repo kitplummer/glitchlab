@@ -8,6 +8,8 @@ use glitchlab_kernel::error::{Error, Result};
 use glitchlab_kernel::outcome::OutcomeContext;
 use glitchlab_memory::beads::{Bead, BeadsClient};
 
+use crate::input_validation::TrustTier;
+
 // ---------------------------------------------------------------------------
 // Task types
 // ---------------------------------------------------------------------------
@@ -73,6 +75,13 @@ pub struct Task {
     /// When this task was created (parsed from bead `created_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Concrete, testable completion criteria. Tasks without this are
+    /// rejected by triage with "needs_refinement".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_of_done: Option<String>,
+    /// Trust tier of the input source for this task's objective.
+    #[serde(default)]
+    pub trust_tier: TrustTier,
 }
 
 fn default_priority() -> u32 {
@@ -340,12 +349,40 @@ fn is_actionable_type(issue_type: &str) -> bool {
     )
 }
 
+/// Extract a `## Definition of Done` section from a description string.
+///
+/// Returns `(cleaned_description, Some(dod))` if the section is found,
+/// or `(original, None)` if not.
+fn extract_definition_of_done(description: &str) -> (String, Option<String>) {
+    let marker = "## Definition of Done";
+    if let Some(start) = description.find(marker) {
+        let before = description[..start].trim_end().to_string();
+        let after_header = &description[start + marker.len()..];
+        // Find the next `## ` heading or end of string.
+        let dod_body = if let Some(next_heading) = after_header.find("\n## ") {
+            after_header[..next_heading].trim().to_string()
+        } else {
+            after_header.trim().to_string()
+        };
+        let dod = if dod_body.is_empty() {
+            None
+        } else {
+            Some(dod_body)
+        };
+        (before, dod)
+    } else {
+        (description.to_string(), None)
+    }
+}
+
 /// Convert a [`Bead`] into a [`Task`].
 fn bead_to_task(bead: Bead) -> Task {
-    let objective = if bead.description.is_empty() {
-        bead.title
+    let (objective, definition_of_done) = if bead.description.is_empty() {
+        (bead.title, None)
     } else {
-        format!("{}\n\n{}", bead.title, bead.description)
+        let full = format!("{}\n\n{}", bead.title, bead.description);
+        let (cleaned, dod) = extract_definition_of_done(&full);
+        (cleaned, dod)
     };
 
     let status = match bead.status.as_str() {
@@ -389,6 +426,8 @@ fn bead_to_task(bead: Bead) -> Task {
         is_remediation: false,
         files_hint: None,
         created_at,
+        definition_of_done,
+        trust_tier: TrustTier::default(),
     }
 }
 
@@ -416,6 +455,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "task-2".into(),
@@ -431,6 +472,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "task-3".into(),
@@ -446,6 +489,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ]
     }
@@ -503,6 +548,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "b".into(),
@@ -518,6 +565,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -682,6 +731,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         };
         let yaml = serde_yaml::to_string(&task).unwrap();
         let parsed: Task = serde_yaml::from_str(&yaml).unwrap();
@@ -709,6 +760,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "b".into(),
@@ -724,6 +777,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "c".into(),
@@ -739,6 +794,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -767,6 +824,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         queue.inject_tasks(new_tasks);
         assert_eq!(queue.tasks().len(), 4);
@@ -795,6 +854,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         queue.inject_tasks(dupe);
         // Should NOT have grown — duplicate was skipped.
@@ -1000,6 +1061,68 @@ mod tests {
     }
 
     #[test]
+    fn bead_to_task_extracts_definition_of_done() {
+        let bead = Bead {
+            id: "dod-1".into(),
+            title: "Add foo feature".into(),
+            description:
+                "Some context\n\n## Definition of Done\n\ncargo test passes; foo() exists in bar.rs"
+                    .into(),
+            status: "open".into(),
+            priority: 2,
+            issue_type: "task".into(),
+            dependencies: vec![],
+            external_ref: None,
+            labels: vec![],
+            assignee: None,
+            created_at: None,
+        };
+        let task = bead_to_task(bead);
+        assert_eq!(
+            task.definition_of_done.as_deref(),
+            Some("cargo test passes; foo() exists in bar.rs")
+        );
+        // The DoD section should be stripped from the objective.
+        assert!(!task.objective.contains("## Definition of Done"));
+        assert!(!task.objective.contains("cargo test passes"));
+        assert!(task.objective.contains("Some context"));
+    }
+
+    #[test]
+    fn bead_to_task_no_definition_of_done() {
+        let bead = Bead {
+            id: "no-dod".into(),
+            title: "Plain task".into(),
+            description: "Just a description without DoD section".into(),
+            status: "open".into(),
+            priority: 2,
+            issue_type: "task".into(),
+            dependencies: vec![],
+            external_ref: None,
+            labels: vec![],
+            assignee: None,
+            created_at: None,
+        };
+        let task = bead_to_task(bead);
+        assert!(task.definition_of_done.is_none());
+    }
+
+    #[test]
+    fn extract_definition_of_done_with_trailing_sections() {
+        let desc = "Intro\n\n## Definition of Done\n\ncargo test passes\n\n## Notes\n\nSome notes";
+        let (cleaned, dod) = extract_definition_of_done(desc);
+        assert_eq!(dod.as_deref(), Some("cargo test passes"));
+        assert_eq!(cleaned, "Intro");
+    }
+
+    #[test]
+    fn extract_definition_of_done_empty_body() {
+        let desc = "Intro\n\n## Definition of Done\n\n## Notes\n\nSome notes";
+        let (_, dod) = extract_definition_of_done(desc);
+        assert!(dod.is_none(), "empty DoD body should return None");
+    }
+
+    #[test]
     fn stale_tasks_returns_old_pending() {
         use chrono::{Duration, Utc};
         let old = Utc::now() - Duration::days(20);
@@ -1019,6 +1142,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: Some(old),
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "new-1".into(),
@@ -1034,6 +1159,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: Some(recent),
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ]);
         let stale = queue.stale_tasks(Duration::days(14));
@@ -1059,6 +1186,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: Some(old),
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }]);
         let stale = queue.stale_tasks(Duration::days(14));
         assert!(stale.is_empty());
@@ -1081,6 +1210,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }]);
         let stale = queue.stale_tasks(Duration::days(14));
         assert!(stale.is_empty());
@@ -1104,6 +1235,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: Some(old),
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }]);
         let stale = queue.stale_tasks(Duration::days(14));
         assert_eq!(stale.len(), 1);
@@ -1191,6 +1324,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "p1".into(),
@@ -1206,6 +1341,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1230,6 +1367,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert_eq!(queue.actionable_count(), 1);
@@ -1251,6 +1390,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         let s = queue.summary();
@@ -1308,6 +1449,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         };
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("outcome_context"));
@@ -1364,6 +1507,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: Task = serde_json::from_str(&json).unwrap();
@@ -1399,6 +1544,8 @@ mod tests {
             is_remediation: false,
             files_hint: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         };
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("files_hint"));
@@ -1425,6 +1572,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         };
         let json = serde_json::to_string(&task).unwrap();
         // None should be omitted (skip_serializing_if).
@@ -1459,6 +1608,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1480,6 +1631,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1501,6 +1654,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1522,6 +1677,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1548,6 +1705,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "fix-1".into(),
@@ -1563,6 +1722,8 @@ mod tests {
                 is_remediation: true,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1596,6 +1757,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "fix-blocked".into(),
@@ -1611,6 +1774,8 @@ mod tests {
                 is_remediation: true,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1660,6 +1825,8 @@ mod tests {
                 is_remediation: true,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "fix-high".into(),
@@ -1675,6 +1842,8 @@ mod tests {
                 is_remediation: true,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);

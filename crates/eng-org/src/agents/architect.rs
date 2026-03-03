@@ -69,6 +69,18 @@ exhausted its budget. You MUST upsize:
 - Previous M → assign L
 - Previous L → assign XL (forces decomposition)
 
+## Definition of done
+
+Every task MUST have a concrete, testable definition of done — either in the
+task objective or as a separate "Definition of Done" section in the context.
+
+A valid definition of done is specific and verifiable:
+  GOOD: "cargo test --workspace passes; new function `foo()` exists in bar.rs"
+  BAD:  "system works reliably" / "feature is implemented" / "tests pass"
+
+If no concrete definition of done is present, return verdict "needs_refinement"
+with suggested_changes including a proposed definition of done.
+
 Rules:
 - verdict "already_done" means the planned work already exists in the codebase.
 - verdict "needs_refinement" means the plan has issues but isn't fundamentally wrong.
@@ -264,6 +276,18 @@ mod tests {
         ctx.previous_output = serde_json::json!({"steps": [{"description": "add feature"}]});
         let output = agent.execute(&ctx).await.unwrap();
         assert_eq!(output.metadata.agent, "architect_triage");
+    }
+
+    #[test]
+    fn triage_prompt_requires_definition_of_done() {
+        assert!(
+            TRIAGE_SYSTEM_PROMPT.contains("Definition of done"),
+            "triage prompt must mention definition of done"
+        );
+        assert!(
+            TRIAGE_SYSTEM_PROMPT.contains("needs_refinement"),
+            "triage prompt must instruct returning needs_refinement for missing DoD"
+        );
     }
 
     // --- ArchitectReviewAgent tests ---

@@ -284,6 +284,7 @@ async fn pipeline_records_history_to_composite() {
             repo_dir.path(),
             &base_branch,
             &[],
+            None,
         )
         .await;
 
@@ -363,6 +364,7 @@ async fn failure_context_flows_across_runs() {
             repo_dir.path(),
             &base_branch,
             &[],
+            None,
         )
         .await;
 
@@ -431,6 +433,7 @@ async fn failure_context_flows_across_runs() {
             repo_dir.path(),
             &base_branch,
             &[],
+            None,
         )
         .await;
 
@@ -502,6 +505,7 @@ async fn history_persists_across_pipeline_instances() {
                 repo_dir.path(),
                 &base_branch,
                 &[],
+                None,
             )
             .await;
     }

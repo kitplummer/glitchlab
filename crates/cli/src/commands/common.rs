@@ -116,7 +116,7 @@ async fn build_history_backend(repo_path: &Path, config: &EngConfig) -> Arc<dyn 
 pub async fn run_pipeline(
     pipeline: &EngineeringPipeline,
     task_id: &str,
-    objective: &str,
+    objective: &glitchlab_eng_org::input_validation::ValidatedObjective,
     repo: &Path,
 ) -> Result<()> {
     // --- Detect base branch ---
@@ -125,7 +125,7 @@ pub async fn run_pipeline(
     // --- Run ---
     eprintln!("starting pipeline (base branch: {base_branch})...");
     let result = pipeline
-        .run(task_id, objective, repo, &base_branch, &[])
+        .run_validated(task_id, objective, repo, &base_branch, &[], None)
         .await;
 
     // --- Display results ---

@@ -77,6 +77,8 @@ pub struct EngConfig {
     pub review: ReviewConfig,
     #[serde(default)]
     pub watch: WatchConfig,
+    #[serde(default)]
+    pub validation: ValidationConfig,
 }
 
 /// Configuration for pipeline execution behavior (e.g. short-circuit skipping).
@@ -220,6 +222,46 @@ impl Default for WatchConfig {
             consultation_enabled: false,
             confidence_threshold: default_watch_confidence(),
             max_beads_per_adr: default_max_beads_per_adr(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ValidationConfig — input validation limits
+// ---------------------------------------------------------------------------
+
+/// Configuration for input validation length limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationConfig {
+    /// Maximum length (bytes) for untrusted input (e.g. GitHub issues).
+    #[serde(default = "default_max_untrusted_len")]
+    pub max_untrusted_len: usize,
+    /// Maximum length (bytes) for operator input (e.g. CLI --objective).
+    #[serde(default = "default_max_operator_len")]
+    pub max_operator_len: usize,
+    /// Maximum length (bytes) for tainted input (anonymous sources).
+    #[serde(default = "default_max_tainted_len")]
+    pub max_tainted_len: usize,
+}
+
+fn default_max_untrusted_len() -> usize {
+    5_000
+}
+
+fn default_max_operator_len() -> usize {
+    10_000
+}
+
+fn default_max_tainted_len() -> usize {
+    2_000
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            max_untrusted_len: default_max_untrusted_len(),
+            max_operator_len: default_max_operator_len(),
+            max_tainted_len: default_max_tainted_len(),
         }
     }
 }
@@ -600,6 +642,7 @@ impl Default for EngConfig {
             pipeline: PipelineConfig::default(),
             review: ReviewConfig::default(),
             watch: WatchConfig::default(),
+            validation: ValidationConfig::default(),
         }
     }
 }

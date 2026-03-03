@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use glitchlab_eng_org::config::EngConfig;
+use glitchlab_eng_org::input_validation::{InputValidator, TrustTier};
 use serde::Deserialize;
 use tokio::process::Command;
 
@@ -37,8 +38,8 @@ pub struct RunArgs<'a> {
 // ---------------------------------------------------------------------------
 
 pub async fn execute(args: RunArgs<'_>) -> Result<()> {
-    // --- Resolve task ---
-    let (task_id, obj) = resolve_task(
+    // --- Resolve task + trust tier ---
+    let (task_id, obj, tier) = resolve_task(
         args.repo,
         args.issue,
         args.local_task,
@@ -71,9 +72,25 @@ pub async fn execute(args: RunArgs<'_>) -> Result<()> {
         config.test_command_override = Some(cmd.to_string());
     }
 
+    // --- Validate input ---
+    let validator = InputValidator::new(&config.validation);
+    let validated = validator.validate(&obj, tier);
+    if validated.had_redactions() {
+        eprintln!(
+            "warning: {} injection pattern(s) redacted from objective (tier: {:?})",
+            validated
+                .warnings()
+                .iter()
+                .filter(|w| w.kind
+                    == glitchlab_eng_org::input_validation::WarningKind::InjectionPatternRedacted)
+                .count(),
+            tier,
+        );
+    }
+
     // --- Setup & run pipeline ---
     let (_router, pipeline) = common::setup_pipeline(&config, args.auto_approve, args.repo).await?;
-    common::run_pipeline(&pipeline, &task_id, &obj, args.repo).await
+    common::run_pipeline(&pipeline, &task_id, &validated, args.repo).await
 }
 
 // ---------------------------------------------------------------------------
@@ -86,19 +103,23 @@ async fn resolve_task(
     local_task: bool,
     task_file: Option<&Path>,
     objective: Option<&str>,
-) -> Result<(String, String)> {
+) -> Result<(String, String, TrustTier)> {
     if let Some(path) = task_file {
         let contents = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("failed to read task file: {}", path.display()))?;
         let task: TaskFile =
             serde_yaml::from_str(&contents).context("failed to parse task YAML")?;
-        return Ok((task.id, task.objective));
+        return Ok((task.id, task.objective, TrustTier::Trusted));
     }
 
     if let Some(text) = objective {
         let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-        return Ok((format!("inline-{stamp}"), text.to_string()));
+        return Ok((
+            format!("inline-{stamp}"),
+            text.to_string(),
+            TrustTier::Operator,
+        ));
     }
 
     if local_task {
@@ -108,12 +129,12 @@ async fn resolve_task(
             .with_context(|| format!("failed to read {}", path.display()))?;
         let task: TaskFile =
             serde_yaml::from_str(&contents).context("failed to parse task YAML")?;
-        return Ok((task.id, task.objective));
+        return Ok((task.id, task.objective, TrustTier::Trusted));
     }
 
     if let Some(num) = issue {
         let obj = fetch_issue_objective(repo, num).await?;
-        return Ok((format!("issue-{num}"), obj));
+        return Ok((format!("issue-{num}"), obj, TrustTier::Untrusted));
     }
 
     bail!("no task specified — use --task-file, --objective, --local-task, or --issue");

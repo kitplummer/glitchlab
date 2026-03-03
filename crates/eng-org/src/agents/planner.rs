@@ -27,6 +27,9 @@ pub struct DecompositionSubTask {
     /// IDs of sub-tasks that must complete before this one can start.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Concrete, testable completion criteria for this sub-task.
+    #[serde(default)]
+    pub definition_of_done: String,
 }
 
 const SYSTEM_PROMPT: &str = r#"You are Professor Zap, the planning engine inside GLITCHLAB.
@@ -51,7 +54,8 @@ Output schema:
   "test_strategy": ["<what tests to add or run>"],
   "estimated_complexity": "trivial|small|medium|large",
   "dependencies_affected": <bool>,
-  "public_api_changed": <bool>
+  "public_api_changed": <bool>,
+  "definition_of_done": "<specific, testable completion criteria>"
 }
 
 ## Token budget constraint
@@ -103,13 +107,15 @@ When decomposing, set `estimated_complexity` to "medium" or "large" and add a `d
       "id": "<parent-id>-part1",
       "objective": "<focused objective — 1 file, 1-2 edits>",
       "files_likely_affected": ["<path>"],
-      "depends_on": []
+      "depends_on": [],
+      "definition_of_done": "<specific, testable criteria>"
     },
     {
       "id": "<parent-id>-part2",
       "objective": "<next piece, may depend on part1>",
       "files_likely_affected": ["<path>"],
-      "depends_on": ["<parent-id>-part1"]
+      "depends_on": ["<parent-id>-part1"],
+      "definition_of_done": "<specific, testable criteria>"
     }
   ],
   ... (other fields still required)
@@ -125,6 +131,9 @@ Each sub-task MUST:
 When decomposing, the `steps` array should be empty (the sub-tasks replace it).
 
 Rules:
+- ALWAYS include a definition_of_done that is concrete and testable.
+  Good: "cargo test -p glitchlab-kernel passes; ObstacleKind::BudgetExhaustion variant exists".
+  Bad: "feature works correctly" or "system is reliable".
 - Keep steps minimal and atomic.
 - List ALL files that will be touched.
 - If the task is ambiguous, choose the simplest interpretation.
@@ -212,12 +221,13 @@ mod tests {
 
     #[test]
     fn decomposition_sub_task_with_files() {
-        let json = r#"{"id":"gl-task-part1","objective":"Add field","files_likely_affected":["src/lib.rs"],"depends_on":[]}"#;
+        let json = r#"{"id":"gl-task-part1","objective":"Add field","files_likely_affected":["src/lib.rs"],"depends_on":[],"definition_of_done":"cargo test passes"}"#;
         let sub: DecompositionSubTask = serde_json::from_str(json).unwrap();
         assert_eq!(sub.id, "gl-task-part1");
         assert_eq!(sub.objective, "Add field");
         assert_eq!(sub.files_likely_affected, vec!["src/lib.rs"]);
         assert!(sub.depends_on.is_empty());
+        assert_eq!(sub.definition_of_done, "cargo test passes");
     }
 
     #[test]
@@ -229,6 +239,10 @@ mod tests {
             "files_likely_affected should default to empty vec when absent"
         );
         assert!(sub.depends_on.is_empty());
+        assert!(
+            sub.definition_of_done.is_empty(),
+            "definition_of_done should default to empty string when absent"
+        );
     }
 
     #[test]
@@ -238,6 +252,7 @@ mod tests {
             objective: "Implement feature".into(),
             files_likely_affected: vec!["src/a.rs".into(), "src/b.rs".into()],
             depends_on: vec!["gl-task-part0".into()],
+            definition_of_done: "cargo test passes".into(),
         };
         let json = serde_json::to_string(&sub).unwrap();
         let deserialized: DecompositionSubTask = serde_json::from_str(&json).unwrap();
@@ -253,6 +268,18 @@ mod tests {
         assert!(
             SYSTEM_PROMPT.contains("\"files_likely_affected\""),
             "decomposition sub-task schema in SYSTEM_PROMPT must document files_likely_affected"
+        );
+    }
+
+    #[test]
+    fn system_prompt_requires_definition_of_done() {
+        assert!(
+            SYSTEM_PROMPT.contains("\"definition_of_done\""),
+            "SYSTEM_PROMPT must include definition_of_done in schema"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("ALWAYS include a definition_of_done"),
+            "SYSTEM_PROMPT must require concrete definition_of_done"
         );
     }
 

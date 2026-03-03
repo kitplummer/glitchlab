@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use glitchlab_eng_org::config::EngConfig;
+use glitchlab_eng_org::input_validation::{InputValidator, TrustTier};
 use glitchlab_eng_org::taskqueue::TaskQueue;
 
 use super::common;
@@ -53,7 +54,9 @@ pub async fn execute(
     eprintln!("objective: {objective}");
     eprintln!();
 
-    // --- Setup & run pipeline ---
+    // --- Validate & run pipeline ---
+    let validator = InputValidator::new(&config.validation);
+    let validated = validator.validate(&objective, TrustTier::Trusted);
     let (_router, pipeline) = common::setup_pipeline(&config, auto_approve, repo).await?;
-    common::run_pipeline(&pipeline, &task_id, &objective, repo).await
+    common::run_pipeline(&pipeline, &task_id, &validated, repo).await
 }

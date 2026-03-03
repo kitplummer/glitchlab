@@ -18,6 +18,7 @@ use glitchlab_router::Router;
 
 use crate::config::EngConfig;
 use crate::dashboard::{DashboardEmitter, DashboardEvent};
+use crate::input_validation::TrustTier;
 use crate::pipeline::{EngineeringPipeline, InterventionHandler, RealExternalOps};
 use crate::taskqueue::{TaskQueue, TaskStatus};
 
@@ -757,6 +758,8 @@ impl Orchestrator {
             let objective;
             let task_depth;
             let task_is_remediation;
+            let task_dod;
+            let task_trust_tier;
             match queue.pick_next() {
                 Some(task) => {
                     task_id = task.id.clone();
@@ -773,6 +776,8 @@ impl Orchestrator {
                     };
                     task_depth = task.decomposition_depth;
                     task_is_remediation = task.is_remediation;
+                    task_dod = task.definition_of_done.clone();
+                    task_trust_tier = task.trust_tier;
                     // Skip remediation tasks when repair budget is exhausted.
                     if task_is_remediation
                         && !budget.can_afford_repair(self.config.limits.max_dollars_per_task)
@@ -832,10 +837,21 @@ impl Orchestrator {
                 is_remediation: task_is_remediation,
             });
 
+            // --- Validate objective ---
+            let validator = crate::input_validation::InputValidator::new(&self.config.validation);
+            let validated_objective = validator.validate(&objective, task_trust_tier);
+
             // --- Create fresh router + pipeline for this task ---
             let attempt_contexts = tracker.contexts(&task_id);
             let pipeline_result = match self
-                .create_and_run_pipeline(&task_id, &objective, params, attempt_contexts, task_depth)
+                .create_and_run_pipeline(
+                    &task_id,
+                    &validated_objective,
+                    params,
+                    attempt_contexts,
+                    task_depth,
+                    task_dod.as_deref(),
+                )
                 .await
             {
                 Ok(pr) => pr,
@@ -1228,10 +1244,11 @@ impl Orchestrator {
     async fn create_and_run_pipeline(
         &self,
         task_id: &str,
-        objective: &str,
+        objective: &crate::input_validation::ValidatedObjective,
         params: &OrchestratorParams,
         previous_attempts: &[OutcomeContext],
         decomposition_depth: u32,
+        definition_of_done: Option<&str>,
     ) -> Result<glitchlab_kernel::pipeline::PipelineResult> {
         let budget_tracker = BudgetTracker::new(
             self.config.limits.max_tokens_per_task,
@@ -1270,7 +1287,7 @@ impl Orchestrator {
 
             let preflight_ctx = AgentContext {
                 task_id: task_id.into(),
-                objective: objective.into(),
+                objective: objective.text().into(),
                 repo_path: params.repo_path.to_string_lossy().into(),
                 working_dir: String::new(),
                 constraints: vec![],
@@ -1330,13 +1347,14 @@ impl Orchestrator {
         );
 
         Ok(pipeline
-            .run_with_depth(
+            .run_with_depth_validated(
                 task_id,
                 objective,
                 &params.repo_path,
                 &params.base_branch,
                 previous_attempts,
                 decomposition_depth,
+                definition_of_done,
             )
             .await)
     }
@@ -1400,9 +1418,14 @@ impl Orchestrator {
                 save_context: true,
                 track_attempt: false,
             },
+            PipelineStatus::BudgetExceeded | PipelineStatus::TimedOut => OutcomeRouting {
+                task_status: TaskStatus::Deferred,
+                counter: OutcomeCounter::Deferred,
+                save_context: true,
+                track_attempt: true,
+            },
             PipelineStatus::ImplementationFailed
             | PipelineStatus::TestsFailed
-            | PipelineStatus::BudgetExceeded
             | PipelineStatus::BoundaryViolation
             | PipelineStatus::PlanFailed => OutcomeRouting {
                 task_status: TaskStatus::Failed,
@@ -1569,6 +1592,8 @@ impl Orchestrator {
                     is_remediation: true,
                     files_hint: None,
                     created_at: None,
+                    definition_of_done: None,
+                    trust_tier: TrustTier::default(),
                 })
             })
             .collect()
@@ -1682,6 +1707,12 @@ impl Orchestrator {
                         .collect()
                 });
 
+            let definition_of_done = item
+                .get("definition_of_done")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+
             tasks.push(crate::taskqueue::Task {
                 id,
                 objective,
@@ -1696,6 +1727,8 @@ impl Orchestrator {
                 is_remediation: false,
                 files_hint,
                 created_at: None,
+                definition_of_done,
+                trust_tier: TrustTier::default(),
             });
         }
 
@@ -2197,6 +2230,8 @@ impl Orchestrator {
                     is_remediation: false,
                     files_hint,
                     created_at: None,
+                    definition_of_done: None,
+                    trust_tier: TrustTier::default(),
                 };
                 queue.inject_tasks(vec![task]);
                 created += 1;
@@ -2251,12 +2286,17 @@ impl Orchestrator {
                 glitchlab_memory::dedup::DedupVerdict::Unique => {}
             }
 
+            let description = if let Some(ref dod) = task.definition_of_done {
+                format!("{}\n\n## Definition of Done\n\n{dod}", task.objective)
+            } else {
+                task.objective.clone()
+            };
             let labels =
                 glitchlab_memory::dedup::normalize_labels(&["tqm:remediation".to_string()]);
             let req = glitchlab_memory::beads::BeadCreateRequest {
                 id: task.id.clone(),
                 title,
-                description: task.objective.clone(),
+                description,
                 issue_type: "task".to_string(),
                 priority: (task.priority).min(4) as i32,
                 labels,
@@ -2420,6 +2460,8 @@ impl Orchestrator {
             is_remediation: true,
             files_hint: Some(vec!["crates/eng-org/src/agents/claude_code.rs".into()]),
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         };
 
         queue.inject_tasks(vec![diag_task.clone()]);
@@ -2827,6 +2869,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(0.10); // less than per-task $0.50
@@ -2867,6 +2911,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "b".into(),
@@ -2882,6 +2928,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ];
         let mut queue = TaskQueue::from_tasks(tasks);
@@ -2961,6 +3009,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }
     }
 
@@ -3942,6 +3992,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -3982,6 +4034,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -4034,6 +4088,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -4557,6 +4613,8 @@ mod tests {
             is_remediation: true,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         let next = queue.pick_next().unwrap();
@@ -4648,6 +4706,8 @@ mod tests {
             is_remediation: false,
             files_hint: Some(vec!["src/main.rs".into(), "src/lib.rs".into()]),
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(100.0);
@@ -4692,6 +4752,8 @@ mod tests {
             is_remediation: true,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         // Repair budget = 0 (fraction 0.0), so all remediation tasks should be skipped.
@@ -4794,6 +4856,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
             Task {
                 id: "gl-1e0.5".into(),
@@ -4809,6 +4873,8 @@ mod tests {
                 is_remediation: false,
                 files_hint: None,
                 created_at: None,
+                definition_of_done: None,
+                trust_tier: TrustTier::default(),
             },
         ])
     }
@@ -5262,6 +5328,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(100.0);
@@ -5522,6 +5590,8 @@ mod tests {
             is_remediation: false,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: TrustTier::default(),
         };
         let mut queue = TaskQueue::from_tasks(vec![existing]);
         let data = serde_json::json!({

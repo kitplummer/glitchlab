@@ -717,6 +717,8 @@ fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::ta
         is_remediation: true,
         files_hint: None,
         created_at: None,
+        definition_of_done: None,
+        trust_tier: crate::input_validation::TrustTier::default(),
     })
 }
 
@@ -1488,6 +1490,8 @@ mod tests {
             is_remediation: true,
             files_hint: None,
             created_at: None,
+            definition_of_done: None,
+            trust_tier: crate::input_validation::TrustTier::default(),
         };
         let queue = crate::taskqueue::TaskQueue::from_tasks(vec![existing]);
 

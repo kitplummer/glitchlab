@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use glitchlab_eng_org::config::EngConfig;
+use glitchlab_eng_org::input_validation::{InputValidator, TrustTier};
 
 use super::common;
 
@@ -41,9 +42,11 @@ pub async fn execute(
             config.test_command_override = Some(cmd.to_string());
         }
 
-        // --- Setup & run pipeline ---
+        // --- Validate & run pipeline ---
+        let validator = InputValidator::new(&config.validation);
+        let validated = validator.validate(&objective, TrustTier::Operator);
         let (_router, pipeline) = common::setup_pipeline(&config, auto_approve, repo).await?;
-        common::run_pipeline(&pipeline, "interactive", &objective, repo).await?;
+        common::run_pipeline(&pipeline, "interactive", &validated, repo).await?;
 
         // --- Continue? ---
         eprint!("Another task? [y/N] ");
