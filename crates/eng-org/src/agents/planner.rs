@@ -87,6 +87,8 @@ You MUST decompose when ANY of these conditions is true:
 - The task would touch 2+ files
 - The task requires 3+ steps
 - Any single target file exceeds 150 lines
+- The task modifies a struct or enum used across multiple modules
+- The `estimated_complexity` is "medium" or "large"
 
 DO NOT DECOMPOSE when the task is trivial: exactly 1 file, fewer than 150 lines,
 1-2 mechanical edits. Sub-task overhead would exceed the work itself.
@@ -336,6 +338,22 @@ mod tests {
         assert!(
             SYSTEM_PROMPT.contains("3+ steps"),
             "prompt should trigger decomposition on 3+ steps"
+        );
+    }
+
+    #[test]
+    fn system_prompt_has_struct_across_modules_decomposition_condition() {
+        assert!(
+            SYSTEM_PROMPT.contains("struct or enum used across multiple modules"),
+            "decomposition conditions should include struct/enum cross-module usage"
+        );
+    }
+
+    #[test]
+    fn system_prompt_has_complexity_based_decomposition_condition() {
+        assert!(
+            SYSTEM_PROMPT.contains("estimated_complexity` is \"medium\" or \"large\""),
+            "decomposition conditions should trigger on medium or large estimated_complexity"
         );
     }
 
