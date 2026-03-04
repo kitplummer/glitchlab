@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-01
 **Authors:** Kit, with Claude analysis
-**Status:** Draft
+**Status:** Accepted
 **Informed by:** [Agentic Corporation Framework](./adr-agentic-corporation-framework.md) (Phase 3), [Full Agentic Ops Delta](./analysis-full-agentic-ops-delta.md) (Uplink SRE agent spec), [Observability ADR](./adr-observability-and-continuous-operations.md), `crates/ops-org/` skeleton
 
 ---
@@ -18,6 +18,8 @@ The `crates/ops-org/` skeleton already exists with `OpsPipelineStage {Monitor, A
 ---
 
 ## Decision
+
+**Platform decision: fly.io (confirmed).** LowEndInsight is deployed on fly.io. All tooling, runbooks, and agent configurations target fly.io as the sole deployment platform.
 
 ### 1. Ops Is Not Engineering with Different Prompts
 
@@ -137,13 +139,15 @@ The maintenance pipeline produces data. It does not act on it — escalation to 
 
 ### 3. Three Agents
 
-The [Ops Delta Analysis](./analysis-full-agentic-ops-delta.md) specified a single "Uplink" SRE agent. Three agents, each with a narrow scope, are safer and more testable:
+The [Ops Delta Analysis](./analysis-full-agentic-ops-delta.md) specified a single "Uplink" SRE agent. The target architecture splits this into three agents, each with a narrow scope, for safety and testability:
 
 | Agent | Name | Pipeline(s) | Capabilities |
 |---|---|---|---|
 | **Deployer** | Uplink-Deploy | Deploy | Pre-deploy validation, `fly deploy`, health check, rollback |
 | **Monitor** | Uplink-Watch | Maintenance, Incident (classification) | Health checks, metrics collection, anomaly classification |
 | **Responder** | Uplink-Respond | Incident (diagnosis + response) | Log analysis, scaling, restarts, postmortem bead creation |
+
+**Phase 1 simplification:** Implementation starts with a single **Uplink** agent (`UplinkSreAgent`) that combines deploy verification and health assessment. This agent is assessment-only — it interprets smoke test results and recommends actions but never executes deploys or rollbacks. The pipeline orchestrator acts on its recommendations. The split into Deployer/Monitor/Responder happens in Phase 2-3 as the tool allowlist expands.
 
 Each agent has its own system prompt, tool subset, and governance profile. A single "Uplink" agent with all capabilities would have too broad a tool allowlist and too much authority.
 
@@ -253,16 +257,42 @@ LowEndInsight is an Elixir/Phoenix application with characteristics that require
 
 These are encoded in the Monitor agent's system prompt as domain knowledge, not as generic ops rules.
 
+### 8. Smoke and Canary Tests
+
+Post-deploy verification uses declarative smoke test definitions. The smoke runner is deterministic code (HTTP requests + response matching); the LLM agent interprets results in context.
+
+#### Smoke Test Endpoints
+
+| # | Method | Path | Expected Status | Body Check | Required |
+|---|--------|------|-----------------|------------|----------|
+| 1 | GET | `/` | 200 | Contains "LowEndInsight" | Yes |
+| 2 | GET | `/v1/cache/stats` | 200 | Valid JSON | Yes |
+| 3 | GET | `/doc` | 200 | — | No |
+| 4 | POST | `/v1/analyze` | 200/202 | — | No |
+
+#### Decision Matrix
+
+| Required Checks | Optional Checks | Assessment | Action |
+|-----------------|-----------------|------------|--------|
+| All pass | All pass | **healthy** | Deploy verified, done |
+| All pass | Some fail | **degraded** | Investigate, no rollback |
+| Any fail | — | **unhealthy** | Rollback immediately |
+| No data | — | **deploy_failed** | Rollback immediately |
+
+The Uplink agent receives smoke test results as structured input and applies this matrix to produce its assessment. The pipeline orchestrator reads the agent's `recommendation` field and executes the appropriate action (rollback, escalation, or no-op).
+
+Canary testing (percentage-based traffic splitting) is deferred to Phase 3+ when fly.io machine-level routing is implemented.
+
 ---
 
 ## Implementation Phases
 
 | Phase | What | Validates | Depends On |
 |---|---|---|---|
-| **0** | Document the manual deploy process in `docs/runbook-lowendinsight-deploy.md` | We understand our own process before automating it | Nothing |
-| **1** | Deploy pipeline — `glitchlab ops deploy` wrapping fly CLI with health check and rollback | Triggered pipeline works; governance gates work | Phase 0 |
-| **2** | Maintenance pipeline — periodic health checks, cert/cost monitoring | Periodic pipeline works; Monitor agent classifies correctly | Phase 1 |
-| **3** | Incident pipeline — classification, diagnosis, response, postmortem beads | Reactive pipeline works; Responder agent follows runbooks | Phase 2 |
+| **0** | Deploy runbook (`docs/runbook-lowendinsight-fly-deploy.md`) + Uplink SRE agent implementation in `crates/ops-org/` | We understand our own process; agent can assess health | Nothing |
+| **1** | Deploy pipeline — `glitchlab ops deploy` wrapping fly CLI with smoke test verification via Uplink agent | Triggered pipeline works; smoke tests gate deploys; governance gates work | Phase 0 |
+| **2** | Maintenance pipeline — periodic health checks, cert/cost monitoring; split Uplink into Deployer + Monitor | Periodic pipeline works; Monitor agent classifies correctly | Phase 1 |
+| **3** | Incident pipeline — classification, diagnosis, response, postmortem beads; add Responder agent | Reactive pipeline works; Responder agent follows runbooks | Phase 2 |
 | **4** | Engineering ↔ Ops handoff — merge event triggers deploy; incident beads appear in engineering backlog | Inter-org communication works | Phase 3 + Beads cross-namespace links |
 
 Phase 0 is deliberately manual documentation. Automating a process you don't fully understand produces automation you can't debug.

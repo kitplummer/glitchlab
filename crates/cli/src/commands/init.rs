@@ -38,6 +38,9 @@ pub async fn execute(path: &Path) -> Result<()> {
 # limits:
 #   max_fix_attempts: 4
 #   max_dollars_per_task: 10.0
+
+# workspace:
+#   setup_command: "mix deps.get && mix compile"
 "#;
         tokio::fs::write(&config_path, default_config).await?;
     }
@@ -65,6 +68,57 @@ risk: low
     println!("  Created: .glitchlab/worktrees/");
     println!("  Created: .glitchlab/logs/");
 
+    // Initialize beads database (`bd init`). Tolerate failure gracefully if
+    // `bd` is not installed — warn but don't error.
+    run_bd_init(path).await;
+
+    // Run setup_command from config if present.
+    run_setup_command(path).await?;
+
+    Ok(())
+}
+
+/// Run `bd init` in the target repo directory. Warns on failure (bd may not
+/// be installed).
+async fn run_bd_init(path: &Path) {
+    match tokio::process::Command::new("bd")
+        .arg("init")
+        .current_dir(path)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            println!("  Initialized beads database (bd init)");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "  Warning: bd init exited with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        Err(e) => {
+            eprintln!("  Warning: bd not found, skipping beads init ({e})");
+        }
+    }
+}
+
+/// Load config from the repo and run `setup_command` if configured.
+async fn run_setup_command(path: &Path) -> Result<()> {
+    let config = glitchlab_eng_org::config::EngConfig::load(Some(path))?;
+    if let Some(cmd) = &config.workspace.setup_command {
+        println!("  Running setup command: {cmd}");
+        let status = tokio::process::Command::new("sh")
+            .args(["-c", cmd])
+            .current_dir(path)
+            .status()
+            .await?;
+        if !status.success() {
+            anyhow::bail!("setup command failed with {status}");
+        }
+        println!("  Setup command completed successfully");
+    }
     Ok(())
 }
 
@@ -105,5 +159,49 @@ mod tests {
             .await
             .unwrap();
         assert!(content.contains("worktrees/"));
+    }
+
+    #[tokio::test]
+    async fn bd_init_tolerates_missing_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        // Should not panic or error even if bd is not on PATH.
+        run_bd_init(dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn run_setup_command_skips_when_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .glitchlab/config.yaml — should load defaults (setup_command: None)
+        // and skip without error.
+        run_setup_command(dir.path()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_setup_command_executes_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        let marker = dir.path().join("setup_ran.txt");
+        let cmd = format!("touch {}", marker.display());
+        let config = format!("workspace:\n  setup_command: \"{cmd}\"\n");
+        std::fs::write(glitchlab_dir.join("config.yaml"), config).unwrap();
+
+        run_setup_command(dir.path()).await.unwrap();
+        assert!(
+            marker.exists(),
+            "setup command should have created marker file"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_setup_command_errors_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        let config = "workspace:\n  setup_command: \"false\"\n";
+        std::fs::write(glitchlab_dir.join("config.yaml"), config).unwrap();
+
+        let result = run_setup_command(dir.path()).await;
+        assert!(result.is_err(), "should error on failing setup command");
     }
 }
