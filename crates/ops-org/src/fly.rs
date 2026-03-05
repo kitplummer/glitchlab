@@ -80,6 +80,12 @@ impl RealFlyExecutor {
     }
 
     async fn run_command(&self, args: &[&str], working_dir: Option<&Path>) -> FlyOutput {
+        tracing::debug!(
+            flyctl = %self.flyctl_path.display(),
+            args = ?args,
+            working_dir = ?working_dir,
+            "running flyctl command"
+        );
         let mut cmd = tokio::process::Command::new(&self.flyctl_path);
         cmd.args(args);
         if let Some(dir) = working_dir {
@@ -128,9 +134,6 @@ impl FlyExecutor for RealFlyExecutor {
             if let Some(cp) = config_path {
                 config_str = cp.to_string_lossy().into_owned();
                 args.push("--config");
-                // Leak intentionally avoided: we own config_str for the duration.
-                // But we need a &str with lifetime matching the future. Store in
-                // a local and reference it.
                 args.push(&config_str);
             }
             self.run_command(&args, Some(working_dir)).await

@@ -320,11 +320,27 @@ impl DeployPipeline {
 
         // Stage 4: Deploy
         info!(app = %opts.app_name, "deploy pipeline: deploying");
-        let config_path = self.target.fly_toml_path.as_ref().map(PathBuf::from);
+        // When fly_toml_path is set, copy it to working_dir/fly.toml so flyctl
+        // auto-discovers it and resolves [build] dockerfile relative to the
+        // working directory (repo root). The --config flag resolves paths
+        // relative to the config file's directory, which breaks umbrella apps.
+        let temp_fly_toml = self.target.fly_toml_path.as_ref().and_then(|p| {
+            let src = opts.working_dir.join(p);
+            let dst = opts.working_dir.join("fly.toml");
+            if src == dst {
+                return None;
+            }
+            std::fs::copy(&src, &dst).ok()?;
+            Some(dst)
+        });
         let deploy_output = self
             .fly
-            .deploy(&opts.app_name, &opts.working_dir, config_path.as_deref())
+            .deploy(&opts.app_name, &opts.working_dir, None)
             .await;
+        // Clean up temporary fly.toml copy.
+        if let Some(tmp) = &temp_fly_toml {
+            let _ = std::fs::remove_file(tmp);
+        }
         if !deploy_output.success {
             return DeployResult {
                 status: DeployStatus::DeployFailed,
