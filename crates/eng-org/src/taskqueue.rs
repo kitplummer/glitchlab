@@ -14,6 +14,17 @@ use crate::input_validation::TrustTier;
 // Task types
 // ---------------------------------------------------------------------------
 
+/// The type of work a task represents, used for routing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskType {
+    /// Standard engineering work (code, tests, docs).
+    #[default]
+    Engineering,
+    /// Deploy an app via the ops deploy pipeline.
+    Deploy,
+}
+
 /// Status of a task in the backlog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +93,9 @@ pub struct Task {
     /// Trust tier of the input source for this task's objective.
     #[serde(default)]
     pub trust_tier: TrustTier,
+    /// Type of work: engineering (default) or deploy.
+    #[serde(default)]
+    pub task_type: TaskType,
 }
 
 fn default_priority() -> u32 {
@@ -428,6 +442,7 @@ fn bead_to_task(bead: Bead) -> Task {
         created_at,
         definition_of_done,
         trust_tier: TrustTier::default(),
+        task_type: TaskType::default(),
     }
 }
 
@@ -457,6 +472,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "task-2".into(),
@@ -474,6 +490,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "task-3".into(),
@@ -491,6 +508,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
         ]
     }
@@ -550,6 +568,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "b".into(),
@@ -567,6 +586,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -733,6 +753,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         };
         let yaml = serde_yaml::to_string(&task).unwrap();
         let parsed: Task = serde_yaml::from_str(&yaml).unwrap();
@@ -762,6 +783,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "b".into(),
@@ -779,6 +801,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "c".into(),
@@ -796,6 +819,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -826,6 +850,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }];
         queue.inject_tasks(new_tasks);
         assert_eq!(queue.tasks().len(), 4);
@@ -856,6 +881,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }];
         queue.inject_tasks(dupe);
         // Should NOT have grown — duplicate was skipped.
@@ -1144,6 +1170,7 @@ mod tests {
                 created_at: Some(old),
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "new-1".into(),
@@ -1161,6 +1188,7 @@ mod tests {
                 created_at: Some(recent),
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
         ]);
         let stale = queue.stale_tasks(Duration::days(14));
@@ -1188,6 +1216,7 @@ mod tests {
             created_at: Some(old),
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }]);
         let stale = queue.stale_tasks(Duration::days(14));
         assert!(stale.is_empty());
@@ -1212,6 +1241,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }]);
         let stale = queue.stale_tasks(Duration::days(14));
         assert!(stale.is_empty());
@@ -1237,6 +1267,7 @@ mod tests {
             created_at: Some(old),
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }]);
         let stale = queue.stale_tasks(Duration::days(14));
         assert_eq!(stale.len(), 1);
@@ -1326,6 +1357,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "p1".into(),
@@ -1343,6 +1375,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1369,6 +1402,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert_eq!(queue.actionable_count(), 1);
@@ -1392,6 +1426,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         let s = queue.summary();
@@ -1451,6 +1486,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         };
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("outcome_context"));
@@ -1509,6 +1545,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         };
         let json = serde_json::to_string(&task).unwrap();
         let parsed: Task = serde_json::from_str(&json).unwrap();
@@ -1546,6 +1583,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         };
         let json = serde_json::to_string(&task).unwrap();
         assert!(json.contains("files_hint"));
@@ -1574,6 +1612,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         };
         let json = serde_json::to_string(&task).unwrap();
         // None should be omitted (skip_serializing_if).
@@ -1610,6 +1649,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1633,6 +1673,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1656,6 +1697,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1679,6 +1721,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: TaskType::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         assert!(!queue.has_pending_with_prefix("gl-tqm-stuck-agents"));
@@ -1707,6 +1750,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "fix-1".into(),
@@ -1724,6 +1768,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1759,6 +1804,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "fix-blocked".into(),
@@ -1776,6 +1822,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
@@ -1827,6 +1874,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
             Task {
                 id: "fix-high".into(),
@@ -1844,10 +1892,57 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: TaskType::default(),
             },
         ];
         let queue = TaskQueue::from_tasks(tasks);
         let next = queue.pick_next().unwrap();
         assert_eq!(next.id, "fix-high");
+    }
+
+    #[test]
+    fn task_type_default_is_engineering() {
+        assert_eq!(TaskType::default(), TaskType::Engineering);
+    }
+
+    #[test]
+    fn task_type_serde_roundtrip() {
+        let types = vec![TaskType::Engineering, TaskType::Deploy];
+        let json = serde_json::to_string(&types).unwrap();
+        let parsed: Vec<TaskType> = serde_json::from_str(&json).unwrap();
+        assert_eq!(types, parsed);
+    }
+
+    #[test]
+    fn task_type_serde_rename() {
+        let json = serde_json::to_string(&TaskType::Deploy).unwrap();
+        assert_eq!(json, r#""deploy""#);
+        let json = serde_json::to_string(&TaskType::Engineering).unwrap();
+        assert_eq!(json, r#""engineering""#);
+    }
+
+    #[test]
+    fn task_without_task_type_deserializes_as_engineering() {
+        let yaml = r#"
+id: test-1
+objective: "Test task"
+priority: 1
+status: pending
+"#;
+        let task: Task = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(task.task_type, TaskType::Engineering);
+    }
+
+    #[test]
+    fn task_with_deploy_type_deserializes() {
+        let yaml = r#"
+id: deploy-1
+objective: "Deploy lowendinsight"
+priority: 0
+status: pending
+task_type: deploy
+"#;
+        let task: Task = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(task.task_type, TaskType::Deploy);
     }
 }

@@ -390,6 +390,10 @@ fn default_repair_budget_fraction() -> f64 {
     0.20
 }
 
+fn default_tool_command_timeout_secs() -> u64 {
+    300
+}
+
 /// Configuration for a model in the cost-aware pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfileConfig {
@@ -451,6 +455,10 @@ pub struct LimitsConfig {
     /// Fraction of total budget reserved for repair/remediation tasks (0.0–1.0).
     #[serde(default = "default_repair_budget_fraction")]
     pub repair_budget_fraction: f64,
+    /// Timeout in seconds for individual tool commands (shell executions).
+    /// Default: 300s (5 minutes). Increase for repos with slow builds.
+    #[serde(default = "default_tool_command_timeout_secs")]
+    pub tool_command_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,6 +477,10 @@ pub struct WorkspaceConfig {
     pub worktree_dir: String,
     pub task_dir: String,
     pub log_dir: String,
+    /// Optional shell command to run during `glitchlab init` (e.g. dependency
+    /// installation / compilation). Runs in the target repo directory.
+    #[serde(default)]
+    pub setup_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +574,8 @@ impl Default for EngConfig {
                 max_remediation_depth: default_max_remediation_depth(),
                 // Fraction of total budget reserved for repair/remediation tasks (0.0–1.0).
                 repair_budget_fraction: default_repair_budget_fraction(),
+                // Timeout in seconds for individual tool commands (shell executions).
+                tool_command_timeout_secs: default_tool_command_timeout_secs(),
             },
             intervention: InterventionConfig {
                 // When true, the orchestrator will pause after generating a plan, awaiting user approval.
@@ -580,6 +594,7 @@ impl Default for EngConfig {
                 worktree_dir: ".glitchlab/worktrees".into(),
                 task_dir: ".glitchlab/tasks".into(),
                 log_dir: ".glitchlab/logs".into(),
+                setup_command: None,
             },
             allowed_tools: vec![
                 // Build / test / lint
@@ -936,6 +951,8 @@ mod tests {
         assert!(config.routing.planner.contains("anthropic"));
         assert_eq!(config.limits.max_tool_turns, 12);
         assert_eq!(config.limits.max_pipeline_duration_secs, 600);
+        assert_eq!(config.limits.tool_command_timeout_secs, 300);
+        assert!(config.workspace.setup_command.is_none());
     }
 
     #[test]
@@ -1001,6 +1018,54 @@ mod tests {
         assert!((config.limits.max_dollars_per_task - 5.0).abs() < f64::EPSILON);
         // Non-overridden values should keep defaults.
         assert_eq!(config.limits.max_tokens_per_task, 200_000);
+    }
+
+    #[test]
+    fn load_tool_command_timeout_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "limits:\n  tool_command_timeout_secs: 600\n",
+        )
+        .unwrap();
+
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(config.limits.tool_command_timeout_secs, 600);
+    }
+
+    #[test]
+    fn load_setup_command_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "workspace:\n  setup_command: \"mix deps.get && mix compile\"\n",
+        )
+        .unwrap();
+
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(
+            config.workspace.setup_command.as_deref(),
+            Some("mix deps.get && mix compile")
+        );
+    }
+
+    #[test]
+    fn tool_command_timeout_defaults_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let glitchlab_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&glitchlab_dir).unwrap();
+        std::fs::write(
+            glitchlab_dir.join("config.yaml"),
+            "limits:\n  max_fix_attempts: 3\n",
+        )
+        .unwrap();
+
+        let config = EngConfig::load(Some(dir.path())).unwrap();
+        assert_eq!(config.limits.tool_command_timeout_secs, 300);
     }
 
     #[test]

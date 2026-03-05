@@ -616,6 +616,44 @@ mod tests {
         assert_eq!(parsed["msg"], "/* not a comment */");
     }
 
+    #[test]
+    fn parse_direct_agent_output() {
+        // Exercises the direct AgentOutput parse path (lines 19-22).
+        let raw = r#"{"data": {"verdict": "pass"}, "metadata": {"agent": "x", "model": "m", "tokens": 0, "cost": 0.0, "latency_ms": 0}, "parse_error": false}"#;
+        let meta = test_meta();
+        let output = parse_json_response(raw, meta, serde_json::json!({}));
+        assert!(!output.parse_error);
+        // Metadata should be overwritten by the caller's metadata.
+        assert_eq!(output.metadata.agent, "test");
+    }
+
+    #[test]
+    fn sanitize_json_carriage_return_in_string() {
+        // Exercises the \r handling (line 178).
+        let input = "{\"desc\": \"line one\r\nline two\"}";
+        let result = sanitize_json(input);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["desc"].as_str().unwrap().contains("line one"));
+    }
+
+    #[test]
+    fn extract_json_object_with_escaped_quotes() {
+        // Exercises escape handling in extract_json_object (lines 244, 248).
+        let input = r#"prefix {"key": "value with \" escape"} suffix"#;
+        let extracted = extract_json_object(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&extracted).unwrap();
+        assert!(parsed["key"].as_str().unwrap().contains("escape"));
+    }
+
+    #[test]
+    fn close_truncated_json_with_escaped_quotes() {
+        // Exercises escape handling in close_truncated_json (lines 315, 319).
+        let input = r#"{"key": "val\"ue", "arr": [1, 2"#;
+        let result = close_truncated_json(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["arr"][0], 1);
+    }
+
     fn test_meta() -> AgentMetadata {
         AgentMetadata {
             agent: "test".into(),

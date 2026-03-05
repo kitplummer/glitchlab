@@ -719,6 +719,7 @@ fn pattern_to_task(pattern: &DetectedPattern, priority: u32) -> Option<crate::ta
         created_at: None,
         definition_of_done: None,
         trust_tier: crate::input_validation::TrustTier::default(),
+        task_type: crate::taskqueue::TaskType::default(),
     })
 }
 
@@ -1492,6 +1493,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: crate::input_validation::TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         };
         let queue = crate::taskqueue::TaskQueue::from_tasks(vec![existing]);
 
@@ -1882,5 +1884,36 @@ mod tests {
     fn tqm_default_remediation_enabled() {
         let config = TQMConfig::default();
         assert!(config.remediation_enabled);
+    }
+
+    #[test]
+    fn kind_slug_covers_all_variants() {
+        // Ensure all PatternKind variants have a slug mapping.
+        assert_eq!(kind_slug(PatternKind::DecompositionLoop), "decomp-loop");
+        assert_eq!(kind_slug(PatternKind::ScopeCreep), "scope-creep");
+        assert_eq!(kind_slug(PatternKind::ModelDegradation), "model-degrad");
+        assert_eq!(kind_slug(PatternKind::StuckAgents), "stuck-agents");
+        assert_eq!(kind_slug(PatternKind::TestFlakiness), "test-flaky");
+        assert_eq!(
+            kind_slug(PatternKind::ArchitectRejectionRate),
+            "arch-reject"
+        );
+        assert_eq!(kind_slug(PatternKind::BudgetPressure), "budget");
+        assert_eq!(kind_slug(PatternKind::ProviderFailures), "provider");
+        assert_eq!(kind_slug(PatternKind::BoundaryViolation), "boundary");
+        assert_eq!(kind_slug(PatternKind::TaskBudgetExhaustion), "task-budget");
+    }
+
+    #[test]
+    fn non_actionable_patterns_produce_no_tasks() {
+        // BudgetPressure is advisory-only
+        let budget = make_pattern(PatternKind::BudgetPressure, vec!["t1".into()]);
+        let task = generate_remediation_task_at_depth(&budget, 50, 0, 3);
+        assert!(task.is_none(), "BudgetPressure should not produce a task");
+
+        // ProviderFailures is advisory-only
+        let provider = make_pattern(PatternKind::ProviderFailures, vec!["t2".into()]);
+        let task = generate_remediation_task_at_depth(&provider, 50, 0, 3);
+        assert!(task.is_none(), "ProviderFailures should not produce a task");
     }
 }

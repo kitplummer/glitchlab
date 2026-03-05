@@ -683,4 +683,73 @@ mod tests {
             assert!(v["event"].is_string());
         }
     }
+
+    #[test]
+    fn emit_tracing_covers_all_arms() {
+        use tracing_subscriber::util::SubscriberInitExt;
+        // Install a subscriber so tracing macros actually execute their bodies.
+        let _guard = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::sink)
+            .set_default();
+
+        let (emitter, _buf) = DashboardEmitter::in_memory();
+        // Emit every variant — the tracing info! bodies are the coverage target.
+        emitter.emit(DashboardEvent::RunCompleted {
+            succeeded: 1,
+            failed: 0,
+            deferred: 0,
+            escalated: 0,
+            total_cost: 1.0,
+            duration_secs: 10.0,
+            cease_reason: "done".into(),
+        });
+        emitter.emit(DashboardEvent::TaskSucceeded {
+            task_id: "t1".into(),
+            status: "ok".into(),
+            cost: 0.1,
+            tokens: 100,
+            pr_url: None,
+        });
+        emitter.emit(DashboardEvent::TaskFailed {
+            task_id: "t2".into(),
+            status: "fail".into(),
+            cost: 0.1,
+            reason: None,
+        });
+        emitter.emit(DashboardEvent::TaskDecomposed {
+            task_id: "t3".into(),
+            sub_task_ids: vec!["t3a".into()],
+        });
+        emitter.emit(DashboardEvent::PrCreated {
+            task_id: "t1".into(),
+            url: "http://example.com".into(),
+        });
+        emitter.emit(DashboardEvent::PrMerged {
+            task_id: "t1".into(),
+            url: "http://example.com".into(),
+        });
+        emitter.emit(DashboardEvent::BoundaryViolation {
+            task_id: "t4".into(),
+        });
+        emitter.emit(DashboardEvent::PatternDetected {
+            kind: "stuck".into(),
+            severity: "warn".into(),
+            occurrences: 1,
+        });
+        emitter.emit(DashboardEvent::QualityGateFailed {
+            details: "test".into(),
+        });
+        emitter.emit(DashboardEvent::RemediationInjected {
+            source: "tqm".into(),
+            count: 1,
+            task_ids: vec!["fix-1".into()],
+        });
+        emitter.emit(DashboardEvent::CircuitEscalation {
+            reason: "test escalation".into(),
+        });
+        emitter.emit(DashboardEvent::SystemicFailure {
+            dominant_category: "provider".into(),
+        });
+    }
 }

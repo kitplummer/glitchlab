@@ -9,6 +9,7 @@ license.workspace = true
 glitchlab-kernel.workspace = true
 glitchlab-memory.workspace = true
 glitchlab-router.workspace = true
+ops-org.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

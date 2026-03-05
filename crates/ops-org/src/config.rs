@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::path::Path;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +81,12 @@ pub struct DeployTarget {
     pub base_url: String,
     /// Smoke test endpoints to verify after deploy.
     pub smoke_tests: Vec<SmokeTestEndpoint>,
+    /// Path to fly.toml relative to the repo root (e.g. "apps/lowendinsight_get/fly.toml").
+    #[serde(default)]
+    pub fly_toml_path: Option<String>,
+    /// Fly.io organization slug for `fly apps create -o <org>`.
+    #[serde(default)]
+    pub fly_org: Option<String>,
 }
 
 impl DeployTarget {
@@ -86,6 +95,8 @@ impl DeployTarget {
         Self {
             app_name: "lowendinsight".into(),
             base_url: "https://lowendinsight.fly.dev".into(),
+            fly_toml_path: Some("apps/lowendinsight_get/fly.toml".into()),
+            fly_org: None,
             smoke_tests: vec![
                 SmokeTestEndpoint {
                     method: "GET".into(),
@@ -154,6 +165,30 @@ impl Default for OpsGovernanceSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+fn default_uplink_sre_model() -> String {
+    "anthropic/claude-haiku-4-5-20251001".into()
+}
+
+/// Model routing for ops agents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OpsRoutingConfig {
+    /// Model string for the Uplink SRE assessment agent.
+    #[serde(default = "default_uplink_sre_model")]
+    pub uplink_sre: String,
+}
+
+impl Default for OpsRoutingConfig {
+    fn default() -> Self {
+        Self {
+            uplink_sre: default_uplink_sre_model(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
 
@@ -168,6 +203,9 @@ pub struct OpsConfig {
     /// Optional deploy target configuration.
     #[serde(default)]
     pub deploy_target: Option<DeployTarget>,
+    /// Model routing for ops agents.
+    #[serde(default)]
+    pub routing: OpsRoutingConfig,
 }
 
 impl Default for OpsConfig {
@@ -181,7 +219,28 @@ impl Default for OpsConfig {
             tool_allowlist: vec!["fly.io deploy".to_string(), "health check".to_string()],
             governance_settings: OpsGovernanceSettings::default(),
             deploy_target: None,
+            routing: OpsRoutingConfig::default(),
         }
+    }
+}
+
+impl OpsConfig {
+    /// Load ops config from `<repo>/.glitchlab/ops-config.yaml`.
+    ///
+    /// Falls back to defaults if the file does not exist.
+    pub fn load(repo_path: &Path) -> Result<Self, String> {
+        let config_path = repo_path.join(".glitchlab/ops-config.yaml");
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("failed to read ops config: {e}"))?;
+        serde_yaml::from_str(&contents).map_err(|e| format!("failed to parse ops config: {e}"))
+    }
+
+    /// Build the routing map (role → model string) for the router.
+    pub fn routing_map(&self) -> HashMap<String, String> {
+        HashMap::from([("uplink_sre".into(), self.routing.uplink_sre.clone())])
     }
 }
 
@@ -283,6 +342,11 @@ mod tests {
         assert_eq!(target.app_name, "lowendinsight");
         assert_eq!(target.base_url, "https://lowendinsight.fly.dev");
         assert_eq!(target.smoke_tests.len(), 4);
+        assert_eq!(
+            target.fly_toml_path.as_deref(),
+            Some("apps/lowendinsight_get/fly.toml")
+        );
+        assert!(target.fly_org.is_none());
 
         // Two required checks
         let required: Vec<_> = target.smoke_tests.iter().filter(|s| s.required).collect();
@@ -291,6 +355,30 @@ mod tests {
         // Two optional checks
         let optional: Vec<_> = target.smoke_tests.iter().filter(|s| !s.required).collect();
         assert_eq!(optional.len(), 2);
+    }
+
+    #[test]
+    fn test_deploy_target_fly_toml_path_serde_default() {
+        // Deserialize without fly_toml_path or fly_org — should default to None
+        let json = r#"{"app_name":"test","base_url":"https://test.dev","smoke_tests":[]}"#;
+        let target: DeployTarget = serde_json::from_str(json).unwrap();
+        assert!(target.fly_toml_path.is_none());
+        assert!(target.fly_org.is_none());
+    }
+
+    #[test]
+    fn test_deploy_target_fly_org_serde_roundtrip() {
+        let target = DeployTarget {
+            app_name: "myapp".into(),
+            base_url: "https://myapp.fly.dev".into(),
+            smoke_tests: vec![],
+            fly_toml_path: Some("fly.toml".into()),
+            fly_org: Some("my-org".into()),
+        };
+        let json = serde_json::to_string(&target).unwrap();
+        let parsed: DeployTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.fly_toml_path.as_deref(), Some("fly.toml"));
+        assert_eq!(parsed.fly_org.as_deref(), Some("my-org"));
     }
 
     #[test]
@@ -325,5 +413,74 @@ mod tests {
         let parsed: OpsConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, parsed);
         assert!(parsed.deploy_target.is_some());
+    }
+
+    #[test]
+    fn test_ops_routing_config_default() {
+        let routing = OpsRoutingConfig::default();
+        assert!(routing.uplink_sre.contains("haiku"));
+    }
+
+    #[test]
+    fn test_ops_routing_config_serde() {
+        let routing = OpsRoutingConfig::default();
+        let json = serde_json::to_string(&routing).unwrap();
+        let parsed: OpsRoutingConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(routing, parsed);
+    }
+
+    #[test]
+    fn test_ops_config_routing_map() {
+        let config = OpsConfig::default();
+        let map = config.routing_map();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("uplink_sre"));
+    }
+
+    #[test]
+    fn test_ops_config_load_missing_file() {
+        let config = OpsConfig::load(std::path::Path::new("/nonexistent/path")).unwrap();
+        assert_eq!(config, OpsConfig::default());
+    }
+
+    #[test]
+    fn test_ops_config_load_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let gl_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&gl_dir).unwrap();
+        let yaml = r#"
+pipeline_shape: [Monitor, Act, Report]
+tool_allowlist: ["fly.io deploy"]
+governance_settings:
+  max_action_retries: 5
+  require_deploy_approval: false
+  budget_cap_per_action: 1.0
+routing:
+  uplink_sre: "anthropic/claude-sonnet-4-20250514"
+"#;
+        std::fs::write(gl_dir.join("ops-config.yaml"), yaml).unwrap();
+        let config = OpsConfig::load(dir.path()).unwrap();
+        assert_eq!(config.governance_settings.max_action_retries, 5);
+        assert!(!config.governance_settings.require_deploy_approval);
+        assert_eq!(
+            config.routing.uplink_sre,
+            "anthropic/claude-sonnet-4-20250514"
+        );
+    }
+
+    #[test]
+    fn test_ops_config_load_invalid_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let gl_dir = dir.path().join(".glitchlab");
+        std::fs::create_dir_all(&gl_dir).unwrap();
+        std::fs::write(gl_dir.join("ops-config.yaml"), "{{invalid").unwrap();
+        let result = OpsConfig::load(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_default_config_includes_routing() {
+        let config = OpsConfig::default();
+        assert_eq!(config.routing, OpsRoutingConfig::default());
     }
 }

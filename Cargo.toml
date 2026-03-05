@@ -70,4 +70,5 @@ glitchlab-memory = { path = "crates/memory" }
 glitchlab-router = { path = "crates/router" }
 glitchlab-eng-org = { path = "crates/eng-org" }
 glitchlab-dashboard = { path = "crates/dashboard" }
+ops-org = { path = "crates/ops-org" }
 tracing-opentelemetry = { version = "0.24" }

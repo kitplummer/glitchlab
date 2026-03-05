@@ -760,6 +760,7 @@ impl Orchestrator {
             let task_is_remediation;
             let task_dod;
             let task_trust_tier;
+            let task_type;
             match queue.pick_next() {
                 Some(task) => {
                     task_id = task.id.clone();
@@ -778,6 +779,7 @@ impl Orchestrator {
                     task_is_remediation = task.is_remediation;
                     task_dod = task.definition_of_done.clone();
                     task_trust_tier = task.trust_tier;
+                    task_type = task.task_type.clone();
                     // Skip remediation tasks when repair budget is exhausted.
                     if task_is_remediation
                         && !budget.can_afford_repair(self.config.limits.max_dollars_per_task)
@@ -841,10 +843,12 @@ impl Orchestrator {
             let validator = crate::input_validation::InputValidator::new(&self.config.validation);
             let validated_objective = validator.validate(&objective, task_trust_tier);
 
-            // --- Create fresh router + pipeline for this task ---
-            let attempt_contexts = tracker.contexts(&task_id);
-            let pipeline_result = match self
-                .create_and_run_pipeline(
+            // --- Create pipeline result (deploy or engineering) ---
+            let pipeline_result = if task_type == crate::taskqueue::TaskType::Deploy {
+                self.run_deploy_task(&task_id, &objective, params).await
+            } else {
+                let attempt_contexts = tracker.contexts(&task_id);
+                self.create_and_run_pipeline(
                     &task_id,
                     &validated_objective,
                     params,
@@ -853,7 +857,9 @@ impl Orchestrator {
                     task_dod.as_deref(),
                 )
                 .await
-            {
+            };
+
+            let pipeline_result = match pipeline_result {
                 Ok(pr) => pr,
                 Err(e) => {
                     warn!(task_id = %task_id, error = %e, "pipeline setup failed");
@@ -1359,6 +1365,62 @@ impl Orchestrator {
             .await)
     }
 
+    /// Run a deploy task through the ops-org DeployPipeline.
+    ///
+    /// Loads OpsConfig, builds a router, and runs the deploy pipeline,
+    /// returning a PipelineResult for the orchestrator's outcome routing.
+    async fn run_deploy_task(
+        &self,
+        task_id: &str,
+        _objective: &str,
+        params: &OrchestratorParams,
+    ) -> Result<glitchlab_kernel::pipeline::PipelineResult> {
+        use ops_org::config::{DeployTarget, OpsConfig};
+        use ops_org::deploy::{AutoApproveDeployHandler, DeployOptions, DeployPipeline};
+
+        info!(task_id = %task_id, "routing to deploy pipeline");
+        let ops_config = OpsConfig::load(&params.repo_path)
+            .map_err(|e| Error::Config(format!("failed to load ops config: {e}")))?;
+        let target = ops_config
+            .deploy_target
+            .clone()
+            .unwrap_or_else(DeployTarget::lowendinsight_default);
+        let budget_cap = ops_config
+            .governance_settings
+            .budget_cap_per_action
+            .max(self.config.limits.max_dollars_per_task);
+        let budget_tracker = BudgetTracker::new(self.config.limits.max_tokens_per_task, budget_cap);
+        let mut routing = ops_config.routing_map();
+        for (k, v) in self.config.routing_map() {
+            routing.entry(k).or_insert(v);
+        }
+        let router = Arc::new(Router::with_providers(
+            routing,
+            budget_tracker,
+            self.config.resolve_providers(),
+        ));
+        let pipeline = DeployPipeline {
+            config: ops_config,
+            target: target.clone(),
+            fly: Arc::new(ops_org::fly::RealFlyExecutor::new()),
+            http: Arc::new(ops_org::smoke::ReqwestClient::new()),
+            router,
+            approval: Arc::new(AutoApproveDeployHandler)
+                as Arc<dyn ops_org::deploy::DeployApprovalHandler>,
+        };
+        let opts = DeployOptions {
+            app_name: target.app_name.clone(),
+            auto_approve: true,
+            dry_run: false,
+            working_dir: params.repo_path.clone(),
+            smoke_timeout: std::time::Duration::from_secs(15),
+        };
+        info!(task_id = %task_id, app = %opts.app_name, "running deploy pipeline");
+        let deploy_result = pipeline.run(&opts).await;
+        info!(task_id = %task_id, status = %deploy_result.status, "deploy pipeline completed");
+        Ok(deploy_result.to_pipeline_result())
+    }
+
     /// Route a pipeline result to the appropriate queue/tracker updates.
     ///
     /// Returns the `TaskStatus` to set, the `OutcomeContext` (if any),
@@ -1594,6 +1656,7 @@ impl Orchestrator {
                     created_at: None,
                     definition_of_done: None,
                     trust_tier: TrustTier::default(),
+                    task_type: crate::taskqueue::TaskType::default(),
                 })
             })
             .collect()
@@ -1729,6 +1792,7 @@ impl Orchestrator {
                 created_at: None,
                 definition_of_done,
                 trust_tier: TrustTier::default(),
+                task_type: crate::taskqueue::TaskType::default(),
             });
         }
 
@@ -2232,6 +2296,7 @@ impl Orchestrator {
                     created_at: None,
                     definition_of_done: None,
                     trust_tier: TrustTier::default(),
+                    task_type: crate::taskqueue::TaskType::default(),
                 };
                 queue.inject_tasks(vec![task]);
                 created += 1;
@@ -2462,6 +2527,7 @@ impl Orchestrator {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         };
 
         queue.inject_tasks(vec![diag_task.clone()]);
@@ -2871,6 +2937,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(0.10); // less than per-task $0.50
@@ -2913,6 +2980,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: crate::taskqueue::TaskType::default(),
             },
             Task {
                 id: "b".into(),
@@ -2930,6 +2998,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: crate::taskqueue::TaskType::default(),
             },
         ];
         let mut queue = TaskQueue::from_tasks(tasks);
@@ -3011,6 +3080,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         }
     }
 
@@ -3994,6 +4064,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -4036,6 +4107,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -4090,6 +4162,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut result = empty_orchestrator_result();
@@ -4615,6 +4688,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         }];
         let queue = TaskQueue::from_tasks(tasks);
         let next = queue.pick_next().unwrap();
@@ -4708,6 +4782,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(100.0);
@@ -4754,6 +4829,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         // Repair budget = 0 (fraction 0.0), so all remediation tasks should be skipped.
@@ -4858,6 +4934,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: crate::taskqueue::TaskType::default(),
             },
             Task {
                 id: "gl-1e0.5".into(),
@@ -4875,6 +4952,7 @@ mod tests {
                 created_at: None,
                 definition_of_done: None,
                 trust_tier: TrustTier::default(),
+                task_type: crate::taskqueue::TaskType::default(),
             },
         ])
     }
@@ -5330,6 +5408,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         }];
         let mut queue = TaskQueue::from_tasks(tasks);
         let mut budget = CumulativeBudget::new(100.0);
@@ -5592,6 +5671,7 @@ mod tests {
             created_at: None,
             definition_of_done: None,
             trust_tier: TrustTier::default(),
+            task_type: crate::taskqueue::TaskType::default(),
         };
         let mut queue = TaskQueue::from_tasks(vec![existing]);
         let data = serde_json::json!({
@@ -5694,5 +5774,17 @@ mod tests {
             .unwrap();
         assert_eq!(t.objective, "Untitled bead");
         assert_eq!(t.priority, 2); // default
+    }
+
+    #[test]
+    fn deploy_task_type_routes_differently() {
+        // Verify that a deploy task is distinguishable from an engineering task
+        let mut task = pending_task("deploy-test", "Deploy lowendinsight");
+        task.task_type = crate::taskqueue::TaskType::Deploy;
+        assert_eq!(task.task_type, crate::taskqueue::TaskType::Deploy);
+
+        // Engineering task is default
+        let eng_task = pending_task("eng-test", "Fix bug");
+        assert_eq!(eng_task.task_type, crate::taskqueue::TaskType::Engineering);
     }
 }

@@ -1295,7 +1295,7 @@ impl EngineeringPipeline {
                 wt_path.clone(),
                 impl_tool_policy,
                 self.config.boundaries.protected_paths.clone(),
-                Duration::from_secs(120),
+                Duration::from_secs(self.config.limits.tool_command_timeout_secs),
             );
             // Seed read cache with pre-loaded file contents so the implementer
             // doesn't waste tool turns re-reading files already in context.
@@ -1495,7 +1495,7 @@ impl EngineeringPipeline {
                             self.config.blocked_patterns.clone(),
                         ),
                         self.config.boundaries.protected_paths.clone(),
-                        Duration::from_secs(120),
+                        Duration::from_secs(self.config.limits.tool_command_timeout_secs),
                     );
                     let retry_implementer = ImplementerAgent::new(
                         Arc::clone(&self.router),
@@ -1714,7 +1714,7 @@ impl EngineeringPipeline {
                                 wt_path.clone(),
                                 dbg_tool_policy,
                                 self.config.boundaries.protected_paths.clone(),
-                                Duration::from_secs(120),
+                                Duration::from_secs(self.config.limits.tool_command_timeout_secs),
                             );
                             let debugger = DebuggerAgent::new(
                                 Arc::clone(&self.router),
